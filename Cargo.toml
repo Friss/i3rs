@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/i3rs-core", "crates/i3rs-app", "crates/i3rs-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+i3rs-core = { path = "crates/i3rs-core" }
+half = "2.7.1"
+memmap2 = "0.9.10"
+eframe = "0.34.1"
+egui = "0.34.1"
+egui_plot = "0.35.0"
+egui-dock = { package = "egui_dock", version = "0.19.1", features = ["serde"] }
+rfd = "0.17.2"
+quick-xml = "0.39.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

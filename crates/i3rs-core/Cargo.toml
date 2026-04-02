@@ -1,0 +1,10 @@
+[package]
+name = "i3rs-core"
+version.workspace = true
+edition.workspace = true
+description = "MoTeC i2 .ld log file parser and data access library"
+
+[dependencies]
+half = { workspace = true }
+memmap2 = { workspace = true }
+quick-xml = { workspace = true }
