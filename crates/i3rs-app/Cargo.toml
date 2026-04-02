@@ -1,0 +1,15 @@
+[package]
+name = "i3rs-app"
+version.workspace = true
+edition.workspace = true
+description = "MoTeC telemetry data analysis application"
+
+[dependencies]
+i3rs-core = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_plot = { workspace = true }
+egui-dock = { workspace = true }
+rfd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

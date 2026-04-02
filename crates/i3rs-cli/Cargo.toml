@@ -1,0 +1,8 @@
+[package]
+name = "i3rs-cli"
+version.workspace = true
+edition.workspace = true
+description = "MoTeC .ld log file CLI parser"
+
+[dependencies]
+i3rs-core = { workspace = true }
