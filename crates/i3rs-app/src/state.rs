@@ -131,6 +131,91 @@ pub const CHANNEL_COLORS: &[egui::Color32] = &[
     egui::Color32::from_rgb(255, 100, 200), // pink
 ];
 
+/// Cached statistics for a single channel (session + per-lap).
+pub struct CachedChannelStats {
+    pub name: String,
+    pub color: egui::Color32,
+    pub dec_places: i16,
+    /// Full session stats: (min, max, avg, stddev).
+    pub session: (f64, f64, f64, f64),
+    /// Per-lap stats: (lap_number, min, max, avg, stddev).
+    pub per_lap: Vec<(u32, f64, f64, f64, f64)>,
+}
+
+/// Cache for report panel statistics, invalidated when channels or laps change.
+pub struct ReportCache {
+    /// Fingerprint: sorted list of (channel_name, data_ptr, data_len) to detect changes.
+    fingerprint: Vec<(String, usize, usize)>,
+    lap_count: usize,
+    pub stats: Vec<CachedChannelStats>,
+}
+
+impl ReportCache {
+    pub fn new() -> Self {
+        Self {
+            fingerprint: Vec::new(),
+            lap_count: 0,
+            stats: Vec::new(),
+        }
+    }
+
+    /// Returns true if the cache is still valid for the current display state.
+    pub fn is_valid(&self, registry: &[PlottedChannelInfo], lap_count: usize) -> bool {
+        if self.lap_count != lap_count || self.fingerprint.len() != registry.len() {
+            return false;
+        }
+        for (i, info) in registry.iter().enumerate() {
+            let ptr = Arc::as_ptr(&info.data) as usize;
+            let (ref name, cached_ptr, cached_len) = self.fingerprint[i];
+            if name != &info.name || cached_ptr != ptr || cached_len != info.data.len() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Rebuild the cache from current display state and laps.
+    pub fn rebuild(&mut self, registry: &[PlottedChannelInfo], laps: &[Lap]) {
+        self.fingerprint = registry
+            .iter()
+            .map(|info| {
+                (
+                    info.name.clone(),
+                    Arc::as_ptr(&info.data) as usize,
+                    info.data.len(),
+                )
+            })
+            .collect();
+        self.lap_count = laps.len();
+        self.stats.clear();
+
+        for info in registry {
+            let session = compute_channel_stats(&info.data);
+            let freq = info.freq;
+            let mut per_lap = Vec::with_capacity(laps.len());
+
+            for lap in laps {
+                let start_sample = (lap.start_time * freq as f64).floor() as usize;
+                let end_sample = (lap.end_time * freq as f64).ceil() as usize;
+                let start = start_sample.min(info.data.len());
+                let end = end_sample.min(info.data.len());
+                if start < end {
+                    let stats = compute_channel_stats(&info.data[start..end]);
+                    per_lap.push((lap.number, stats.0, stats.1, stats.2, stats.3));
+                }
+            }
+
+            self.stats.push(CachedChannelStats {
+                name: info.name.clone(),
+                color: info.color,
+                dec_places: info.dec_places,
+                session,
+                per_lap,
+            });
+        }
+    }
+}
+
 /// State shared across all panels.
 pub struct SharedState {
     pub ld_file: Option<Arc<LdFile>>,
@@ -164,6 +249,9 @@ pub struct SharedState {
     // Math channels
     pub math_channels: Vec<MathChannelDef>,
 
+    // Report cache
+    pub report_cache: ReportCache,
+
     // Next panel ID counter
     pub next_panel_id: u64,
 }
@@ -188,6 +276,7 @@ impl SharedState {
             dragging_channel: None,
             pending_toggle_channel: None,
             math_channels: Vec::new(),
+            report_cache: ReportCache::new(),
             next_panel_id: 1,
         }
     }

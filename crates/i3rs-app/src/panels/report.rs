@@ -17,12 +17,22 @@ impl ReportPanel {
         }
     }
 
-    pub fn ui(&self, ui: &mut egui::Ui, shared: &SharedState) {
+    pub fn ui(&self, ui: &mut egui::Ui, shared: &mut SharedState) {
         if shared.display_channel_registry.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label("Plot some channels to see statistics");
             });
             return;
+        }
+
+        // Rebuild cache if channels or laps changed
+        if !shared
+            .report_cache
+            .is_valid(&shared.display_channel_registry, shared.laps.len())
+        {
+            shared
+                .report_cache
+                .rebuild(&shared.display_channel_registry, &shared.laps);
         }
 
         egui::ScrollArea::both()
@@ -42,13 +52,11 @@ impl ReportPanel {
                         ui.strong("StdDev");
                         ui.end_row();
 
-                        for info in &shared.display_channel_registry {
-                            let freq = info.freq;
-                            let dec = info.dec_places.max(0) as usize;
+                        for cached in &shared.report_cache.stats {
+                            let dec = cached.dec_places.max(0) as usize;
+                            let (min, max, avg, stddev) = cached.session;
 
-                            // Full session stats
-                            let (min, max, avg, stddev) = compute_stats(&info.data);
-                            ui.colored_label(info.color, &info.name);
+                            ui.colored_label(cached.color, &cached.name);
                             ui.label("All");
                             ui.monospace(format!("{:.prec$}", min, prec = dec));
                             ui.monospace(format!("{:.prec$}", max, prec = dec));
@@ -57,41 +65,28 @@ impl ReportPanel {
                             ui.end_row();
 
                             // Per-lap stats
-                            for lap in &shared.laps {
-                                let start_sample =
-                                    (lap.start_time * freq as f64).floor() as usize;
-                                let end_sample =
-                                    (lap.end_time * freq as f64).ceil() as usize;
-                                let start = start_sample.min(info.data.len());
-                                let end = end_sample.min(info.data.len());
+                            for &(lap_number, lmin, lmax, lavg, lstddev) in &cached.per_lap {
+                                let is_selected = shared.selected_lap
+                                    == shared
+                                        .laps
+                                        .iter()
+                                        .position(|l| l.number == lap_number);
+                                let label = format!("Lap {}", lap_number);
 
-                                if start < end {
-                                    let slice = &info.data[start..end];
-                                    let (lmin, lmax, lavg, lstddev) = compute_stats(slice);
-
-                                    let is_selected = shared.selected_lap
-                                        == shared.laps.iter().position(|l| l.number == lap.number);
-                                    let label = format!("Lap {}", lap.number);
-
-                                    ui.label(""); // empty channel column
-                                    if is_selected {
-                                        ui.strong(&label);
-                                    } else {
-                                        ui.label(&label);
-                                    }
-                                    ui.monospace(format!("{:.prec$}", lmin, prec = dec));
-                                    ui.monospace(format!("{:.prec$}", lmax, prec = dec));
-                                    ui.monospace(format!("{:.prec$}", lavg, prec = dec));
-                                    ui.monospace(format!("{:.prec$}", lstddev, prec = dec));
-                                    ui.end_row();
+                                ui.label(""); // empty channel column
+                                if is_selected {
+                                    ui.strong(&label);
+                                } else {
+                                    ui.label(&label);
                                 }
+                                ui.monospace(format!("{:.prec$}", lmin, prec = dec));
+                                ui.monospace(format!("{:.prec$}", lmax, prec = dec));
+                                ui.monospace(format!("{:.prec$}", lavg, prec = dec));
+                                ui.monospace(format!("{:.prec$}", lstddev, prec = dec));
+                                ui.end_row();
                             }
                         }
                     });
             });
     }
-}
-
-fn compute_stats(data: &[f64]) -> (f64, f64, f64, f64) {
-    crate::state::compute_channel_stats(data)
 }

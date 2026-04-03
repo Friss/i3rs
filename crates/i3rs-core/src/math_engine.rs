@@ -323,11 +323,15 @@ fn finite_derivative(data: &[f64], freq: u16) -> Vec<f64> {
 }
 
 fn cumulative_integral(data: &[f64], freq: u16) -> Vec<f64> {
+    if data.is_empty() {
+        return Vec::new();
+    }
     let dt = 1.0 / freq as f64;
     let mut result = Vec::with_capacity(data.len());
     let mut sum = 0.0;
-    for &val in data {
-        sum += val * dt;
+    result.push(0.0);
+    for i in 0..data.len() - 1 {
+        sum += (data[i] + data[i + 1]) * 0.5 * dt;
         result.push(sum);
     }
     result
@@ -500,9 +504,9 @@ mod tests {
     fn eval_integrate() {
         let channels = make_channels();
         // Speed = [10, 20, 30, 40, 50] at 1Hz, dt = 1.0
-        // Integral: [10, 30, 60, 100, 150]
+        // Trapezoidal rule: [0, 15, 40, 75, 120]
         let (result, _) = evaluate_expression("integrate(Speed)", &channels).unwrap();
-        assert_eq!(result, vec![10.0, 30.0, 60.0, 100.0, 150.0]);
+        assert_eq!(result, vec![0.0, 15.0, 40.0, 75.0, 120.0]);
     }
 
     #[test]

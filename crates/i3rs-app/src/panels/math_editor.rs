@@ -48,8 +48,18 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
                 .desired_width(f32::INFINITY)
                 .code_editor(),
         );
+        let name_conflict = is_duplicate_name(&editor.new_name, shared, None);
+        if name_conflict {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 200, 100),
+                format!("⚠ A channel named \"{}\" already exists", editor.new_name),
+            );
+        }
         if ui
-            .add_enabled(!editor.new_name.is_empty() && !editor.new_expression.is_empty(), egui::Button::new("Add Channel"))
+            .add_enabled(
+                !editor.new_name.is_empty() && !editor.new_expression.is_empty() && !name_conflict,
+                egui::Button::new("Add Channel"),
+            )
             .clicked()
         {
             let mut mc = MathChannelDef::new(
@@ -213,13 +223,93 @@ fn eval_mc(mc: &mut MathChannelDef, channel_data: &HashMap<String, ChannelData>)
     }
 }
 
-/// Evaluate all math channels in order.
+/// Evaluate all math channels in dependency order (topological sort).
 pub fn evaluate_all_math_channels(shared: &mut SharedState) {
-    for i in 0..shared.math_channels.len() {
+    let order = topological_eval_order(shared);
+    for i in order {
         let expr = shared.math_channels[i].expression.clone();
         let channel_data = build_channel_data_map(shared, &expr, i);
         eval_mc(&mut shared.math_channels[i], &channel_data);
     }
+}
+
+/// Compute a topological evaluation order for math channels based on their dependencies.
+/// Falls back to original index order for channels involved in cycles.
+fn topological_eval_order(shared: &SharedState) -> Vec<usize> {
+    let n = shared.math_channels.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Build name→index map for math channels
+    let name_to_idx: HashMap<String, usize> = shared
+        .math_channels
+        .iter()
+        .enumerate()
+        .map(|(i, mc)| (mc.name.clone(), i))
+        .collect();
+
+    // Build adjacency: deps[i] = set of math channel indices that channel i depends on
+    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(n);
+    for mc in &shared.math_channels {
+        let refs = match i3rs_core::parse_expression(&mc.expression) {
+            Ok(expr) => i3rs_core::referenced_channels(&expr),
+            Err(_) => Vec::new(),
+        };
+        let dep_indices: Vec<usize> = refs
+            .iter()
+            .filter_map(|r| name_to_idx.get(r).copied())
+            .collect();
+        deps.push(dep_indices);
+    }
+
+    // Kahn's algorithm for topological sort
+    let mut in_degree = vec![0usize; n];
+    for dep_list in &deps {
+        for &dep in dep_list {
+            in_degree[dep] += 1;
+        }
+    }
+
+    // Note: in_degree counts how many channels depend on each channel,
+    // but we want to evaluate dependencies first. Reverse the direction:
+    // in_degree[i] = number of channels that i depends on.
+    let mut in_degree = vec![0usize; n];
+    for (i, dep_list) in deps.iter().enumerate() {
+        in_degree[i] = dep_list.len();
+    }
+
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for i in 0..n {
+        if in_degree[i] == 0 {
+            queue.push_back(i);
+        }
+    }
+
+    let mut order = Vec::with_capacity(n);
+    while let Some(idx) = queue.pop_front() {
+        order.push(idx);
+        // For every channel that depends on idx, decrease in_degree
+        for (i, dep_list) in deps.iter().enumerate() {
+            if dep_list.contains(&idx) {
+                in_degree[i] -= 1;
+                if in_degree[i] == 0 {
+                    queue.push_back(i);
+                }
+            }
+        }
+    }
+
+    // Any remaining channels (cycles) — append in original order
+    if order.len() < n {
+        for i in 0..n {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+        }
+    }
+
+    order
 }
 
 /// Save math channels to a JSON file.
@@ -273,4 +363,28 @@ pub fn load_math_channels(shared: &mut SharedState) {
             Err(e) => eprintln!("Failed to read file: {}", e),
         }
     }
+}
+
+/// Check if a channel name conflicts with existing physical or math channels.
+/// `exclude_math_idx` allows excluding a specific math channel (for edits).
+fn is_duplicate_name(name: &str, shared: &SharedState, exclude_math_idx: Option<usize>) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // Check physical channels
+    if let Some(ld) = &shared.ld_file {
+        if ld.channels.iter().any(|ch| ch.name.eq_ignore_ascii_case(name)) {
+            return true;
+        }
+    }
+    // Check other math channels
+    for (i, mc) in shared.math_channels.iter().enumerate() {
+        if Some(i) == exclude_math_idx {
+            continue;
+        }
+        if mc.name.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+    false
 }
