@@ -2,6 +2,7 @@
 
 use eframe::egui;
 use i3rs_core::{Lap, LdFile, LdxFile};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -249,6 +250,9 @@ pub struct SharedState {
     // Math channels
     pub math_channels: Vec<MathChannelDef>,
 
+    // Channel aliases: maps alias name → canonical channel name
+    pub channel_aliases: HashMap<String, String>,
+
     // Report cache
     pub report_cache: ReportCache,
 
@@ -276,6 +280,7 @@ impl SharedState {
             dragging_channel: None,
             pending_toggle_channel: None,
             math_channels: Vec::new(),
+            channel_aliases: HashMap::new(),
             report_cache: ReportCache::new(),
             next_panel_id: 1,
         }

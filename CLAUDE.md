@@ -43,7 +43,7 @@ Three crates in `crates/`:
 - `panels/channel_browser.rs` — Searchable channel list with drag-and-drop, includes math channels section
 - `panels/cursor_readout.rs` — Shows all plotted channel values at cursor time
 - `panels/timeline.rs` — Overview bar with draggable zoom window
-- `panels/math_editor.rs` — Math channel definition UI: add/edit/delete/evaluate expressions
+- `panels/math_editor.rs` — Math channel definition UI: add/edit/delete/evaluate expressions, predefined calculation templates, channel alias management
 - `panels/report.rs` — Statistics report panel: min/max/avg/stddev per channel per lap
 
 ## Architecture Notes
@@ -73,4 +73,4 @@ Full format docs: `docs/ld-file-format.md`
 
 ## Current Status
 
-Milestones 1–4 substantially complete. Remaining Milestone 4 items: predefined calculations, unit conversion, channel aliases, data gating. Next up: Milestone 5 (track map).
+Milestones 1–4 complete. Next up: Milestone 5 (track map).

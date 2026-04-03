@@ -37,6 +37,14 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+    Eq,
+    Neq,
+    And,
+    Or,
 }
 
 impl fmt::Display for BinOp {
@@ -47,6 +55,14 @@ impl fmt::Display for BinOp {
             BinOp::Mul => write!(f, "*"),
             BinOp::Div => write!(f, "/"),
             BinOp::Mod => write!(f, "%"),
+            BinOp::Gt => write!(f, ">"),
+            BinOp::Lt => write!(f, "<"),
+            BinOp::Gte => write!(f, ">="),
+            BinOp::Lte => write!(f, "<="),
+            BinOp::Eq => write!(f, "=="),
+            BinOp::Neq => write!(f, "!="),
+            BinOp::And => write!(f, "&&"),
+            BinOp::Or => write!(f, "||"),
         }
     }
 }
@@ -83,6 +99,15 @@ enum Token {
     Star,
     Slash,
     Percent,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+    EqEq,
+    BangEq,
+    AmpAmp,
+    PipePipe,
+    Bang,
     LParen,
     RParen,
     Comma,
@@ -119,6 +144,63 @@ impl<'a> Tokenizer<'a> {
                 b'*' => { self.pos += 1; Token::Star }
                 b'/' => { self.pos += 1; Token::Slash }
                 b'%' => { self.pos += 1; Token::Percent }
+                b'>' => {
+                    self.pos += 1;
+                    if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'=' {
+                        self.pos += 1; Token::Gte
+                    } else {
+                        Token::Gt
+                    }
+                }
+                b'<' => {
+                    self.pos += 1;
+                    if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'=' {
+                        self.pos += 1; Token::Lte
+                    } else {
+                        Token::Lt
+                    }
+                }
+                b'=' => {
+                    self.pos += 1;
+                    if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'=' {
+                        self.pos += 1; Token::EqEq
+                    } else {
+                        return Err(ParseError {
+                            message: "use '==' for equality comparison".into(),
+                            position: start,
+                        });
+                    }
+                }
+                b'!' => {
+                    self.pos += 1;
+                    if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'=' {
+                        self.pos += 1; Token::BangEq
+                    } else {
+                        Token::Bang
+                    }
+                }
+                b'&' => {
+                    self.pos += 1;
+                    if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'&' {
+                        self.pos += 1; Token::AmpAmp
+                    } else {
+                        return Err(ParseError {
+                            message: "use '&&' for logical AND".into(),
+                            position: start,
+                        });
+                    }
+                }
+                b'|' => {
+                    self.pos += 1;
+                    if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'|' {
+                        self.pos += 1; Token::PipePipe
+                    } else {
+                        return Err(ParseError {
+                            message: "use '||' for logical OR".into(),
+                            position: start,
+                        });
+                    }
+                }
                 b'(' => { self.pos += 1; Token::LParen }
                 b')' => { self.pos += 1; Token::RParen }
                 b',' => { self.pos += 1; Token::Comma }
@@ -211,6 +293,17 @@ const BUILTIN_FUNCTIONS: &[&str] = &[
     "log", "ln", "exp", "pow",
     "floor", "ceil", "round",
     "clamp",
+    // Data gating
+    "gate", "if_then",
+    // Unit conversion
+    "kmh_to_mph", "mph_to_kmh",
+    "c_to_f", "f_to_c",
+    "kpa_to_psi", "psi_to_kpa",
+    "bar_to_psi", "psi_to_bar",
+    "deg_to_rad", "rad_to_deg",
+    "kg_to_lb", "lb_to_kg",
+    "m_to_ft", "ft_to_m",
+    "nm_to_lbft", "lbft_to_nm",
 ];
 
 fn is_builtin_function(name: &str) -> bool {
@@ -257,9 +350,56 @@ impl Parser {
         }
     }
 
-    // expr = additive
+    // expr = or_expr
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_additive()
+        self.parse_or()
+    }
+
+    // or_expr = and_expr ('||' and_expr)*
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_and()?;
+        loop {
+            if self.peek() == Some(&Token::PipePipe) {
+                self.advance();
+                let right = self.parse_and()?;
+                left = Expr::BinaryOp(Box::new(left), BinOp::Or, Box::new(right));
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    // and_expr = comparison ('&&' comparison)*
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_comparison()?;
+        loop {
+            if self.peek() == Some(&Token::AmpAmp) {
+                self.advance();
+                let right = self.parse_comparison()?;
+                left = Expr::BinaryOp(Box::new(left), BinOp::And, Box::new(right));
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    // comparison = additive (('>' | '<' | '>=' | '<=' | '==' | '!=') additive)?
+    fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
+        let left = self.parse_additive()?;
+        let op = match self.peek() {
+            Some(Token::Gt) => BinOp::Gt,
+            Some(Token::Lt) => BinOp::Lt,
+            Some(Token::Gte) => BinOp::Gte,
+            Some(Token::Lte) => BinOp::Lte,
+            Some(Token::EqEq) => BinOp::Eq,
+            Some(Token::BangEq) => BinOp::Neq,
+            _ => return Ok(left),
+        };
+        self.advance();
+        let right = self.parse_additive()?;
+        Ok(Expr::BinaryOp(Box::new(left), op, Box::new(right)))
     }
 
     // additive = multiplicative (('+' | '-') multiplicative)*
@@ -295,12 +435,21 @@ impl Parser {
         Ok(left)
     }
 
-    // unary = '-' unary | primary
+    // unary = '-' unary | '!' unary | primary
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         if self.peek() == Some(&Token::Minus) {
             self.advance();
             let expr = self.parse_unary()?;
             Ok(Expr::UnaryNeg(Box::new(expr)))
+        } else if self.peek() == Some(&Token::Bang) {
+            self.advance();
+            let expr = self.parse_unary()?;
+            // Logical NOT: implemented as (x == 0) — truthy if zero
+            Ok(Expr::BinaryOp(
+                Box::new(expr),
+                BinOp::Eq,
+                Box::new(Expr::Number(0.0)),
+            ))
         } else {
             self.parse_primary()
         }
@@ -540,5 +689,62 @@ mod tests {
     #[test]
     fn parse_error_trailing_tokens() {
         assert!(parse_expression("a b").is_err());
+    }
+
+    #[test]
+    fn parse_comparison() {
+        let expr = parse_expression("a > b").unwrap();
+        assert_eq!(
+            expr,
+            Expr::BinaryOp(
+                Box::new(Expr::Channel("a".into())),
+                BinOp::Gt,
+                Box::new(Expr::Channel("b".into())),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_logical_and_or() {
+        let expr = parse_expression("a > 1 && b < 2").unwrap();
+        assert_eq!(
+            expr,
+            Expr::BinaryOp(
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Channel("a".into())),
+                    BinOp::Gt,
+                    Box::new(Expr::Number(1.0)),
+                )),
+                BinOp::And,
+                Box::new(Expr::BinaryOp(
+                    Box::new(Expr::Channel("b".into())),
+                    BinOp::Lt,
+                    Box::new(Expr::Number(2.0)),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_gate_function() {
+        let expr = parse_expression("gate(Speed, Speed > 25)").unwrap();
+        let channels = referenced_channels(&expr);
+        assert_eq!(channels, vec!["Speed"]);
+    }
+
+    #[test]
+    fn parse_if_then_function() {
+        let expr = parse_expression("if_then(Speed > 100, Speed, 0)").unwrap();
+        let channels = referenced_channels(&expr);
+        assert_eq!(channels, vec!["Speed"]);
+    }
+
+    #[test]
+    fn parse_unit_conversion() {
+        let expr = parse_expression("kmh_to_mph(Speed)").unwrap();
+        assert_eq!(
+            expr,
+            Expr::FuncCall("kmh_to_mph".into(), vec![Expr::Channel("Speed".into())])
+        );
     }
 }
