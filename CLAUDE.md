@@ -31,15 +31,20 @@ Three crates in `crates/`:
 - `ldx_parser.rs` — XML sidecar parser for lap timing. `find_ldx_for_ld()` locates the .ldx next to a .ld file
 - `lap_detect.rs` — Detects lap boundaries from "Lap Number" channel data
 - `downsample.rs` — Min-max decimation for efficient chart rendering
+- `math_expr.rs` — Recursive descent expression parser (AST: `Expr`, `BinOp`)
+- `math_engine.rs` — Expression evaluator with built-in functions, channel resampling, `evaluate_expression()` entry point
+- `export.rs` — CSV export with multi-frequency resampling
 
 ### i3rs-app (`crates/i3rs-app/src/`)
-- `app.rs` — Top-level `I3rsApp` struct, egui-dock layout, file open logic
-- `state.rs` — `SharedState`: cursor position, zoom range, selected lap, channel data cache
-- `workspace.rs` — Save/load workspace layouts as JSON
-- `panels/graph.rs` — Main graph panel (largest file ~23KB): multi-channel time-series, overlay/tiled modes, dual Y-axes, zoom/pan
-- `panels/channel_browser.rs` — Searchable channel list with drag-and-drop
+- `app.rs` — Top-level `App` struct, egui-dock layout, file open logic, menu bar
+- `state.rs` — `SharedState`: cursor position, zoom range, selected lap, channel data cache, `ChannelId` (Physical/Math), `MathChannelDef`
+- `workspace.rs` — Save/load workspace layouts + math channels as JSON
+- `panels/graph.rs` — Main graph panel: multi-channel time-series, overlay/tiled modes, dual Y-axes, zoom/pan. Uses `ChannelId` for both physical and math channels
+- `panels/channel_browser.rs` — Searchable channel list with drag-and-drop, includes math channels section
 - `panels/cursor_readout.rs` — Shows all plotted channel values at cursor time
 - `panels/timeline.rs` — Overview bar with draggable zoom window
+- `panels/math_editor.rs` — Math channel definition UI: add/edit/delete/evaluate expressions
+- `panels/report.rs` — Statistics report panel: min/max/avg/stddev per channel per lap
 
 ## Architecture Notes
 
@@ -68,4 +73,4 @@ Full format docs: `docs/ld-file-format.md`
 
 ## Current Status
 
-Milestones 1–3 complete (core parsing, multi-channel graphs, workspace layout with cursor sync). Next up: Milestone 4 (math engine + reports).
+Milestones 1–4 substantially complete. Remaining Milestone 4 items: predefined calculations, unit conversion, channel aliases, data gating. Next up: Milestone 5 (track map).

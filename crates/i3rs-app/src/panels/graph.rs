@@ -1,19 +1,54 @@
 //! Graph panel: time-series plotting with overlay and tiled modes.
 
-use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints, VLine};
-use i3rs_core::{Lap, LdFile, downsample_minmax};
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use eframe::egui;
+use egui_plot::{Line, Plot, PlotPoints, VLine};
+use i3rs_core::{Lap, downsample_minmax};
+
 use crate::state::{
-    CHANNEL_COLORS, GraphMode, PlottedChannel, PlottedChannelInfo, SharedState, YAxis,
+    CHANNEL_COLORS, ChannelId, GraphMode, PlottedChannel, PlottedChannelInfo, SharedState, YAxis,
 };
+
+/// Resolve channel metadata (name, unit, freq, dec_places) from a ChannelId.
+fn resolve_channel_meta(id: ChannelId, shared: &SharedState) -> (String, String, u16, i16) {
+    match id {
+        ChannelId::Physical(idx) => {
+            if let Some(ld) = &shared.ld_file
+                && let Some(ch) = ld.channels.get(idx)
+            {
+                (ch.name.clone(), ch.unit.clone(), ch.freq, ch.dec_places)
+            } else {
+                ("???".into(), String::new(), 0, 0)
+            }
+        }
+        ChannelId::Math(idx) => {
+            if let Some(mc) = shared.math_channels.get(idx) {
+                (mc.name.clone(), mc.unit.clone(), mc.freq, mc.dec_places)
+            } else {
+                ("???".into(), String::new(), 0, 0)
+            }
+        }
+    }
+}
+
+/// Build a freq map for a set of plotted channels (used to pass into closures).
+fn build_freq_map(channels: &[&PlottedChannel], shared: &SharedState) -> HashMap<ChannelId, u16> {
+    channels
+        .iter()
+        .map(|pc| {
+            let (_, _, freq, _) = resolve_channel_meta(pc.channel_id, shared);
+            (pc.channel_id, freq)
+        })
+        .collect()
+}
 
 /// Actions from context menus.
 enum ContextAction {
-    Remove(usize),
-    ChangeColor(usize, egui::Color32),
-    SetYAxis(usize, YAxis),
+    Remove(ChannelId),
+    ChangeColor(ChannelId, egui::Color32),
+    SetYAxis(ChannelId, YAxis),
 }
 
 /// A single graph panel with its own set of plotted channels.
@@ -39,76 +74,76 @@ impl GraphPanel {
         }
     }
 
-    pub fn add_channel(&mut self, channel_index: usize, ld: &LdFile) {
-        if self.is_channel_plotted(channel_index) {
+    pub fn add_channel(&mut self, channel_id: ChannelId, shared: &SharedState) {
+        if self.is_channel_plotted(channel_id) {
             return;
         }
-        let ch = &ld.channels[channel_index];
-        if let Some(data) = ld.read_channel_data(ch) {
-            let (cached_min, cached_max, cached_avg) = Self::compute_stats(&data);
-            let color_idx = self.plotted_channels.len() % self.colors.len();
-            self.plotted_channels.push(PlottedChannel {
-                channel_index,
-                color: self.colors[color_idx],
-                data: Arc::new(data),
-                y_axis: YAxis::Left,
-                cached_min,
-                cached_max,
-                cached_avg,
-            });
-        }
+        let (data, _name) = match channel_id {
+            ChannelId::Physical(idx) => {
+                let ld = match &shared.ld_file {
+                    Some(ld) => ld,
+                    None => return,
+                };
+                let ch = &ld.channels[idx];
+                match ld.read_channel_data(ch) {
+                    Some(d) => (d, ch.name.clone()),
+                    None => return,
+                }
+            }
+            ChannelId::Math(idx) => {
+                let mc = match shared.math_channels.get(idx) {
+                    Some(mc) => mc,
+                    None => return,
+                };
+                match &mc.data {
+                    Some(d) => ((**d).clone(), mc.name.clone()),
+                    None => return,
+                }
+            }
+        };
+        let (cached_min, cached_max, cached_avg) = Self::compute_stats(&data);
+        let color_idx = self.plotted_channels.len() % self.colors.len();
+        self.plotted_channels.push(PlottedChannel {
+            channel_id,
+            color: self.colors[color_idx],
+            data: Arc::new(data),
+            y_axis: YAxis::Left,
+            cached_min,
+            cached_max,
+            cached_avg,
+        });
     }
 
     pub fn compute_stats(data: &[f64]) -> (f64, f64, f64) {
-        let mut min = f64::MAX;
-        let mut max = f64::MIN;
-        let mut sum = 0.0;
-        let mut count = 0u64;
-        for &v in data {
-            if v.is_finite() {
-                if v < min {
-                    min = v;
-                }
-                if v > max {
-                    max = v;
-                }
-                sum += v;
-                count += 1;
-            }
-        }
-        if count == 0 {
-            return (0.0, 0.0, 0.0);
-        }
-        (min, max, sum / count as f64)
+        let (min, max, avg, _stddev) = crate::state::compute_channel_stats(data);
+        (min, max, avg)
     }
 
-    pub fn remove_channel(&mut self, channel_index: usize) {
+    pub fn remove_channel(&mut self, channel_id: ChannelId) {
         self.plotted_channels
-            .retain(|pc| pc.channel_index != channel_index);
+            .retain(|pc| pc.channel_id != channel_id);
     }
 
-    pub fn toggle_channel(&mut self, channel_index: usize, ld: &LdFile) {
-        if self.is_channel_plotted(channel_index) {
-            self.remove_channel(channel_index);
+    pub fn toggle_channel(&mut self, channel_id: ChannelId, shared: &SharedState) {
+        if self.is_channel_plotted(channel_id) {
+            self.remove_channel(channel_id);
         } else {
-            self.add_channel(channel_index, ld);
+            self.add_channel(channel_id, shared);
         }
     }
 
-    pub fn is_channel_plotted(&self, channel_index: usize) -> bool {
+    pub fn is_channel_plotted(&self, channel_id: ChannelId) -> bool {
         self.plotted_channels
             .iter()
-            .any(|pc| pc.channel_index == channel_index)
+            .any(|pc| pc.channel_id == channel_id)
     }
 
     /// Render the graph panel UI.
     pub fn ui(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
         // Handle pending channel toggle from browser
-        if let Some(ch_idx) = shared.pending_toggle_channel.take()
-            && let Some(ld) = &shared.ld_file
-        {
+        if let Some(ch_id) = shared.pending_toggle_channel.take() {
             let was_empty = self.plotted_channels.is_empty();
-            self.toggle_channel(ch_idx, ld);
+            self.toggle_channel(ch_id, shared);
             if was_empty && !self.plotted_channels.is_empty() {
                 self.needs_zoom_reset = true;
             }
@@ -117,12 +152,11 @@ impl GraphPanel {
         // Handle drop from channel browser
         if shared.dragging_channel.is_some()
             && ui.input(|i| i.pointer.any_released())
-            && let Some(ch_idx) = shared.dragging_channel.take()
+            && let Some(ch_id) = shared.dragging_channel.take()
             && ui.ui_contains_pointer()
-            && let Some(ld) = &shared.ld_file
         {
             let was_empty = self.plotted_channels.is_empty();
-            self.add_channel(ch_idx, ld);
+            self.add_channel(ch_id, shared);
             if was_empty && !self.plotted_channels.is_empty() {
                 self.needs_zoom_reset = true;
             }
@@ -135,18 +169,13 @@ impl GraphPanel {
             return;
         }
 
-        let ld = match &shared.ld_file {
-            Some(ld) => ld.clone(),
-            None => return,
-        };
-
         for pc in &self.plotted_channels {
-            let ch = &ld.channels[pc.channel_index];
+            let (name, unit, freq, dec_places) = resolve_channel_meta(pc.channel_id, shared);
             shared.plotted_channel_registry.push(PlottedChannelInfo {
-                name: ch.name.clone(),
-                unit: ch.unit.clone(),
-                freq: ch.freq,
-                dec_places: ch.dec_places,
+                name,
+                unit,
+                freq,
+                dec_places,
                 color: pc.color,
                 data: pc.data.clone(),
             });
@@ -156,8 +185,8 @@ impl GraphPanel {
         self.needs_zoom_reset = false;
 
         match self.graph_mode {
-            GraphMode::Overlay => self.show_overlay_graph(ui, shared, &ld, needs_zoom_reset),
-            GraphMode::Tiled => self.show_tiled_graphs(ui, shared, &ld, needs_zoom_reset),
+            GraphMode::Overlay => self.show_overlay_graph(ui, shared, needs_zoom_reset),
+            GraphMode::Tiled => self.show_tiled_graphs(ui, shared, needs_zoom_reset),
         }
     }
 
@@ -165,7 +194,6 @@ impl GraphPanel {
         &mut self,
         ui: &mut egui::Ui,
         shared: &mut SharedState,
-        ld: &LdFile,
         needs_zoom_reset: bool,
     ) {
         let cursor_group = egui::Id::new("global_cursor_link");
@@ -198,6 +226,7 @@ impl GraphPanel {
         let data_duration = shared.data_duration.unwrap_or(f64::MAX);
 
         let y_range = Self::compute_y_range(&plotted);
+        let freq_map = build_freq_map(&plotted, shared);
 
         let response = plot.show(ui, |plot_ui| {
             if needs_zoom_reset {
@@ -215,7 +244,7 @@ impl GraphPanel {
                 plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
             }
 
-            Self::draw_channels(plot_ui, &plotted, ld);
+            Self::draw_channels(plot_ui, &plotted, &freq_map);
 
             if show_markers {
                 Self::draw_lap_markers(plot_ui, &laps);
@@ -236,7 +265,7 @@ impl GraphPanel {
             shared.cursor_time = Some(t);
         }
 
-        Self::draw_legend(ui, response.response.rect, &plotted, ld, shared.cursor_time);
+        Self::draw_legend(ui, response.response.rect, &plotted, shared, shared.cursor_time);
 
         if needs_zoom_reset {
             shared.zoom_range = Some((0.0, data_duration));
@@ -249,14 +278,13 @@ impl GraphPanel {
             ));
         }
 
-        self.handle_context_menu(&response.response, ld);
+        self.handle_context_menu(&response.response, shared);
     }
 
     fn show_tiled_graphs(
         &mut self,
         ui: &mut egui::Ui,
         shared: &mut SharedState,
-        ld: &LdFile,
         needs_zoom_reset: bool,
     ) {
         let cursor_group = egui::Id::new("global_cursor_link");
@@ -267,6 +295,16 @@ impl GraphPanel {
         let zoom_range = shared.zoom_range;
         let data_duration = shared.data_duration.unwrap_or(f64::MAX);
         let n = self.plotted_channels.len();
+
+        // Pre-compute metadata for each channel to avoid borrowing shared inside closures
+        let channel_meta: Vec<(String, String, u16, i16)> = self
+            .plotted_channels
+            .iter()
+            .map(|pc| resolve_channel_meta(pc.channel_id, shared))
+            .collect();
+
+        let all_plotted: Vec<&PlottedChannel> = self.plotted_channels.iter().collect();
+        let freq_map = build_freq_map(&all_plotted, shared);
 
         let available_height = ui.available_height();
         let tile_height = (available_height / n as f32).max(80.0);
@@ -282,12 +320,12 @@ impl GraphPanel {
                 let mut responses = Vec::new();
 
                 for (i, pc) in self.plotted_channels.iter().enumerate() {
-                    let ch = &ld.channels[pc.channel_index];
+                    let (ref name, ref unit, _freq, _dec) = channel_meta[i];
                     let plot_id = format!("tile_{}_{}", self.id, i);
-                    let y_label = if ch.unit.is_empty() {
-                        ch.name.clone()
+                    let y_label = if unit.is_empty() {
+                        name.clone()
                     } else {
-                        format!("{} ({})", ch.name, ch.unit)
+                        format!("{} ({})", name, unit)
                     };
 
                     let mut plot = Plot::new(plot_id)
@@ -332,7 +370,7 @@ impl GraphPanel {
                             plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
                         }
 
-                        Self::draw_channels(plot_ui, &single, ld);
+                        Self::draw_channels(plot_ui, &single, &freq_map);
 
                         if show_markers {
                             Self::draw_lap_markers(plot_ui, &laps);
@@ -360,13 +398,20 @@ impl GraphPanel {
                         }
                     }
 
-                    Self::draw_legend(ui, resp.response.rect, &single, ld, shared.cursor_time);
+                    // Draw legend with pre-computed metadata
+                    Self::draw_tile_legend(
+                        ui,
+                        resp.response.rect,
+                        pc,
+                        &channel_meta[i],
+                        cursor_time,
+                    );
 
-                    responses.push((pc.channel_index, resp.response));
+                    responses.push((pc.channel_id, resp.response));
                 }
 
-                for (ch_idx, resp) in &responses {
-                    self.handle_tile_context_menu(resp, *ch_idx, ld);
+                for (ch_id, resp) in &responses {
+                    self.handle_tile_context_menu_with_meta(resp, *ch_id, &channel_meta);
                 }
             });
 
@@ -427,7 +472,11 @@ impl GraphPanel {
         }
     }
 
-    fn draw_channels(plot_ui: &mut egui_plot::PlotUi, channels: &[&PlottedChannel], ld: &LdFile) {
+    fn draw_channels(
+        plot_ui: &mut egui_plot::PlotUi,
+        channels: &[&PlottedChannel],
+        freq_map: &HashMap<ChannelId, u16>,
+    ) {
         let bounds = plot_ui.plot_bounds();
         let x_min = bounds.min()[0];
         let x_max = bounds.max()[0];
@@ -435,8 +484,7 @@ impl GraphPanel {
         let target_width = pixels_wide.max(100);
 
         for pc in channels {
-            let ch = &ld.channels[pc.channel_index];
-            let freq = ch.freq;
+            let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
             if freq == 0 {
                 continue;
             }
@@ -475,62 +523,86 @@ impl GraphPanel {
         ui: &egui::Ui,
         plot_rect: egui::Rect,
         channels: &[&PlottedChannel],
-        ld: &LdFile,
+        shared: &SharedState,
         cursor_time: Option<f64>,
     ) {
-        let painter = ui.painter();
-        let font = egui::FontId::proportional(11.0);
         let line_height = 15.0;
         let pad = 4.0;
-
         for (i, pc) in channels.iter().enumerate() {
-            let ch = &ld.channels[pc.channel_index];
+            let meta = resolve_channel_meta(pc.channel_id, shared);
             let y = plot_rect.top() + pad + i as f32 * line_height;
+            Self::draw_legend_entry(ui, plot_rect, pc, &meta, cursor_time, y);
+        }
+    }
 
-            let swatch = egui::Rect::from_min_size(
-                egui::pos2(plot_rect.left() + pad, y + 2.0),
-                egui::vec2(8.0, 8.0),
-            );
-            painter.rect_filled(swatch, 1.0, pc.color);
+    fn draw_tile_legend(
+        ui: &egui::Ui,
+        plot_rect: egui::Rect,
+        pc: &PlottedChannel,
+        meta: &(String, String, u16, i16),
+        cursor_time: Option<f64>,
+    ) {
+        let pad = 4.0;
+        let y = plot_rect.top() + pad;
+        Self::draw_legend_entry(ui, plot_rect, pc, meta, cursor_time, y);
+    }
 
-            let name_x = swatch.right() + 4.0;
-            let mut left_text = ch.name.clone();
+    fn draw_legend_entry(
+        ui: &egui::Ui,
+        plot_rect: egui::Rect,
+        pc: &PlottedChannel,
+        meta: &(String, String, u16, i16),
+        cursor_time: Option<f64>,
+        y: f32,
+    ) {
+        let (ref name, ref unit, freq, dec_places) = *meta;
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(11.0);
+        let pad = 4.0;
 
-            if let Some(t) = cursor_time {
-                let val = crate::panels::cursor_readout::interpolate_at_time(&pc.data, ch.freq, t);
-                let dec = ch.dec_places.max(0) as usize;
-                if ch.unit.is_empty() {
-                    left_text = format!("{}: {:.prec$}", ch.name, val, prec = dec);
-                } else {
-                    left_text = format!("{}: {:.prec$} {}", ch.name, val, ch.unit, prec = dec);
-                }
+        let swatch = egui::Rect::from_min_size(
+            egui::pos2(plot_rect.left() + pad, y + 2.0),
+            egui::vec2(8.0, 8.0),
+        );
+        painter.rect_filled(swatch, 1.0, pc.color);
+
+        let name_x = swatch.right() + 4.0;
+        let mut left_text = name.clone();
+
+        if let Some(t) = cursor_time {
+            let val = crate::panels::cursor_readout::interpolate_at_time(&pc.data, freq, t);
+            let dec = dec_places.max(0) as usize;
+            if unit.is_empty() {
+                left_text = format!("{}: {:.prec$}", name, val, prec = dec);
+            } else {
+                left_text = format!("{}: {:.prec$} {}", name, val, unit, prec = dec);
             }
+        }
 
+        painter.text(
+            egui::pos2(name_x, y),
+            egui::Align2::LEFT_TOP,
+            &left_text,
+            font.clone(),
+            pc.color,
+        );
+
+        if !pc.data.is_empty() {
+            let dec = dec_places.max(0) as usize;
+            let stats = format!(
+                "min {:.prec$}  avg {:.prec$}  max {:.prec$}",
+                pc.cached_min,
+                pc.cached_avg,
+                pc.cached_max,
+                prec = dec,
+            );
             painter.text(
-                egui::pos2(name_x, y),
-                egui::Align2::LEFT_TOP,
-                &left_text,
+                egui::pos2(plot_rect.right() - pad, y),
+                egui::Align2::RIGHT_TOP,
+                &stats,
                 font.clone(),
-                pc.color,
+                egui::Color32::from_gray(180),
             );
-
-            if !pc.data.is_empty() {
-                let dec = ch.dec_places.max(0) as usize;
-                let stats = format!(
-                    "min {:.prec$}  avg {:.prec$}  max {:.prec$}",
-                    pc.cached_min,
-                    pc.cached_avg,
-                    pc.cached_max,
-                    prec = dec,
-                );
-                painter.text(
-                    egui::pos2(plot_rect.right() - pad, y),
-                    egui::Align2::RIGHT_TOP,
-                    &stats,
-                    font.clone(),
-                    egui::Color32::from_gray(180),
-                );
-            }
         }
     }
 
@@ -552,7 +624,7 @@ impl GraphPanel {
         }
     }
 
-    fn handle_context_menu(&mut self, response: &egui::Response, ld: &LdFile) {
+    fn handle_context_menu(&mut self, response: &egui::Response, shared: &SharedState) {
         response.context_menu(|ui| {
             ui.label("Channels:");
             ui.separator();
@@ -560,10 +632,10 @@ impl GraphPanel {
             let mut action: Option<ContextAction> = None;
 
             for pc in &self.plotted_channels {
-                let ch = &ld.channels[pc.channel_index];
-                ui.menu_button(&ch.name, |ui| {
+                let (name, _, _, _) = resolve_channel_meta(pc.channel_id, shared);
+                ui.menu_button(&name, |ui| {
                     if ui.button("Remove").clicked() {
-                        action = Some(ContextAction::Remove(pc.channel_index));
+                        action = Some(ContextAction::Remove(pc.channel_id));
                         ui.close();
                     }
                     ui.separator();
@@ -578,17 +650,17 @@ impl GraphPanel {
                         );
                         ui.painter().rect_filled(swatch, 2.0, c);
                         if resp.clicked() {
-                            action = Some(ContextAction::ChangeColor(pc.channel_index, c));
+                            action = Some(ContextAction::ChangeColor(pc.channel_id, c));
                             ui.close();
                         }
                     }
                     ui.separator();
                     if ui.button("Move to Left Y-axis").clicked() {
-                        action = Some(ContextAction::SetYAxis(pc.channel_index, YAxis::Left));
+                        action = Some(ContextAction::SetYAxis(pc.channel_id, YAxis::Left));
                         ui.close();
                     }
                     if ui.button("Move to Right Y-axis").clicked() {
-                        action = Some(ContextAction::SetYAxis(pc.channel_index, YAxis::Right));
+                        action = Some(ContextAction::SetYAxis(pc.channel_id, YAxis::Right));
                         ui.close();
                     }
                 });
@@ -600,16 +672,28 @@ impl GraphPanel {
         });
     }
 
-    fn handle_tile_context_menu(&mut self, response: &egui::Response, ch_idx: usize, ld: &LdFile) {
+    fn handle_tile_context_menu_with_meta(
+        &mut self,
+        response: &egui::Response,
+        ch_id: ChannelId,
+        all_meta: &[(String, String, u16, i16)],
+    ) {
+        let name = self
+            .plotted_channels
+            .iter()
+            .position(|pc| pc.channel_id == ch_id)
+            .and_then(|i| all_meta.get(i))
+            .map(|(n, _, _, _)| n.clone())
+            .unwrap_or_default();
+
         response.context_menu(|ui| {
-            let ch = &ld.channels[ch_idx];
-            ui.label(&ch.name);
+            ui.label(&name);
             ui.separator();
 
             let mut action: Option<ContextAction> = None;
 
             if ui.button("Remove").clicked() {
-                action = Some(ContextAction::Remove(ch_idx));
+                action = Some(ContextAction::Remove(ch_id));
                 ui.close();
             }
             ui.separator();
@@ -617,7 +701,7 @@ impl GraphPanel {
             let current_color = self
                 .plotted_channels
                 .iter()
-                .find(|pc| pc.channel_index == ch_idx)
+                .find(|pc| pc.channel_id == ch_id)
                 .map(|pc| pc.color);
             for (i, &c) in CHANNEL_COLORS.iter().enumerate() {
                 let label = format!("Color {}", i + 1);
@@ -629,7 +713,7 @@ impl GraphPanel {
                 );
                 ui.painter().rect_filled(swatch, 2.0, c);
                 if resp.clicked() {
-                    action = Some(ContextAction::ChangeColor(ch_idx, c));
+                    action = Some(ContextAction::ChangeColor(ch_id, c));
                     ui.close();
                 }
             }
@@ -642,21 +726,21 @@ impl GraphPanel {
 
     fn apply_context_action(&mut self, action: ContextAction) {
         match action {
-            ContextAction::Remove(idx) => self.remove_channel(idx),
-            ContextAction::ChangeColor(idx, color) => {
+            ContextAction::Remove(id) => self.remove_channel(id),
+            ContextAction::ChangeColor(id, color) => {
                 if let Some(pc) = self
                     .plotted_channels
                     .iter_mut()
-                    .find(|pc| pc.channel_index == idx)
+                    .find(|pc| pc.channel_id == id)
                 {
                     pc.color = color;
                 }
             }
-            ContextAction::SetYAxis(idx, axis) => {
+            ContextAction::SetYAxis(id, axis) => {
                 if let Some(pc) = self
                     .plotted_channels
                     .iter_mut()
-                    .find(|pc| pc.channel_index == idx)
+                    .find(|pc| pc.channel_id == id)
                 {
                     pc.y_axis = axis;
                 }

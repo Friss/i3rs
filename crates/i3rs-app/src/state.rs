@@ -5,6 +5,15 @@ use i3rs_core::{Lap, LdFile, LdxFile};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Identifies a channel: either a physical channel from the .ld file or a math channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChannelId {
+    /// Index into `LdFile::channels`.
+    Physical(usize),
+    /// Index into `SharedState::math_channels`.
+    Math(usize),
+}
+
 /// Which Y-axis a channel is assigned to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum YAxis {
@@ -14,7 +23,7 @@ pub enum YAxis {
 
 /// A loaded channel's cached display data.
 pub struct PlottedChannel {
-    pub channel_index: usize,
+    pub channel_id: ChannelId,
     pub color: egui::Color32,
     pub data: Arc<Vec<f64>>,
     pub y_axis: YAxis,
@@ -34,6 +43,72 @@ pub struct PlottedChannelInfo {
     pub dec_places: i16,
     pub color: egui::Color32,
     pub data: Arc<Vec<f64>>,
+}
+
+/// A user-defined math channel.
+pub struct MathChannelDef {
+    pub name: String,
+    pub expression: String,
+    pub unit: String,
+    pub dec_places: i16,
+    pub freq: u16,
+    /// Cached evaluation result.
+    pub data: Option<Arc<Vec<f64>>>,
+    /// Parse or evaluation error.
+    pub error: Option<String>,
+    pub cached_min: f64,
+    pub cached_max: f64,
+    pub cached_avg: f64,
+}
+
+impl MathChannelDef {
+    pub fn new(name: String, expression: String, unit: String, dec_places: i16) -> Self {
+        Self {
+            name,
+            expression,
+            unit,
+            dec_places,
+            freq: 0,
+            data: None,
+            error: None,
+            cached_min: 0.0,
+            cached_max: 0.0,
+            cached_avg: 0.0,
+        }
+    }
+}
+
+/// Compute min, max, avg, stddev for a slice of finite f64 values.
+pub fn compute_channel_stats(data: &[f64]) -> (f64, f64, f64, f64) {
+    let mut min = f64::MAX;
+    let mut max = f64::MIN;
+    let mut sum = 0.0;
+    let mut count = 0u64;
+
+    for &v in data {
+        if v.is_finite() {
+            if v < min { min = v; }
+            if v > max { max = v; }
+            sum += v;
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
+    let avg = sum / count as f64;
+    let mut var_sum = 0.0;
+    for &v in data {
+        if v.is_finite() {
+            let diff = v - avg;
+            var_sum += diff * diff;
+        }
+    }
+    let stddev = (var_sum / count as f64).sqrt();
+
+    (min, max, avg, stddev)
 }
 
 /// Graph display mode.
@@ -81,10 +156,13 @@ pub struct SharedState {
 
     // Channel browser
     pub channel_filter: String,
-    pub dragging_channel: Option<usize>,
+    pub dragging_channel: Option<ChannelId>,
 
     // Channels pending addition (set by browser, consumed by graph panels)
-    pub pending_toggle_channel: Option<usize>,
+    pub pending_toggle_channel: Option<ChannelId>,
+
+    // Math channels
+    pub math_channels: Vec<MathChannelDef>,
 
     // Next panel ID counter
     pub next_panel_id: u64,
@@ -109,6 +187,7 @@ impl SharedState {
             channel_filter: String::new(),
             dragging_channel: None,
             pending_toggle_channel: None,
+            math_channels: Vec::new(),
             next_panel_id: 1,
         }
     }

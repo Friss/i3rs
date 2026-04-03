@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::state::SharedState;
+use crate::state::{ChannelId, SharedState};
 
 /// Render channel browser as a standalone docked panel.
 /// Channel toggles go through `shared.pending_toggle_channel`.
@@ -14,17 +14,15 @@ pub fn show_standalone(ui: &mut egui::Ui, shared: &mut SharedState) {
 
     ui.separator();
 
-    if let Some(ld) = shared.ld_file.clone() {
+    if shared.ld_file.is_some() || !shared.math_channels.is_empty() {
         let filter_lower = shared.channel_filter.to_lowercase();
-        let mut toggle_idx: Option<usize> = None;
-        let mut drag_start: Option<usize> = None;
+        let mut toggle_id: Option<ChannelId> = None;
+        let mut drag_start: Option<ChannelId> = None;
 
         let has_laps = !shared.laps.is_empty();
 
-        // Use a top panel for channels and bottom panel for laps,
-        // so each gets its own independent scroll area.
+        // Bottom region: lap selector (fixed height)
         if has_laps {
-            // Bottom region: lap selector (fixed height)
             egui::Panel::bottom("lap_selector_panel")
                 .default_size(180.0)
                 .resizable(true)
@@ -34,45 +32,84 @@ pub fn show_standalone(ui: &mut egui::Ui, shared: &mut SharedState) {
         }
 
         // Remaining space: channel list (sorted alphabetically)
-        let mut sorted_channels: Vec<_> = ld.channels.iter().collect();
-        sorted_channels.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-
         egui::ScrollArea::both()
             .id_salt("channel_list_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for ch in &sorted_channels {
-                    if !filter_lower.is_empty()
-                        && !ch.name.to_lowercase().contains(&filter_lower)
-                        && !ch.unit.to_lowercase().contains(&filter_lower)
-                    {
-                        continue;
+                // Physical channels
+                if let Some(ld) = shared.ld_file.clone() {
+                    let mut sorted_channels: Vec<_> = ld.channels.iter().collect();
+                    sorted_channels
+                        .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+                    for ch in &sorted_channels {
+                        if !filter_lower.is_empty()
+                            && !ch.name.to_lowercase().contains(&filter_lower)
+                            && !ch.unit.to_lowercase().contains(&filter_lower)
+                        {
+                            continue;
+                        }
+                        let label = format!(
+                            "{} [{}] {}Hz",
+                            ch.name,
+                            if ch.unit.is_empty() { "-" } else { &ch.unit },
+                            ch.freq
+                        );
+
+                        let response = ui.selectable_label(false, &label);
+
+                        if response.dragged() {
+                            drag_start = Some(ChannelId::Physical(ch.index));
+                        }
+
+                        if response.clicked() {
+                            toggle_id = Some(ChannelId::Physical(ch.index));
+                        }
                     }
-                    let label = format!(
-                        "{} [{}] {}Hz",
-                        ch.name,
-                        if ch.unit.is_empty() { "-" } else { &ch.unit },
-                        ch.freq
-                    );
+                }
 
-                    let response = ui.selectable_label(false, &label);
+                // Math channels
+                if !shared.math_channels.is_empty() {
+                    ui.separator();
+                    ui.strong("Math Channels");
+                    for (i, mc) in shared.math_channels.iter().enumerate() {
+                        if !filter_lower.is_empty()
+                            && !mc.name.to_lowercase().contains(&filter_lower)
+                        {
+                            continue;
+                        }
+                        // Skip channels with evaluation errors
+                        if mc.data.is_none() {
+                            let label = format!("\u{26A0} {} (error)", mc.name);
+                            ui.colored_label(egui::Color32::from_rgb(200, 100, 100), &label);
+                            continue;
+                        }
+                        let label = format!(
+                            "\u{0192} {} [{}] {}Hz",
+                            mc.name,
+                            if mc.unit.is_empty() { "-" } else { &mc.unit },
+                            mc.freq
+                        );
 
-                    if response.dragged() {
-                        drag_start = Some(ch.index);
-                    }
+                        let response = ui.selectable_label(false, &label);
 
-                    if response.clicked() {
-                        toggle_idx = Some(ch.index);
+                        if response.dragged() {
+                            drag_start = Some(ChannelId::Math(i));
+                        }
+
+                        if response.clicked() {
+                            toggle_id = Some(ChannelId::Math(i));
+                        }
                     }
                 }
             });
 
-        if let Some(idx) = drag_start {
-            shared.dragging_channel = Some(idx);
+        if let Some(id) = drag_start {
+            shared.dragging_channel = Some(id);
         }
 
-        if let Some(idx) = toggle_idx {
-            shared.pending_toggle_channel = Some(idx);
+        if let Some(id) = toggle_id {
+            shared.pending_toggle_channel = Some(id);
         }
     } else {
         ui.label("No file loaded. Use File > Open.");

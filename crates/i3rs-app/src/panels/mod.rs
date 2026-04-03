@@ -3,6 +3,8 @@
 pub mod channel_browser;
 pub mod cursor_readout;
 pub mod graph;
+pub mod math_editor;
+pub mod report;
 pub mod timeline;
 
 use eframe::egui;
@@ -10,12 +12,14 @@ use egui_dock::TabViewer;
 
 use crate::state::SharedState;
 use graph::GraphPanel;
+use report::ReportPanel;
 
 /// Each dockable tab in the workspace.
 pub enum PanelTab {
     Graph(GraphPanel),
     ChannelBrowser,
     CursorReadout,
+    Report(ReportPanel),
 }
 
 /// Viewer that bridges shared state to individual panel tabs.
@@ -31,6 +35,7 @@ impl TabViewer for AppTabViewer<'_> {
             PanelTab::Graph(g) => g.title.clone().into(),
             PanelTab::ChannelBrowser => "Channels".into(),
             PanelTab::CursorReadout => "Readout".into(),
+            PanelTab::Report(r) => r.title.clone().into(),
         }
     }
 
@@ -45,6 +50,9 @@ impl TabViewer for AppTabViewer<'_> {
             PanelTab::CursorReadout => {
                 cursor_readout::show(ui, self.shared);
             }
+            PanelTab::Report(report) => {
+                report.ui(ui, self.shared);
+            }
         }
     }
 
@@ -53,11 +61,12 @@ impl TabViewer for AppTabViewer<'_> {
             PanelTab::Graph(g) => egui::Id::new(format!("graph_{}", g.id)),
             PanelTab::ChannelBrowser => egui::Id::new("channel_browser"),
             PanelTab::CursorReadout => egui::Id::new("cursor_readout"),
+            PanelTab::Report(r) => egui::Id::new(format!("report_{}", r.id)),
         }
     }
 
     fn is_closeable(&self, tab: &PanelTab) -> bool {
-        matches!(tab, PanelTab::Graph(_))
+        matches!(tab, PanelTab::Graph(_) | PanelTab::Report(_))
     }
 
     fn scroll_bars(&self, _tab: &PanelTab) -> [bool; 2] {

@@ -143,17 +143,21 @@ crates/
 
 **Goal**: Computed channels and statistical analysis.
 
-- [ ] Math expression parser (nom/pest) and evaluator
-  - Syntax: `SlipR = (WheelSpeed.RL - GPS.Speed) / GPS.Speed * 100`
-  - Built-in functions: `smooth()`, `derivative()`, `integrate()`, `abs()`, `atan2()`, trig, etc.
-  - Lazy evaluation with caching
+- [x] Math expression parser (hand-written recursive descent) and evaluator
+  - Syntax: `(WheelSpeed_RL - GPS.Speed) / GPS.Speed * 100`
+  - Built-in functions: `smooth()`, `derivative()`, `integrate()`, `abs()`, `atan2()`, trig, `pow()`, `clamp()`, etc.
+  - Evaluation with caching, channel name resolution (underscore↔space/dot, case-insensitive)
+  - Automatic frequency resampling when mixing channels of different sample rates
 - [ ] Predefined calculations: oversteer angle, pitch/roll, wheel slip
-- [ ] Math file save/load/import/export
+- [x] Math file save/load/import/export (JSON format)
 - [ ] Automatic unit conversion (km/h ↔ mph, C ↔ F, kPa ↔ psi)
-- [ ] Channel report panel: min/max/avg/stddev per channel per lap/sector
+- [x] Channel report panel: min/max/avg/stddev per channel per lap
 - [ ] Channel aliases (map different names across sessions to a common name)
 - [ ] Data gating (exclude regions by boolean condition)
-- [ ] CSV export of selected channels and time range
+- [x] CSV export of selected channels and time range
+- [x] Math channel editor panel (define, edit, delete math channels with inline error display)
+- [x] Math channels integrated into channel browser and graph panels
+- [x] ChannelId abstraction (Physical/Math) throughout the UI
 
 ### Milestone 5: Track Map
 
