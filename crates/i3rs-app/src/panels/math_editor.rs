@@ -263,17 +263,8 @@ fn topological_eval_order(shared: &SharedState) -> Vec<usize> {
         deps.push(dep_indices);
     }
 
-    // Kahn's algorithm for topological sort
-    let mut in_degree = vec![0usize; n];
-    for dep_list in &deps {
-        for &dep in dep_list {
-            in_degree[dep] += 1;
-        }
-    }
-
-    // Note: in_degree counts how many channels depend on each channel,
-    // but we want to evaluate dependencies first. Reverse the direction:
-    // in_degree[i] = number of channels that i depends on.
+    // Kahn's algorithm: in_degree[i] = number of dependencies channel i has.
+    // Channels with 0 dependencies can be evaluated first.
     let mut in_degree = vec![0usize; n];
     for (i, dep_list) in deps.iter().enumerate() {
         in_degree[i] = dep_list.len();

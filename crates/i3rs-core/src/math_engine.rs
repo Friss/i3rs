@@ -1,5 +1,6 @@
 //! Math channel evaluator: evaluates parsed expressions against channel data.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -69,12 +70,13 @@ fn resolve_channel_name<'a>(
 // ---------------------------------------------------------------------------
 
 /// Resample a channel to a target frequency using linear interpolation.
-fn resample(data: &[f64], src_freq: u16, target_freq: u16, target_len: usize) -> Vec<f64> {
+/// Returns a borrowed slice when no resampling is needed.
+fn resample<'a>(data: &'a [f64], src_freq: u16, target_freq: u16, target_len: usize) -> Cow<'a, [f64]> {
     if src_freq == target_freq && data.len() == target_len {
-        return data.to_vec();
+        return Cow::Borrowed(data);
     }
     if data.is_empty() {
-        return vec![0.0; target_len];
+        return Cow::Owned(vec![0.0; target_len]);
     }
 
     let mut out = Vec::with_capacity(target_len);
@@ -93,7 +95,7 @@ fn resample(data: &[f64], src_freq: u16, target_freq: u16, target_len: usize) ->
         };
         out.push(val);
     }
-    out
+    Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +119,7 @@ pub fn evaluate(
                 message: format!("unknown channel '{}'", name),
             })?;
             let ch = &channels[resolved];
-            Ok(resample(&ch.samples, ch.freq, output_freq, output_len))
+            Ok(resample(&ch.samples, ch.freq, output_freq, output_len).into_owned())
         }
 
         Expr::UnaryNeg(inner) => {

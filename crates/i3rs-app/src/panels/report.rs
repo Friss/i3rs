@@ -66,11 +66,10 @@ impl ReportPanel {
 
                             // Per-lap stats
                             for &(lap_number, lmin, lmax, lavg, lstddev) in &cached.per_lap {
-                                let is_selected = shared.selected_lap
-                                    == shared
-                                        .laps
-                                        .iter()
-                                        .position(|l| l.number == lap_number);
+                                let is_selected = shared
+                                    .selected_lap
+                                    .and_then(|idx| shared.laps.get(idx))
+                                    .map_or(false, |l| l.number == lap_number);
                                 let label = format!("Lap {}", lap_number);
 
                                 ui.label(""); // empty channel column
