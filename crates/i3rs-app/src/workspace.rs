@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::panels::PanelTab;
 use crate::panels::graph::GraphPanel;
-use crate::state::{CHANNEL_COLORS, GraphMode, SharedState};
+use crate::state::{CHANNEL_COLORS, ChannelId, GraphMode, SharedState};
 
 // ---------------------------------------------------------------------------
 // Serializable workspace types
@@ -16,6 +16,8 @@ pub struct WorkspaceFile {
     pub worksheets: Vec<WorksheetConfig>,
     pub active_worksheet: usize,
     pub last_file_path: Option<String>,
+    #[serde(default)]
+    pub math_channels: Vec<MathChannelConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -29,6 +31,7 @@ pub enum PanelConfig {
     Graph(GraphPanelConfig),
     ChannelBrowser,
     CursorReadout,
+    Report(ReportPanelConfig),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -38,6 +41,23 @@ pub struct GraphPanelConfig {
     pub channel_names: Vec<String>,
     pub colors: Vec<[u8; 3]>,
     pub graph_mode: String, // "Tiled" or "Overlay"
+    /// Whether each channel is a math channel (true) or physical (false).
+    #[serde(default)]
+    pub is_math: Vec<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ReportPanelConfig {
+    pub id: u64,
+    pub title: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MathChannelConfig {
+    pub name: String,
+    pub expression: String,
+    pub unit: String,
+    pub dec_places: i16,
 }
 
 // ---------------------------------------------------------------------------
@@ -56,14 +76,24 @@ pub fn save_workspace(
             for (_path, tab) in dock.iter_all_tabs() {
                 let config = match tab {
                     PanelTab::Graph(g) => {
-                        let channel_names: Vec<String> = if let Some(ld) = &shared.ld_file {
-                            g.plotted_channels
-                                .iter()
-                                .map(|pc| ld.channels[pc.channel_index].name.clone())
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
+                        let mut channel_names = Vec::new();
+                        let mut is_math = Vec::new();
+                        for pc in &g.plotted_channels {
+                            match pc.channel_id {
+                                ChannelId::Physical(idx) => {
+                                    if let Some(ld) = &shared.ld_file {
+                                        channel_names.push(ld.channels[idx].name.clone());
+                                    }
+                                    is_math.push(false);
+                                }
+                                ChannelId::Math(idx) => {
+                                    if let Some(mc) = shared.math_channels.get(idx) {
+                                        channel_names.push(mc.name.clone());
+                                    }
+                                    is_math.push(true);
+                                }
+                            }
+                        }
                         let colors: Vec<[u8; 3]> = g
                             .plotted_channels
                             .iter()
@@ -81,10 +111,15 @@ pub fn save_workspace(
                                 GraphMode::Tiled => "Tiled".into(),
                                 GraphMode::Overlay => "Overlay".into(),
                             },
+                            is_math,
                         })
                     }
                     PanelTab::ChannelBrowser => PanelConfig::ChannelBrowser,
                     PanelTab::CursorReadout => PanelConfig::CursorReadout,
+                    PanelTab::Report(r) => PanelConfig::Report(ReportPanelConfig {
+                        id: r.id,
+                        title: r.title.clone(),
+                    }),
                 };
                 panels.push(config);
             }
@@ -95,6 +130,17 @@ pub fn save_workspace(
         })
         .collect();
 
+    let math_channels: Vec<MathChannelConfig> = shared
+        .math_channels
+        .iter()
+        .map(|mc| MathChannelConfig {
+            name: mc.name.clone(),
+            expression: mc.expression.clone(),
+            unit: mc.unit.clone(),
+            dec_places: mc.dec_places,
+        })
+        .collect();
+
     WorkspaceFile {
         worksheets: ws_configs,
         active_worksheet,
@@ -102,6 +148,7 @@ pub fn save_workspace(
             .ld_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
+        math_channels,
     }
 }
 
@@ -129,19 +176,42 @@ pub fn load_workspace(
                         };
 
                         // Resolve channels by name
-                        if let Some(ld) = &shared.ld_file {
-                            for (i, name) in gc.channel_names.iter().enumerate() {
+                        for (i, name) in gc.channel_names.iter().enumerate() {
+                            let is_math = gc.is_math.get(i).copied().unwrap_or(false);
+                            let color = gc
+                                .colors
+                                .get(i)
+                                .map(|c| eframe::egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                .unwrap_or(CHANNEL_COLORS[i % CHANNEL_COLORS.len()]);
+
+                            if is_math {
+                                // Find math channel by name
+                                if let Some(mc_idx) = shared
+                                    .math_channels
+                                    .iter()
+                                    .position(|mc| mc.name == *name)
+                                {
+                                    if let Some(data) = &shared.math_channels[mc_idx].data {
+                                        let (cached_min, cached_max, cached_avg) =
+                                            GraphPanel::compute_stats(data);
+                                        graph.plotted_channels.push(crate::state::PlottedChannel {
+                                            channel_id: ChannelId::Math(mc_idx),
+                                            color,
+                                            data: data.clone(),
+                                            y_axis: crate::state::YAxis::Left,
+                                            cached_min,
+                                            cached_max,
+                                            cached_avg,
+                                        });
+                                    }
+                                }
+                            } else if let Some(ld) = &shared.ld_file {
                                 if let Some(ch) = ld.channels.iter().find(|c| &c.name == name) {
-                                    let color = gc
-                                        .colors
-                                        .get(i)
-                                        .map(|c| eframe::egui::Color32::from_rgb(c[0], c[1], c[2]))
-                                        .unwrap_or(CHANNEL_COLORS[i % CHANNEL_COLORS.len()]);
                                     if let Some(data) = ld.read_channel_data(ch) {
                                         let (cached_min, cached_max, cached_avg) =
-                                            crate::panels::graph::GraphPanel::compute_stats(&data);
+                                            GraphPanel::compute_stats(&data);
                                         graph.plotted_channels.push(crate::state::PlottedChannel {
-                                            channel_index: ch.index,
+                                            channel_id: ChannelId::Physical(ch.index),
                                             color,
                                             data: std::sync::Arc::new(data),
                                             y_axis: crate::state::YAxis::Left,
@@ -163,6 +233,13 @@ pub fn load_workspace(
                     }
                     PanelConfig::ChannelBrowser => PanelTab::ChannelBrowser,
                     PanelConfig::CursorReadout => PanelTab::CursorReadout,
+                    PanelConfig::Report(rc) => {
+                        let report = crate::panels::report::ReportPanel::new(rc.id, &rc.title);
+                        if rc.id >= shared.next_panel_id {
+                            shared.next_panel_id = rc.id + 1;
+                        }
+                        PanelTab::Report(report)
+                    }
                 })
                 .collect();
 
@@ -181,10 +258,6 @@ pub fn load_workspace(
                 dock.push_to_focused_leaf(tab);
             }
 
-            // Note: We can't easily reconstruct the exact split layout from
-            // just a list of panels. For a proper implementation, we'd serialize
-            // the DockState tree itself. For now, we rebuild a reasonable default.
-            // If there's a channel browser, split it to the left.
             let has_browser = dock
                 .iter_all_tabs()
                 .any(|(_, t)| matches!(t, PanelTab::ChannelBrowser));

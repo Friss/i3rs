@@ -2,11 +2,13 @@
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState};
-use i3rs_core::{LdFile, detect_laps, find_ldx_for_ld};
+use i3rs_core::{ExportChannel, LdFile, detect_laps, export_csv, find_ldx_for_ld};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::panels::graph::GraphPanel;
+use crate::panels::math_editor::{self, MathEditorState};
+use crate::panels::report::ReportPanel;
 use crate::panels::timeline::TimelinePanel;
 use crate::panels::{AppTabViewer, PanelTab};
 use crate::state::SharedState;
@@ -23,7 +25,9 @@ pub struct App {
     active_worksheet: usize,
     show_channel_browser: bool,
     show_cursor_readout: bool,
+    show_math_editor: bool,
     timeline: TimelinePanel,
+    math_editor_state: MathEditorState,
 }
 
 impl App {
@@ -40,7 +44,9 @@ impl App {
             active_worksheet: 0,
             show_channel_browser: true,
             show_cursor_readout: true,
+            show_math_editor: false,
             timeline: TimelinePanel::new(),
+            math_editor_state: MathEditorState::new(),
         }
     }
 
@@ -76,6 +82,9 @@ impl App {
                         }
                     }
                 }
+
+                // Re-evaluate math channels with new file data
+                math_editor::evaluate_all_math_channels(&mut self.shared);
             }
             Err(e) => {
                 eprintln!("Failed to open file: {}", e);
@@ -90,6 +99,15 @@ impl App {
         self.worksheets[self.active_worksheet]
             .dock_state
             .push_to_focused_leaf(PanelTab::Graph(graph));
+    }
+
+    fn add_report_panel(&mut self) {
+        let id = self.shared.next_panel_id;
+        self.shared.next_panel_id += 1;
+        let report = ReportPanel::new(id, format!("Report {}", id));
+        self.worksheets[self.active_worksheet]
+            .dock_state
+            .push_to_focused_leaf(PanelTab::Report(report));
     }
 
     fn add_worksheet(&mut self) {
@@ -138,6 +156,20 @@ impl App {
                             }
                         }
 
+                        // Load math channels from workspace
+                        self.shared.math_channels.clear();
+                        for config in &workspace.math_channels {
+                            self.shared
+                                .math_channels
+                                .push(crate::state::MathChannelDef::new(
+                                    config.name.clone(),
+                                    config.expression.clone(),
+                                    config.unit.clone(),
+                                    config.dec_places,
+                                ));
+                        }
+                        math_editor::evaluate_all_math_channels(&mut self.shared);
+
                         let loaded = crate::workspace::load_workspace(&workspace, &mut self.shared);
                         self.worksheets = loaded
                             .into_iter()
@@ -150,6 +182,33 @@ impl App {
                     Err(e) => eprintln!("Failed to parse workspace: {}", e),
                 },
                 Err(e) => eprintln!("Failed to read workspace file: {}", e),
+            }
+        }
+    }
+
+    fn export_csv(&self) {
+        let registry = &self.shared.display_channel_registry;
+        if registry.is_empty() {
+            return;
+        }
+
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .set_file_name("export.csv")
+            .save_file()
+        {
+            let channels: Vec<ExportChannel<'_>> = registry
+                .iter()
+                .map(|info| ExportChannel {
+                    name: &info.name,
+                    data: &info.data,
+                    freq: info.freq,
+                    dec_places: info.dec_places,
+                })
+                .collect();
+
+            if let Err(e) = export_csv(&path, &channels, self.shared.zoom_range) {
+                eprintln!("Failed to export CSV: {}", e);
             }
         }
     }
@@ -175,10 +234,34 @@ impl App {
                     self.load_workspace();
                     ui.close();
                 }
+                ui.separator();
+                if ui.button("Save Math Channels...").clicked() {
+                    math_editor::save_math_channels(&self.shared);
+                    ui.close();
+                }
+                if ui.button("Load Math Channels...").clicked() {
+                    math_editor::load_math_channels(&mut self.shared);
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        !self.shared.display_channel_registry.is_empty(),
+                        egui::Button::new("Export CSV..."),
+                    )
+                    .clicked()
+                {
+                    self.export_csv();
+                    ui.close();
+                }
             });
             ui.menu_button("View", |ui| {
                 if ui.button("Add Graph Panel").clicked() {
                     self.add_graph_panel();
+                    ui.close();
+                }
+                if ui.button("Add Report Panel").clicked() {
+                    self.add_report_panel();
                     ui.close();
                 }
                 ui.separator();
@@ -219,6 +302,7 @@ impl App {
                 ui.separator();
                 ui.checkbox(&mut self.show_channel_browser, "Channel Browser");
                 ui.checkbox(&mut self.show_cursor_readout, "Cursor Readout");
+                ui.checkbox(&mut self.show_math_editor, "Math Editor");
             });
         });
     }
@@ -245,6 +329,13 @@ impl App {
                 if !self.shared.laps.is_empty() {
                     ui.separator();
                     ui.label(format!("{} laps", self.shared.laps.len()));
+                }
+                if !self.shared.math_channels.is_empty() {
+                    ui.separator();
+                    ui.label(format!(
+                        "{} math",
+                        self.shared.math_channels.len()
+                    ));
                 }
             });
         }
@@ -377,6 +468,27 @@ impl eframe::App for App {
                 });
         }
 
+        // Math editor — collapsible left panel (after browser)
+        if self.show_math_editor {
+            egui::Panel::left("math_editor")
+                .default_size(300.0)
+                .resizable(true)
+                .show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("\u{25C0}")
+                            .on_hover_text("Collapse")
+                            .clicked()
+                        {
+                            self.show_math_editor = false;
+                        }
+                        ui.strong("Math Editor");
+                    });
+                    ui.separator();
+                    math_editor::show(ui, &mut self.shared, &mut self.math_editor_state);
+                });
+        }
+
         // Cursor readout — collapsible right panel
         if self.show_cursor_readout {
             egui::Panel::right("cursor_readout")
@@ -409,7 +521,7 @@ impl eframe::App for App {
                 });
         }
 
-        // Dock area fills the rest (graph panels only)
+        // Dock area fills the rest (graph + report panels)
         let dock = &mut self.worksheets[self.active_worksheet].dock_state;
         let mut viewer = AppTabViewer {
             shared: &mut self.shared,
