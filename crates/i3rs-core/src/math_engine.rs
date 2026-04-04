@@ -73,9 +73,8 @@ fn resolve_channel_name<'a>(
         }
     }
 
-    let ref_lower = reference.to_ascii_lowercase();
     for (alias, target) in aliases {
-        if alias.to_ascii_lowercase() == ref_lower {
+        if alias.eq_ignore_ascii_case(reference) {
             if let Some((k, _)) = available.get_key_value(target) {
                 return Some(k);
             }
@@ -99,9 +98,8 @@ pub fn resolve_alias_target(reference: &str, aliases: &HashMap<String, String>) 
     if let Some(target) = aliases.get(&with_dots) {
         return Some(target.clone());
     }
-    let ref_lower = reference.to_ascii_lowercase();
     for (alias, target) in aliases {
-        if alias.to_ascii_lowercase() == ref_lower {
+        if alias.eq_ignore_ascii_case(reference) {
             return Some(target.clone());
         }
     }
@@ -213,10 +211,10 @@ fn eval_impl(
                     BinOp::Lt => if l < r { 1.0 } else { 0.0 },
                     BinOp::Gte => if l >= r { 1.0 } else { 0.0 },
                     BinOp::Lte => if l <= r { 1.0 } else { 0.0 },
-                    BinOp::Eq => if (l - r).abs() < f64::EPSILON { 1.0 } else { 0.0 },
-                    BinOp::Neq => if (l - r).abs() >= f64::EPSILON { 1.0 } else { 0.0 },
-                    BinOp::And => if l != 0.0 && r != 0.0 { 1.0 } else { 0.0 },
-                    BinOp::Or => if l != 0.0 || r != 0.0 { 1.0 } else { 0.0 },
+                    BinOp::Eq => if l == r { 1.0 } else { 0.0 },
+                    BinOp::Neq => if l != r { 1.0 } else { 0.0 },
+                    BinOp::And => if !l.is_nan() && l != 0.0 && !r.is_nan() && r != 0.0 { 1.0 } else { 0.0 },
+                    BinOp::Or => if (!l.is_nan() && l != 0.0) || (!r.is_nan() && r != 0.0) { 1.0 } else { 0.0 },
                 })
                 .collect();
             Ok(result)
