@@ -148,12 +148,12 @@ crates/
   - Built-in functions: `smooth()`, `derivative()`, `integrate()`, `abs()`, `atan2()`, trig, `pow()`, `clamp()`, etc.
   - Evaluation with caching, channel name resolution (underscore↔space/dot, case-insensitive)
   - Automatic frequency resampling when mixing channels of different sample rates
-- [ ] Predefined calculations: oversteer angle, pitch/roll, wheel slip
+- [x] Predefined calculations: oversteer angle, pitch/roll, wheel slip (12 templates: traction, chassis, handling, engine, performance)
 - [x] Math file save/load/import/export (JSON format)
-- [ ] Automatic unit conversion (km/h ↔ mph, C ↔ F, kPa ↔ psi)
+- [x] Automatic unit conversion (km/h ↔ mph, C ↔ F, kPa ↔ psi, bar ↔ psi, deg ↔ rad, kg ↔ lb, m ↔ ft, Nm ↔ lbft)
 - [x] Channel report panel: min/max/avg/stddev per channel per lap
-- [ ] Channel aliases (map different names across sessions to a common name)
-- [ ] Data gating (exclude regions by boolean condition)
+- [x] Channel aliases (map different names across sessions to a common name, persisted in workspace)
+- [x] Data gating (comparison operators >, <, >=, <=, ==, !=; logical &&, ||, !; gate() and if_then() functions)
 - [x] CSV export of selected channels and time range
 - [x] Math channel editor panel (define, edit, delete math channels with inline error display)
 - [x] Math channels integrated into channel browser and graph panels

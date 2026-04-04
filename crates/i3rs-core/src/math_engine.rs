@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::LazyLock;
 
 use crate::math_expr::{BinOp, Expr, parse_expression, referenced_channels};
 
@@ -35,11 +36,14 @@ impl std::error::Error for MathError {}
 // Channel name resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve a channel reference name against available channel names.
-/// Tries exact match first, then normalizes underscores to spaces/dots.
+/// Resolve a channel reference against available channel names.
+///
+/// Resolution priority: exact → underscore-to-space → underscore-to-dot
+/// → alias (exact + normalized) → case-insensitive channel → case-insensitive alias.
 fn resolve_channel_name<'a>(
     reference: &str,
     available: &'a HashMap<String, ChannelData>,
+    aliases: &HashMap<String, String>,
 ) -> Option<&'a str> {
     if let Some((k, _)) = available.get_key_value(reference) {
         return Some(k);
@@ -55,13 +59,50 @@ fn resolve_channel_name<'a>(
         return Some(k);
     }
 
-    // Case-insensitive fallback
+    for variant in [reference, with_spaces.as_str(), with_dots.as_str()] {
+        if let Some(target) = aliases.get(variant) {
+            if let Some((k, _)) = available.get_key_value(target) {
+                return Some(k);
+            }
+        }
+    }
+
     for key in available.keys() {
         if key.eq_ignore_ascii_case(reference) {
             return Some(key);
         }
     }
 
+    for (alias, target) in aliases {
+        if alias.eq_ignore_ascii_case(reference) {
+            if let Some((k, _)) = available.get_key_value(target) {
+                return Some(k);
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve an alias reference to its target channel name.
+/// Used by the app to determine which physical channels to load before evaluation.
+pub fn resolve_alias_target(reference: &str, aliases: &HashMap<String, String>) -> Option<String> {
+    if let Some(target) = aliases.get(reference) {
+        return Some(target.clone());
+    }
+    let with_spaces = reference.replace('_', " ");
+    if let Some(target) = aliases.get(&with_spaces) {
+        return Some(target.clone());
+    }
+    let with_dots = reference.replace('_', ".");
+    if let Some(target) = aliases.get(&with_dots) {
+        return Some(target.clone());
+    }
+    for (alias, target) in aliases {
+        if alias.eq_ignore_ascii_case(reference) {
+            return Some(target.clone());
+        }
+    }
     None
 }
 
@@ -102,34 +143,49 @@ fn resample<'a>(data: &'a [f64], src_freq: u16, target_freq: u16, target_len: us
 // Evaluator
 // ---------------------------------------------------------------------------
 
-/// Evaluate a parsed expression against channel data.
-///
-/// Returns `(samples, freq)` — the output samples at the determined frequency.
+static EMPTY_ALIASES: LazyLock<HashMap<String, String>> = LazyLock::new(HashMap::new);
+
+/// Evaluate a parsed expression against channel data (no aliases).
 pub fn evaluate(
     expr: &Expr,
     channels: &HashMap<String, ChannelData>,
     output_freq: u16,
     output_len: usize,
 ) -> Result<Vec<f64>, MathError> {
+    eval_impl(expr, channels, output_freq, output_len, &EMPTY_ALIASES)
+}
+
+fn eval_impl(
+    expr: &Expr,
+    channels: &HashMap<String, ChannelData>,
+    output_freq: u16,
+    output_len: usize,
+    aliases: &HashMap<String, String>,
+) -> Result<Vec<f64>, MathError> {
     match expr {
         Expr::Number(n) => Ok(vec![*n; output_len]),
 
         Expr::Channel(name) => {
-            let resolved = resolve_channel_name(name, channels).ok_or_else(|| MathError {
-                message: format!("unknown channel '{}'", name),
-            })?;
+            let resolved =
+                resolve_channel_name(name, channels, aliases).ok_or_else(|| {
+                    MathError {
+                        message: format!("unknown channel '{}'", name),
+                    }
+                })?;
             let ch = &channels[resolved];
             Ok(resample(&ch.samples, ch.freq, output_freq, output_len).into_owned())
         }
 
         Expr::UnaryNeg(inner) => {
-            let vals = evaluate(inner, channels, output_freq, output_len)?;
+            let vals = eval_impl(inner, channels, output_freq, output_len, aliases)?;
             Ok(vals.into_iter().map(|v| -v).collect())
         }
 
         Expr::BinaryOp(lhs, op, rhs) => {
-            let left = evaluate(lhs, channels, output_freq, output_len)?;
-            let right = evaluate(rhs, channels, output_freq, output_len)?;
+            let left =
+                eval_impl(lhs, channels, output_freq, output_len, aliases)?;
+            let right =
+                eval_impl(rhs, channels, output_freq, output_len, aliases)?;
             let result = left
                 .iter()
                 .zip(right.iter())
@@ -151,12 +207,22 @@ pub fn evaluate(
                             l % r
                         }
                     }
+                    BinOp::Gt => if l > r { 1.0 } else { 0.0 },
+                    BinOp::Lt => if l < r { 1.0 } else { 0.0 },
+                    BinOp::Gte => if l >= r { 1.0 } else { 0.0 },
+                    BinOp::Lte => if l <= r { 1.0 } else { 0.0 },
+                    BinOp::Eq => if l == r { 1.0 } else { 0.0 },
+                    BinOp::Neq => if l != r { 1.0 } else { 0.0 },
+                    BinOp::And => if !l.is_nan() && l != 0.0 && !r.is_nan() && r != 0.0 { 1.0 } else { 0.0 },
+                    BinOp::Or => if (!l.is_nan() && l != 0.0) || (!r.is_nan() && r != 0.0) { 1.0 } else { 0.0 },
                 })
                 .collect();
             Ok(result)
         }
 
-        Expr::FuncCall(name, args) => eval_function(name, args, channels, output_freq, output_len),
+        Expr::FuncCall(name, args) => {
+            eval_function(name, args, channels, output_freq, output_len, aliases)
+        }
     }
 }
 
@@ -166,6 +232,7 @@ fn eval_function(
     channels: &HashMap<String, ChannelData>,
     freq: u16,
     len: usize,
+    aliases: &HashMap<String, String>,
 ) -> Result<Vec<f64>, MathError> {
     match name {
         // smooth(channel, window_size)
@@ -175,11 +242,11 @@ fn eval_function(
                     message: "smooth() requires 2 arguments: smooth(channel, window_size)".into(),
                 });
             }
-            let data = evaluate(&args[0], channels, freq, len)?;
+            let data = eval_impl(&args[0], channels, freq, len, aliases)?;
             let window = match &args[1] {
                 Expr::Number(n) => *n as usize,
                 _ => {
-                    let w = evaluate(&args[1], channels, freq, len)?;
+                    let w = eval_impl(&args[1], channels, freq, len, aliases)?;
                     w[0] as usize
                 }
             };
@@ -193,7 +260,7 @@ fn eval_function(
                     message: "derivative() requires 1 argument".into(),
                 });
             }
-            let data = evaluate(&args[0], channels, freq, len)?;
+            let data = eval_impl(&args[0], channels, freq, len, aliases)?;
             Ok(finite_derivative(&data, freq))
         }
 
@@ -204,30 +271,30 @@ fn eval_function(
                     message: "integrate() requires 1 argument".into(),
                 });
             }
-            let data = evaluate(&args[0], channels, freq, len)?;
+            let data = eval_impl(&args[0], channels, freq, len, aliases)?;
             Ok(cumulative_integral(&data, freq))
         }
 
         // Single-argument math functions
-        "abs" => unary_fn(args, channels, freq, len, f64::abs),
-        "sqrt" => unary_fn(args, channels, freq, len, f64::sqrt),
-        "sin" => unary_fn(args, channels, freq, len, f64::sin),
-        "cos" => unary_fn(args, channels, freq, len, f64::cos),
-        "tan" => unary_fn(args, channels, freq, len, f64::tan),
-        "asin" => unary_fn(args, channels, freq, len, f64::asin),
-        "acos" => unary_fn(args, channels, freq, len, f64::acos),
-        "atan" => unary_fn(args, channels, freq, len, f64::atan),
-        "log" | "ln" => unary_fn(args, channels, freq, len, f64::ln),
-        "exp" => unary_fn(args, channels, freq, len, f64::exp),
-        "floor" => unary_fn(args, channels, freq, len, f64::floor),
-        "ceil" => unary_fn(args, channels, freq, len, f64::ceil),
-        "round" => unary_fn(args, channels, freq, len, f64::round),
+        "abs" => unary_fn(args, channels, freq, len, aliases, f64::abs),
+        "sqrt" => unary_fn(args, channels, freq, len, aliases, f64::sqrt),
+        "sin" => unary_fn(args, channels, freq, len, aliases, f64::sin),
+        "cos" => unary_fn(args, channels, freq, len, aliases, f64::cos),
+        "tan" => unary_fn(args, channels, freq, len, aliases, f64::tan),
+        "asin" => unary_fn(args, channels, freq, len, aliases, f64::asin),
+        "acos" => unary_fn(args, channels, freq, len, aliases, f64::acos),
+        "atan" => unary_fn(args, channels, freq, len, aliases, f64::atan),
+        "log" | "ln" => unary_fn(args, channels, freq, len, aliases, f64::ln),
+        "exp" => unary_fn(args, channels, freq, len, aliases, f64::exp),
+        "floor" => unary_fn(args, channels, freq, len, aliases, f64::floor),
+        "ceil" => unary_fn(args, channels, freq, len, aliases, f64::ceil),
+        "round" => unary_fn(args, channels, freq, len, aliases, f64::round),
 
         // Two-argument functions
-        "atan2" => binary_fn(args, channels, freq, len, f64::atan2),
-        "pow" => binary_fn(args, channels, freq, len, f64::powf),
-        "min" => binary_fn(args, channels, freq, len, f64::min),
-        "max" => binary_fn(args, channels, freq, len, f64::max),
+        "atan2" => binary_fn(args, channels, freq, len, aliases, f64::atan2),
+        "pow" => binary_fn(args, channels, freq, len, aliases, f64::powf),
+        "min" => binary_fn(args, channels, freq, len, aliases, f64::min),
+        "max" => binary_fn(args, channels, freq, len, aliases, f64::max),
 
         // clamp(value, min, max)
         "clamp" => {
@@ -236,9 +303,9 @@ fn eval_function(
                     message: "clamp() requires 3 arguments: clamp(value, min, max)".into(),
                 });
             }
-            let val = evaluate(&args[0], channels, freq, len)?;
-            let lo = evaluate(&args[1], channels, freq, len)?;
-            let hi = evaluate(&args[2], channels, freq, len)?;
+            let val = eval_impl(&args[0], channels, freq, len, aliases)?;
+            let lo = eval_impl(&args[1], channels, freq, len, aliases)?;
+            let hi = eval_impl(&args[2], channels, freq, len, aliases)?;
             Ok(val
                 .iter()
                 .zip(lo.iter())
@@ -246,6 +313,58 @@ fn eval_function(
                 .map(|((&v, &l), &h)| v.clamp(l, h))
                 .collect())
         }
+
+        // gate(data, condition) — returns data where condition is non-zero, NAN otherwise
+        "gate" => {
+            if args.len() != 2 {
+                return Err(MathError {
+                    message: "gate() requires 2 arguments: gate(data, condition)".into(),
+                });
+            }
+            let data = eval_impl(&args[0], channels, freq, len, aliases)?;
+            let cond = eval_impl(&args[1], channels, freq, len, aliases)?;
+            Ok(data
+                .iter()
+                .zip(cond.iter())
+                .map(|(&d, &c)| if c != 0.0 { d } else { f64::NAN })
+                .collect())
+        }
+
+        // if_then(condition, true_value, false_value)
+        "if_then" => {
+            if args.len() != 3 {
+                return Err(MathError {
+                    message: "if_then() requires 3 arguments: if_then(condition, true_val, false_val)".into(),
+                });
+            }
+            let cond = eval_impl(&args[0], channels, freq, len, aliases)?;
+            let true_val = eval_impl(&args[1], channels, freq, len, aliases)?;
+            let false_val = eval_impl(&args[2], channels, freq, len, aliases)?;
+            Ok(cond
+                .iter()
+                .zip(true_val.iter())
+                .zip(false_val.iter())
+                .map(|((&c, &t), &f)| if c != 0.0 { t } else { f })
+                .collect())
+        }
+
+        // Unit conversion functions
+        "kmh_to_mph" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.621371),
+        "mph_to_kmh" => unary_fn(args, channels, freq, len, aliases, |v| v * 1.60934),
+        "c_to_f" => unary_fn(args, channels, freq, len, aliases, |v| v * 9.0 / 5.0 + 32.0),
+        "f_to_c" => unary_fn(args, channels, freq, len, aliases, |v| (v - 32.0) * 5.0 / 9.0),
+        "kpa_to_psi" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.145038),
+        "psi_to_kpa" => unary_fn(args, channels, freq, len, aliases, |v| v * 6.89476),
+        "bar_to_psi" => unary_fn(args, channels, freq, len, aliases, |v| v * 14.5038),
+        "psi_to_bar" => unary_fn(args, channels, freq, len, aliases, |v| v / 14.5038),
+        "deg_to_rad" => unary_fn(args, channels, freq, len, aliases, |v| v.to_radians()),
+        "rad_to_deg" => unary_fn(args, channels, freq, len, aliases, |v| v.to_degrees()),
+        "kg_to_lb" => unary_fn(args, channels, freq, len, aliases, |v| v * 2.20462),
+        "lb_to_kg" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.453592),
+        "m_to_ft" => unary_fn(args, channels, freq, len, aliases, |v| v * 3.28084),
+        "ft_to_m" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.3048),
+        "nm_to_lbft" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.737562),
+        "lbft_to_nm" => unary_fn(args, channels, freq, len, aliases, |v| v * 1.35582),
 
         _ => Err(MathError {
             message: format!("unknown function '{}'", name),
@@ -258,6 +377,7 @@ fn unary_fn(
     channels: &HashMap<String, ChannelData>,
     freq: u16,
     len: usize,
+    aliases: &HashMap<String, String>,
     f: fn(f64) -> f64,
 ) -> Result<Vec<f64>, MathError> {
     if args.len() != 1 {
@@ -265,7 +385,7 @@ fn unary_fn(
             message: "function requires 1 argument".into(),
         });
     }
-    let data = evaluate(&args[0], channels, freq, len)?;
+    let data = eval_impl(&args[0], channels, freq, len, aliases)?;
     Ok(data.into_iter().map(f).collect())
 }
 
@@ -274,6 +394,7 @@ fn binary_fn(
     channels: &HashMap<String, ChannelData>,
     freq: u16,
     len: usize,
+    aliases: &HashMap<String, String>,
     f: fn(f64, f64) -> f64,
 ) -> Result<Vec<f64>, MathError> {
     if args.len() != 2 {
@@ -281,8 +402,8 @@ fn binary_fn(
             message: "function requires 2 arguments".into(),
         });
     }
-    let a = evaluate(&args[0], channels, freq, len)?;
-    let b = evaluate(&args[1], channels, freq, len)?;
+    let a = eval_impl(&args[0], channels, freq, len, aliases)?;
+    let b = eval_impl(&args[1], channels, freq, len, aliases)?;
     Ok(a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)).collect())
 }
 
@@ -348,10 +469,18 @@ pub fn determine_output_freq(
     expr: &Expr,
     channels: &HashMap<String, ChannelData>,
 ) -> u16 {
+    output_freq_impl(expr, channels, &EMPTY_ALIASES)
+}
+
+fn output_freq_impl(
+    expr: &Expr,
+    channels: &HashMap<String, ChannelData>,
+    aliases: &HashMap<String, String>,
+) -> u16 {
     let refs = referenced_channels(expr);
     let mut max_freq = 1u16;
     for name in &refs {
-        if let Some(resolved) = resolve_channel_name(name, channels) {
+        if let Some(resolved) = resolve_channel_name(name, channels, aliases) {
             let f = channels[resolved].freq;
             if f > max_freq {
                 max_freq = f;
@@ -367,10 +496,19 @@ pub fn determine_output_len(
     channels: &HashMap<String, ChannelData>,
     output_freq: u16,
 ) -> usize {
+    output_len_impl(expr, channels, output_freq, &EMPTY_ALIASES)
+}
+
+fn output_len_impl(
+    expr: &Expr,
+    channels: &HashMap<String, ChannelData>,
+    output_freq: u16,
+    aliases: &HashMap<String, String>,
+) -> usize {
     let refs = referenced_channels(expr);
     let mut max_duration: f64 = 0.0;
     for name in &refs {
-        if let Some(resolved) = resolve_channel_name(name, channels) {
+        if let Some(resolved) = resolve_channel_name(name, channels, aliases) {
             let ch = &channels[resolved];
             if ch.freq > 0 {
                 let dur = ch.samples.len() as f64 / ch.freq as f64;
@@ -388,13 +526,23 @@ pub fn evaluate_expression(
     expression: &str,
     channels: &HashMap<String, ChannelData>,
 ) -> Result<(Vec<f64>, u16), String> {
+    evaluate_expression_with_aliases(expression, channels, &EMPTY_ALIASES)
+}
+
+/// Parse and evaluate a math expression string, with channel alias support.
+pub fn evaluate_expression_with_aliases(
+    expression: &str,
+    channels: &HashMap<String, ChannelData>,
+    aliases: &HashMap<String, String>,
+) -> Result<(Vec<f64>, u16), String> {
     let expr = parse_expression(expression).map_err(|e| e.to_string())?;
-    let freq = determine_output_freq(&expr, channels);
-    let len = determine_output_len(&expr, channels, freq);
+    let freq = output_freq_impl(&expr, channels, aliases);
+    let len = output_len_impl(&expr, channels, freq, aliases);
     if len == 0 {
         return Err("expression references no channels with data".into());
     }
-    let samples = evaluate(&expr, channels, freq, len).map_err(|e| e.to_string())?;
+    let samples = eval_impl(&expr, channels, freq, len, aliases)
+        .map_err(|e| e.to_string())?;
     Ok((samples, freq))
 }
 
@@ -572,5 +720,90 @@ mod tests {
         assert_eq!(result.len(), 10);
         // First sample: 0 + 0 = 0
         assert!((result[0] - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn eval_comparison_operators() {
+        let channels = make_channels();
+        // Speed = [10, 20, 30, 40, 50]
+        let (result, _) = evaluate_expression("Speed > 25", &channels).unwrap();
+        assert_eq!(result, vec![0.0, 0.0, 1.0, 1.0, 1.0]);
+
+        let (result, _) = evaluate_expression("Speed <= 30", &channels).unwrap();
+        assert_eq!(result, vec![1.0, 1.0, 1.0, 0.0, 0.0]);
+
+        let (result, _) = evaluate_expression("Speed == 30", &channels).unwrap();
+        assert_eq!(result, vec![0.0, 0.0, 1.0, 0.0, 0.0]);
+
+        let (result, _) = evaluate_expression("Speed != 30", &channels).unwrap();
+        assert_eq!(result, vec![1.0, 1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn eval_logical_operators() {
+        let channels = make_channels();
+        // Speed > 15 && Speed < 45
+        let (result, _) = evaluate_expression("Speed > 15 && Speed < 45", &channels).unwrap();
+        assert_eq!(result, vec![0.0, 1.0, 1.0, 1.0, 0.0]);
+
+        // Speed < 15 || Speed > 45
+        let (result, _) = evaluate_expression("Speed < 15 || Speed > 45", &channels).unwrap();
+        assert_eq!(result, vec![1.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn eval_gate() {
+        let channels = make_channels();
+        // gate(Speed, Speed > 25) — keep values where Speed > 25, NAN otherwise
+        let (result, _) = evaluate_expression("gate(Speed, Speed > 25)", &channels).unwrap();
+        assert!(result[0].is_nan());
+        assert!(result[1].is_nan());
+        assert_eq!(result[2], 30.0);
+        assert_eq!(result[3], 40.0);
+        assert_eq!(result[4], 50.0);
+    }
+
+    #[test]
+    fn eval_if_then() {
+        let channels = make_channels();
+        // if_then(Speed > 25, Speed, 0) — Speed where > 25, else 0
+        let (result, _) = evaluate_expression("if_then(Speed > 25, Speed, 0)", &channels).unwrap();
+        assert_eq!(result, vec![0.0, 0.0, 30.0, 40.0, 50.0]);
+    }
+
+    #[test]
+    fn eval_unit_conversion() {
+        let channels = make_channels();
+        // Speed = [10, 20, 30, 40, 50] in km/h
+        let (result, _) = evaluate_expression("kmh_to_mph(Speed)", &channels).unwrap();
+        for (i, &v) in result.iter().enumerate() {
+            let expected = (i as f64 + 1.0) * 10.0 * 0.621371;
+            assert!((v - expected).abs() < 1e-6);
+        }
+
+        // Round-trip: mph_to_kmh(kmh_to_mph(Speed)) ≈ Speed
+        let (result, _) = evaluate_expression("mph_to_kmh(kmh_to_mph(Speed))", &channels).unwrap();
+        for (i, &v) in result.iter().enumerate() {
+            let expected = (i as f64 + 1.0) * 10.0;
+            assert!((v - expected).abs() < 1e-3, "round-trip mismatch: {} vs {}", v, expected);
+        }
+    }
+
+    #[test]
+    fn eval_with_aliases() {
+        let channels = make_channels();
+        // "Velocity" is not a real channel, but alias it to "Speed"
+        let mut aliases = HashMap::new();
+        aliases.insert("Velocity".into(), "Speed".into());
+
+        let (result, _) =
+            evaluate_expression_with_aliases("Velocity + 5", &channels, &aliases).unwrap();
+        assert_eq!(result, vec![15.0, 25.0, 35.0, 45.0, 55.0]);
+
+        // Alias with different casing
+        aliases.insert("Revs".into(), "RPM".into());
+        let (result, _) =
+            evaluate_expression_with_aliases("Revs / Velocity", &channels, &aliases).unwrap();
+        assert_eq!(result, vec![100.0, 100.0, 100.0, 100.0, 100.0]);
     }
 }

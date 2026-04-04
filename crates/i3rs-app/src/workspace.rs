@@ -18,6 +18,14 @@ pub struct WorkspaceFile {
     pub last_file_path: Option<String>,
     #[serde(default)]
     pub math_channels: Vec<MathChannelConfig>,
+    #[serde(default)]
+    pub channel_aliases: Vec<ChannelAliasConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ChannelAliasConfig {
+    pub alias: String,
+    pub target: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -141,6 +149,15 @@ pub fn save_workspace(
         })
         .collect();
 
+    let channel_aliases: Vec<ChannelAliasConfig> = shared
+        .channel_aliases
+        .iter()
+        .map(|(alias, target)| ChannelAliasConfig {
+            alias: alias.clone(),
+            target: target.clone(),
+        })
+        .collect();
+
     WorkspaceFile {
         worksheets: ws_configs,
         active_worksheet,
@@ -149,6 +166,7 @@ pub fn save_workspace(
             .as_ref()
             .map(|p| p.to_string_lossy().to_string()),
         math_channels,
+        channel_aliases,
     }
 }
 

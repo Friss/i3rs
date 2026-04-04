@@ -156,6 +156,15 @@ impl App {
                             }
                         }
 
+                        // Load channel aliases from workspace
+                        self.shared.channel_aliases.clear();
+                        for alias_config in &workspace.channel_aliases {
+                            self.shared.channel_aliases.insert(
+                                alias_config.alias.clone(),
+                                alias_config.target.clone(),
+                            );
+                        }
+
                         // Load math channels from workspace
                         self.shared.math_channels.clear();
                         for config in &workspace.math_channels {
