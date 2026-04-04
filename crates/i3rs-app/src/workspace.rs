@@ -75,7 +75,6 @@ pub struct TrackMapPanelConfig {
     pub color_channel_name: Option<String>,
 }
 
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MathChannelConfig {
     pub name: String,
@@ -140,9 +139,10 @@ pub fn save_workspace(
                     }
                     PanelTab::TrackMap(t) => {
                         let color_channel_name = t.color_channel_idx.and_then(|idx| {
-                            shared.ld_file.as_ref().and_then(|ld| {
-                                ld.channels.get(idx).map(|ch| ch.name.clone())
-                            })
+                            shared
+                                .ld_file
+                                .as_ref()
+                                .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
                         });
                         PanelConfig::TrackMap(TrackMapPanelConfig {
                             id: t.id,
@@ -236,41 +236,37 @@ pub fn load_workspace(
 
                             if is_math {
                                 // Find math channel by name
-                                if let Some(mc_idx) = shared
-                                    .math_channels
-                                    .iter()
-                                    .position(|mc| mc.name == *name)
+                                if let Some(mc_idx) =
+                                    shared.math_channels.iter().position(|mc| mc.name == *name)
+                                    && let Some(data) = &shared.math_channels[mc_idx].data
                                 {
-                                    if let Some(data) = &shared.math_channels[mc_idx].data {
-                                        let (cached_min, cached_max, cached_avg) =
-                                            GraphPanel::compute_stats(data);
-                                        graph.plotted_channels.push(crate::state::PlottedChannel {
-                                            channel_id: ChannelId::Math(mc_idx),
-                                            color,
-                                            data: data.clone(),
-                                            y_axis: crate::state::YAxis::Left,
-                                            cached_min,
-                                            cached_max,
-                                            cached_avg,
-                                        });
-                                    }
+                                    let (cached_min, cached_max, cached_avg) =
+                                        GraphPanel::compute_stats(data);
+                                    graph.plotted_channels.push(crate::state::PlottedChannel {
+                                        channel_id: ChannelId::Math(mc_idx),
+                                        color,
+                                        data: data.clone(),
+                                        y_axis: crate::state::YAxis::Left,
+                                        cached_min,
+                                        cached_max,
+                                        cached_avg,
+                                    });
                                 }
-                            } else if let Some(ld) = &shared.ld_file {
-                                if let Some(ch) = ld.channels.iter().find(|c| &c.name == name) {
-                                    if let Some(data) = ld.read_channel_data(ch) {
-                                        let (cached_min, cached_max, cached_avg) =
-                                            GraphPanel::compute_stats(&data);
-                                        graph.plotted_channels.push(crate::state::PlottedChannel {
-                                            channel_id: ChannelId::Physical(ch.index),
-                                            color,
-                                            data: std::sync::Arc::new(data),
-                                            y_axis: crate::state::YAxis::Left,
-                                            cached_min,
-                                            cached_max,
-                                            cached_avg,
-                                        });
-                                    }
-                                }
+                            } else if let Some(ld) = &shared.ld_file
+                                && let Some(ch) = ld.channels.iter().find(|c| &c.name == name)
+                                && let Some(data) = ld.read_channel_data(ch)
+                            {
+                                let (cached_min, cached_max, cached_avg) =
+                                    GraphPanel::compute_stats(&data);
+                                graph.plotted_channels.push(crate::state::PlottedChannel {
+                                    channel_id: ChannelId::Physical(ch.index),
+                                    color,
+                                    data: std::sync::Arc::new(data),
+                                    y_axis: crate::state::YAxis::Left,
+                                    cached_min,
+                                    cached_max,
+                                    cached_avg,
+                                });
                             }
                         }
 
@@ -286,10 +282,8 @@ pub fn load_workspace(
                         // Resolve color channel by name
                         if let Some(ref color_name) = tc.color_channel_name
                             && let Some(ld) = &shared.ld_file
-                            && let Some(idx) = ld
-                                .channels
-                                .iter()
-                                .position(|ch| &ch.name == color_name)
+                            && let Some(idx) =
+                                ld.channels.iter().position(|ch| &ch.name == color_name)
                         {
                             track_map.color_channel_idx = Some(idx);
                         }

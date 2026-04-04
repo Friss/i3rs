@@ -88,8 +88,12 @@ pub fn compute_channel_stats(data: &[f64]) -> (f64, f64, f64, f64) {
 
     for &v in data {
         if v.is_finite() {
-            if v < min { min = v; }
-            if v > max { max = v; }
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
             sum += v;
             count += 1;
         }

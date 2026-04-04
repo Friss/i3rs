@@ -197,10 +197,9 @@ impl App {
                         // Load channel aliases from workspace
                         self.shared.channel_aliases.clear();
                         for alias_config in &workspace.channel_aliases {
-                            self.shared.channel_aliases.insert(
-                                alias_config.alias.clone(),
-                                alias_config.target.clone(),
-                            );
+                            self.shared
+                                .channel_aliases
+                                .insert(alias_config.alias.clone(), alias_config.target.clone());
                         }
 
                         // Load math channels from workspace
@@ -383,10 +382,7 @@ impl App {
                 }
                 if !self.shared.math_channels.is_empty() {
                     ui.separator();
-                    ui.label(format!(
-                        "{} math",
-                        self.shared.math_channels.len()
-                    ));
+                    ui.label(format!("{} math", self.shared.math_channels.len()));
                 }
             });
         }

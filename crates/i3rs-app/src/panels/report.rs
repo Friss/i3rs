@@ -69,7 +69,7 @@ impl ReportPanel {
                                 let is_selected = shared
                                     .selected_lap
                                     .and_then(|idx| shared.laps.get(idx))
-                                    .map_or(false, |l| l.name == *lap_name);
+                                    .is_some_and(|l| l.name == *lap_name);
                                 let label = lap_name.as_str();
 
                                 ui.label(""); // empty channel column

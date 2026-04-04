@@ -40,10 +40,10 @@ pub fn format_duration(secs: f64) -> String {
 /// Tries "Lap Time Running" resets first (sub-sample precision via interpolation),
 /// then falls back to "Lap Number" transitions.
 pub fn detect_laps(ld: &LdFile) -> Vec<Lap> {
-    if let Some(laps) = detect_from_lap_time_running(ld) {
-        if !laps.is_empty() {
-            return laps;
-        }
+    if let Some(laps) = detect_from_lap_time_running(ld)
+        && !laps.is_empty()
+    {
+        return laps;
     }
     detect_from_lap_number(ld)
 }

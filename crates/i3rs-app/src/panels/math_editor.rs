@@ -204,9 +204,11 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
         ui.group(|ui| {
             ui.label("Predefined Calculations");
             ui.label(
-                egui::RichText::new("Click to populate the form above. Adjust channel names to match your data.")
-                    .small()
-                    .weak(),
+                egui::RichText::new(
+                    "Click to populate the form above. Adjust channel names to match your data.",
+                )
+                .small()
+                .weak(),
             );
 
             let mut current_category = "";
@@ -217,14 +219,16 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
                     ui.strong(current_category);
                 }
                 ui.horizontal(|ui| {
-                    if ui.small_button("+").on_hover_text(calc.description).clicked() {
+                    if ui
+                        .small_button("+")
+                        .on_hover_text(calc.description)
+                        .clicked()
+                    {
                         editor.new_name = calc.name.to_string();
                         editor.new_expression = calc.expression.to_string();
                         editor.new_unit = calc.unit.to_string();
                     }
-                    ui.label(
-                        egui::RichText::new(calc.name).strong(),
-                    );
+                    ui.label(egui::RichText::new(calc.name).strong());
                     ui.weak(format!("[{}]", calc.unit));
                 });
             }
@@ -255,7 +259,11 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
                             ui.label(err);
                         } else if mc.data.is_some() {
                             ui.colored_label(egui::Color32::from_rgb(100, 255, 100), "\u{2713}");
-                            ui.label(format!("{}Hz, {} samples", mc.freq, mc.data.as_ref().map_or(0, |d| d.len())));
+                            ui.label(format!(
+                                "{}Hz, {} samples",
+                                mc.freq,
+                                mc.data.as_ref().map_or(0, |d| d.len())
+                            ));
                         }
                     });
 
@@ -317,9 +325,7 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
             );
             ui.horizontal(|ui| {
                 ui.label("Alias:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut editor.new_alias_name).desired_width(100.0),
-                );
+                ui.add(egui::TextEdit::singleline(&mut editor.new_alias_name).desired_width(100.0));
                 ui.label("\u{2192}");
                 ui.label("Target:");
                 ui.add(
@@ -392,32 +398,31 @@ fn build_channel_data_map(
                     || r.replace('_', ".") == ch.name
                     || r.eq_ignore_ascii_case(&ch.name)
             });
-            if needed {
-                if let Some(data) = ld.read_channel_data(ch) {
-                    channel_data.insert(
-                        ch.name.clone(),
-                        ChannelData {
-                            samples: data,
-                            freq: ch.freq,
-                        },
-                    );
-                }
+            if needed && let Some(data) = ld.read_channel_data(ch) {
+                channel_data.insert(
+                    ch.name.clone(),
+                    ChannelData {
+                        samples: data,
+                        freq: ch.freq,
+                    },
+                );
             }
         }
     }
 
     // Add other evaluated math channels that are referenced
     for (i, other) in shared.math_channels.iter().enumerate() {
-        if i != exclude_idx && resolved_refs.iter().any(|r| r == &other.name) {
-            if let Some(ref data) = other.data {
-                channel_data.insert(
-                    other.name.clone(),
-                    ChannelData {
-                        samples: (**data).clone(),
-                        freq: other.freq,
-                    },
-                );
-            }
+        if i != exclude_idx
+            && resolved_refs.iter().any(|r| r == &other.name)
+            && let Some(ref data) = other.data
+        {
+            channel_data.insert(
+                other.name.clone(),
+                ChannelData {
+                    samples: (**data).clone(),
+                    freq: other.freq,
+                },
+            );
         }
     }
 
@@ -509,8 +514,8 @@ fn topological_eval_order(shared: &SharedState) -> Vec<usize> {
     }
 
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    for i in 0..n {
-        if in_degree[i] == 0 {
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
             queue.push_back(i);
         }
     }
@@ -601,10 +606,13 @@ fn is_duplicate_name(name: &str, shared: &SharedState, exclude_math_idx: Option<
         return false;
     }
     // Check physical channels
-    if let Some(ld) = &shared.ld_file {
-        if ld.channels.iter().any(|ch| ch.name.eq_ignore_ascii_case(name)) {
-            return true;
-        }
+    if let Some(ld) = &shared.ld_file
+        && ld
+            .channels
+            .iter()
+            .any(|ch| ch.name.eq_ignore_ascii_case(name))
+    {
+        return true;
     }
     // Check other math channels
     for (i, mc) in shared.math_channels.iter().enumerate() {

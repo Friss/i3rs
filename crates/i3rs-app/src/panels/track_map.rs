@@ -77,7 +77,8 @@ impl TrackMapPanel {
     pub fn ui(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
         // If popped out, handle OS window close → dock back
         if self.is_popped_out && ui.input(|i| i.viewport().close_requested()) {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.dock_requested = true;
         }
 
@@ -140,25 +141,23 @@ impl TrackMapPanel {
             }
         });
 
-        if response.response.hovered() {
-            if let Some(idx) = hover_idx {
-                shared.cursor_time = Some(track.time[idx]);
-            }
+        if response.response.hovered()
+            && let Some(idx) = hover_idx
+        {
+            shared.cursor_time = Some(track.time[idx]);
         }
 
-        if editing {
-            if let Some(idx) = clicked_idx {
-                if let Some(start) = self.pending_sector_start.take() {
-                    let sector_num = shared.sectors.len() + 1;
-                    shared.sectors.push(Sector {
-                        name: format!("S{}", sector_num),
-                        start_index: start,
-                        end_index: idx,
-                    });
-                    self.cached_sector_times = None;
-                } else {
-                    self.pending_sector_start = Some(idx);
-                }
+        if editing && let Some(idx) = clicked_idx {
+            if let Some(start) = self.pending_sector_start.take() {
+                let sector_num = shared.sectors.len() + 1;
+                shared.sectors.push(Sector {
+                    name: format!("S{}", sector_num),
+                    start_index: start,
+                    end_index: idx,
+                });
+                self.cached_sector_times = None;
+            } else {
+                self.pending_sector_start = Some(idx);
             }
         }
 
@@ -231,8 +230,11 @@ impl TrackMapPanel {
         colors: Option<&Vec<[u8; 4]>>,
     ) {
         if let Some(colors) = colors {
-            for i in 0..track.x.len().saturating_sub(1) {
-                let c = colors[i];
+            for (i, c) in colors
+                .iter()
+                .enumerate()
+                .take(track.x.len().saturating_sub(1))
+            {
                 let segment = Line::new(
                     "",
                     PlotPoints::new(vec![
@@ -275,22 +277,17 @@ impl TrackMapPanel {
         }
     }
 
-    fn draw_sector_markers(
-        plot_ui: &mut egui_plot::PlotUi,
-        track: &TrackData,
-        sectors: &[Sector],
-    ) {
+    fn draw_sector_markers(plot_ui: &mut egui_plot::PlotUi, track: &TrackData, sectors: &[Sector]) {
         for (i, sector) in sectors.iter().enumerate() {
             let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
 
             if sector.start_index < track.x.len() {
                 let pt = vec![[track.x[sector.start_index], track.y[sector.start_index]]];
-                let marker =
-                    Points::new(format!("{} start", sector.name), PlotPoints::new(pt))
-                        .shape(MarkerShape::Diamond)
-                        .radius(8.0)
-                        .color(color)
-                        .filled(true);
+                let marker = Points::new(format!("{} start", sector.name), PlotPoints::new(pt))
+                    .shape(MarkerShape::Diamond)
+                    .radius(8.0)
+                    .color(color)
+                    .filled(true);
                 plot_ui.points(marker);
             }
         }
@@ -378,7 +375,13 @@ impl TrackMapPanel {
             ui.label("Ref lap:");
             let ref_label = shared
                 .reference_lap
-                .map(|i| shared.laps.get(i).map(|l| l.name.clone()).unwrap_or_default())
+                .map(|i| {
+                    shared
+                        .laps
+                        .get(i)
+                        .map(|l| l.name.clone())
+                        .unwrap_or_default()
+                })
                 .unwrap_or_else(|| "None".into());
             egui::ComboBox::from_id_salt(format!("ref_lap_{}", self.id))
                 .selected_text(ref_label)
@@ -470,10 +473,9 @@ impl TrackMapPanel {
         };
 
         // Cache sector times — only recompute when sectors or laps change
-        let needs_rebuild = self
-            .cached_sector_times
-            .as_ref()
-            .is_none_or(|c| c.sector_count != shared.sectors.len() || c.lap_count != shared.laps.len());
+        let needs_rebuild = self.cached_sector_times.as_ref().is_none_or(|c| {
+            c.sector_count != shared.sectors.len() || c.lap_count != shared.laps.len()
+        });
 
         if needs_rebuild {
             let times = compute_sector_times(&shared.sectors, &shared.laps, track);
@@ -491,8 +493,7 @@ impl TrackMapPanel {
 
         ui.strong("Sector Times");
 
-        let ref_lap_times: Option<&Vec<_>> =
-            shared.reference_lap.and_then(|i| sector_times.get(i));
+        let ref_lap_times: Option<&Vec<_>> = shared.reference_lap.and_then(|i| sector_times.get(i));
 
         egui::ScrollArea::vertical()
             .max_height(200.0)
@@ -523,7 +524,11 @@ impl TrackMapPanel {
                                     let delta = st.time_secs - ref_st.time_secs;
                                     ui.colored_label(
                                         delta_color(delta),
-                                        format!("{} ({:+.3})", i3rs_core::format_duration(st.time_secs), delta),
+                                        format!(
+                                            "{} ({:+.3})",
+                                            i3rs_core::format_duration(st.time_secs),
+                                            delta
+                                        ),
                                     );
                                     continue;
                                 }
@@ -533,12 +538,15 @@ impl TrackMapPanel {
                             if let Some(ref_times) = ref_lap_times
                                 && Some(lap_idx) != shared.reference_lap
                             {
-                                let ref_total: f64 =
-                                    ref_times.iter().map(|st| st.time_secs).sum();
+                                let ref_total: f64 = ref_times.iter().map(|st| st.time_secs).sum();
                                 let delta = total - ref_total;
                                 ui.colored_label(
                                     delta_color(delta),
-                                    format!("{} ({:+.3})", i3rs_core::format_duration(total), delta),
+                                    format!(
+                                        "{} ({:+.3})",
+                                        i3rs_core::format_duration(total),
+                                        delta
+                                    ),
                                 );
                             } else {
                                 ui.label(i3rs_core::format_duration(total));
