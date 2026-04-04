@@ -419,34 +419,40 @@ impl TrackMapPanel {
     }
 
     fn draw_color_legend(ui: &mut egui::Ui, vmin: f64, vmax: f64) {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 16.0), egui::Sense::hover());
+        let gradient_h = 12.0;
+        let label_h = 11.0;
+        let gap = 1.0;
+        let total_h = gradient_h + gap + label_h;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, total_h), egui::Sense::hover());
         let painter = ui.painter();
 
+        let grad_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), gradient_h));
         let n_steps = 60;
-        let step_width = rect.width() / n_steps as f32;
+        let step_width = grad_rect.width() / n_steps as f32;
         for i in 0..n_steps {
             let t = i as f32 / (n_steps - 1) as f32;
             let hue = (1.0 - t) * 240.0;
             let (r, g, b) = i3rs_core::track::hsv_to_rgb(hue, 1.0, 1.0);
             let color = egui::Color32::from_rgb(r, g, b);
-            let x = rect.left() + i as f32 * step_width;
+            let x = grad_rect.left() + i as f32 * step_width;
             let step_rect = egui::Rect::from_min_size(
-                egui::pos2(x, rect.top()),
-                egui::vec2(step_width + 0.5, rect.height()),
+                egui::pos2(x, grad_rect.top()),
+                egui::vec2(step_width + 0.5, gradient_h),
             );
             painter.rect_filled(step_rect, 0.0, color);
         }
 
         let font = egui::FontId::proportional(9.0);
+        let label_y = grad_rect.bottom() + gap;
         painter.text(
-            egui::pos2(rect.left(), rect.bottom() + 1.0),
+            egui::pos2(rect.left(), label_y),
             egui::Align2::LEFT_TOP,
             format!("{:.1}", vmin),
             font.clone(),
             egui::Color32::from_gray(200),
         );
         painter.text(
-            egui::pos2(rect.right(), rect.bottom() + 1.0),
+            egui::pos2(rect.right(), label_y),
             egui::Align2::RIGHT_TOP,
             format!("{:.1}", vmax),
             font,
