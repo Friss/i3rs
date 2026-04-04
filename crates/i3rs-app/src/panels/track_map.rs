@@ -27,6 +27,8 @@ pub struct TrackMapPanel {
     cached_sector_times: Option<CachedSectorReport>,
     /// Fingerprint for track/color cache invalidation.
     cache_fingerprint: Option<(usize, Option<usize>)>,
+    /// Search filter for the color channel dropdown.
+    color_filter: String,
     /// Whether this panel is currently in a popped-out OS window.
     pub is_popped_out: bool,
     /// Set by the "Pop Out" button; consumed by App to move panel to its own window.
@@ -55,6 +57,7 @@ impl TrackMapPanel {
             pending_sector_start: None,
             cached_sector_times: None,
             cache_fingerprint: None,
+            color_filter: String::new(),
             is_popped_out: false,
             pop_out_requested: false,
             dock_requested: false,
@@ -305,14 +308,26 @@ impl TrackMapPanel {
                 .selected_text(current_name)
                 .width(160.0)
                 .show_ui(ui, |ui| {
+                    ui.text_edit_singleline(&mut self.color_filter)
+                        .request_focus();
+                    ui.separator();
+
+                    let filter = self.color_filter.to_lowercase();
                     if ui
                         .selectable_value(&mut self.color_channel_idx, None, "None")
                         .clicked()
                     {
                         self.invalidate_color_cache();
+                        self.color_filter.clear();
                     }
                     if let Some(ld) = &shared.ld_file {
                         for (i, ch) in ld.channels.iter().enumerate() {
+                            if !filter.is_empty()
+                                && !ch.name.to_lowercase().contains(&filter)
+                                && !ch.unit.to_lowercase().contains(&filter)
+                            {
+                                continue;
+                            }
                             let label = if ch.unit.is_empty() {
                                 ch.name.clone()
                             } else {
@@ -323,6 +338,7 @@ impl TrackMapPanel {
                                 .clicked()
                             {
                                 self.invalidate_color_cache();
+                                self.color_filter.clear();
                             }
                         }
                     }
