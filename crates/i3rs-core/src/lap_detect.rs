@@ -23,6 +23,18 @@ impl Lap {
     }
 }
 
+/// Format a duration in seconds as `M:SS.mmm` (e.g. `2:08.392`) or `S.mmm`
+/// for durations under a minute, matching MoTeC i2's display style.
+pub fn format_duration(secs: f64) -> String {
+    let mins = (secs / 60.0) as u32;
+    let remainder = secs - (mins as f64 * 60.0);
+    if mins > 0 {
+        format!("{}:{:06.3}", mins, remainder)
+    } else {
+        format!("{:.3}", remainder)
+    }
+}
+
 /// Detect laps from the .ld file.
 ///
 /// Tries "Lap Time Running" resets first (sub-sample precision via interpolation),

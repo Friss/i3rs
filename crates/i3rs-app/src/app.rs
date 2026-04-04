@@ -364,9 +364,6 @@ impl App {
     fn show_session_info(&self, ui: &mut egui::Ui) {
         if let Some(ld) = &self.shared.ld_file {
             let s = &ld.session;
-            let dur = ld.duration_secs();
-            let mins = (dur / 60.0) as u32;
-            let secs = dur - (mins as f64 * 60.0);
 
             ui.horizontal(|ui| {
                 ui.strong(&self.shared.file_name);
@@ -377,7 +374,7 @@ impl App {
                 ui.separator();
                 ui.label(&s.vehicle_id);
                 ui.separator();
-                ui.label(format!("{}m {:.0}s", mins, secs));
+                ui.label(i3rs_core::format_duration(ld.duration_secs()));
                 ui.separator();
                 ui.label(format!("{} channels", ld.channels.len()));
                 if !self.shared.laps.is_empty() {

@@ -371,7 +371,7 @@ impl TrackMapPanel {
                     ui.selectable_value(&mut shared.reference_lap, None, "None");
                     for (i, lap) in shared.laps.iter().enumerate() {
                         let dur = lap.end_time - lap.start_time;
-                        let label = format!("{} ({:.2}s)", lap.name, dur);
+                        let label = format!("{} ({})", lap.name, i3rs_core::format_duration(dur));
                         ui.selectable_value(&mut shared.reference_lap, Some(i), label);
                     }
                 });
@@ -501,11 +501,11 @@ impl TrackMapPanel {
                                     let delta = st.time_secs - ref_st.time_secs;
                                     ui.colored_label(
                                         delta_color(delta),
-                                        format!("{:.2}s ({:+.2})", st.time_secs, delta),
+                                        format!("{} ({:+.3})", i3rs_core::format_duration(st.time_secs), delta),
                                     );
                                     continue;
                                 }
-                                ui.label(format!("{:.2}s", st.time_secs));
+                                ui.label(i3rs_core::format_duration(st.time_secs));
                             }
 
                             if let Some(ref_times) = ref_lap_times
@@ -516,10 +516,10 @@ impl TrackMapPanel {
                                 let delta = total - ref_total;
                                 ui.colored_label(
                                     delta_color(delta),
-                                    format!("{:.2}s ({:+.2})", total, delta),
+                                    format!("{} ({:+.3})", i3rs_core::format_duration(total), delta),
                                 );
                             } else {
-                                ui.label(format!("{:.2}s", total));
+                                ui.label(i3rs_core::format_duration(total));
                             }
                             ui.end_row();
                         }
