@@ -31,7 +31,7 @@ pub struct Sector {
 #[derive(Clone, Debug)]
 pub struct SectorTime {
     pub sector_name: String,
-    pub lap_number: u32,
+    pub lap_name: String,
     /// Time in seconds spent in this sector during this lap.
     pub time_secs: f64,
 }
@@ -237,7 +237,7 @@ pub fn compute_sector_times(
 
                     SectorTime {
                         sector_name: sector.name.clone(),
-                        lap_number: lap.number,
+                        lap_name: lap.name.clone(),
                         time_secs,
                     }
                 })

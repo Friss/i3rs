@@ -145,9 +145,9 @@ fn show_lap_selector(ui: &mut egui::Ui, shared: &mut SharedState) {
                 let mins = (dur / 60.0) as u32;
                 let secs = dur - (mins as f64 * 60.0);
                 let label = if mins > 0 {
-                    format!("Lap {} - {}:{:05.2}", lap.number, mins, secs)
+                    format!("{} - {}:{:05.2}", lap.name, mins, secs)
                 } else {
-                    format!("Lap {} - {:.2}s", lap.number, secs)
+                    format!("{} - {:.2}s", lap.name, secs)
                 };
 
                 let is_selected = shared.selected_lap == Some(i);

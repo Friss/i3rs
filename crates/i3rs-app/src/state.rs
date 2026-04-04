@@ -139,8 +139,8 @@ pub struct CachedChannelStats {
     pub dec_places: i16,
     /// Full session stats: (min, max, avg, stddev).
     pub session: (f64, f64, f64, f64),
-    /// Per-lap stats: (lap_number, min, max, avg, stddev).
-    pub per_lap: Vec<(u32, f64, f64, f64, f64)>,
+    /// Per-lap stats: (lap_name, min, max, avg, stddev).
+    pub per_lap: Vec<(String, f64, f64, f64, f64)>,
 }
 
 /// Cache for report panel statistics, invalidated when channels or laps change.
@@ -202,7 +202,7 @@ impl ReportCache {
                 let end = end_sample.min(info.data.len());
                 if start < end {
                     let stats = compute_channel_stats(&info.data[start..end]);
-                    per_lap.push((lap.number, stats.0, stats.1, stats.2, stats.3));
+                    per_lap.push((lap.name.clone(), stats.0, stats.1, stats.2, stats.3));
                 }
             }
 

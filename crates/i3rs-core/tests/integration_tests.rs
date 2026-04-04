@@ -136,18 +136,26 @@ fn find_ldx_for_ld_discovers_sidecar() {
 fn detect_laps_from_ld() {
     let ld = LdFile::open(TEST_LD).unwrap();
     let laps = detect_laps(&ld);
-    // Lap Number channel has values 2, 3, 4 so we expect 3 laps
+
+    // Expect 3 laps: Out Lap, Lap 1, In Lap
+    assert_eq!(laps.len(), 3, "expected 3 laps, got {}", laps.len());
+    assert_eq!(laps[0].name, "Out Lap");
+    assert_eq!(laps[1].name, "Lap 1");
+    assert_eq!(laps[2].name, "In Lap");
+
+    // Lap 1 should be ~128.39s (i2 reports 2:08.392)
+    let lap1_dur = laps[1].duration();
     assert!(
-        laps.len() >= 3,
-        "expected at least 3 laps, got {}",
-        laps.len()
+        (lap1_dur - 128.392).abs() < 0.1,
+        "Lap 1 duration should be ~128.392s, got {:.3}s",
+        lap1_dur
     );
 
     for lap in &laps {
         assert!(
             lap.duration() > 0.0,
-            "lap {} has non-positive duration",
-            lap.number
+            "{} has non-positive duration",
+            lap.name
         );
         assert!(lap.end_time > lap.start_time);
     }

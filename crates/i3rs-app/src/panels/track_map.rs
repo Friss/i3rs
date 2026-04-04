@@ -362,7 +362,7 @@ impl TrackMapPanel {
             ui.label("Ref lap:");
             let ref_label = shared
                 .reference_lap
-                .map(|i| format!("Lap {}", shared.laps.get(i).map(|l| l.number).unwrap_or(0)))
+                .map(|i| shared.laps.get(i).map(|l| l.name.clone()).unwrap_or_default())
                 .unwrap_or_else(|| "None".into());
             egui::ComboBox::from_id_salt(format!("ref_lap_{}", self.id))
                 .selected_text(ref_label)
@@ -371,7 +371,7 @@ impl TrackMapPanel {
                     ui.selectable_value(&mut shared.reference_lap, None, "None");
                     for (i, lap) in shared.laps.iter().enumerate() {
                         let dur = lap.end_time - lap.start_time;
-                        let label = format!("Lap {} ({:.2}s)", lap.number, dur);
+                        let label = format!("{} ({:.2}s)", lap.name, dur);
                         ui.selectable_value(&mut shared.reference_lap, Some(i), label);
                     }
                 });
@@ -488,7 +488,7 @@ impl TrackMapPanel {
 
                         for (lap_idx, lap_sectors) in sector_times.iter().enumerate() {
                             let lap = &shared.laps[lap_idx];
-                            ui.label(format!("Lap {}", lap.number));
+                            ui.label(&lap.name);
 
                             let mut total = 0.0;
                             for (s_idx, st) in lap_sectors.iter().enumerate() {

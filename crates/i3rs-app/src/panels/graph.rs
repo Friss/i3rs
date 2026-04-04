@@ -616,7 +616,7 @@ impl GraphPanel {
     fn draw_lap_markers(plot_ui: &mut egui_plot::PlotUi, laps: &[Lap]) {
         let marker_color = egui::Color32::from_rgba_premultiplied(200, 200, 200, 80);
         for lap in laps {
-            let vline = VLine::new(format!("Lap {}", lap.number), lap.start_time)
+            let vline = VLine::new(&lap.name, lap.start_time)
                 .color(marker_color)
                 .width(1.0)
                 .style(egui_plot::LineStyle::dashed_dense());
