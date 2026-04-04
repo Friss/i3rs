@@ -618,16 +618,15 @@ impl eframe::App for App {
 
         // Dock-back: return panels that requested docking to the main dock
         let dock = &mut self.worksheets[self.active_worksheet].dock_state;
-        let mut i = 0;
-        while i < self.popped_out_track_maps.len() {
-            if self.popped_out_track_maps[i].dock_requested {
-                let mut tm = self.popped_out_track_maps.remove(i);
-                tm.dock_requested = false;
-                tm.is_popped_out = false;
-                dock.push_to_focused_leaf(PanelTab::TrackMap(tm));
-            } else {
-                i += 1;
-            }
+        let (to_dock, to_keep): (Vec<_>, Vec<_>) = self
+            .popped_out_track_maps
+            .drain(..)
+            .partition(|tm| tm.dock_requested);
+        self.popped_out_track_maps = to_keep;
+        for mut tm in to_dock {
+            tm.dock_requested = false;
+            tm.is_popped_out = false;
+            dock.push_to_focused_leaf(PanelTab::TrackMap(tm));
         }
 
         // Clear per-frame flags

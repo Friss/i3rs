@@ -18,7 +18,7 @@ pub struct TrackData {
 }
 
 /// A track sector defined by GPS sample index boundaries.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Sector {
     pub name: String,
     /// Index into GPS data where this sector starts.
