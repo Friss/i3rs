@@ -141,14 +141,7 @@ fn show_lap_selector(ui: &mut egui::Ui, shared: &mut SharedState) {
             }
 
             for (i, lap) in shared.laps.iter().enumerate() {
-                let dur = lap.duration();
-                let mins = (dur / 60.0) as u32;
-                let secs = dur - (mins as f64 * 60.0);
-                let label = if mins > 0 {
-                    format!("Lap {} - {}:{:05.2}", lap.number, mins, secs)
-                } else {
-                    format!("Lap {} - {:.2}s", lap.number, secs)
-                };
+                let label = format!("{} - {}", lap.name, i3rs_core::format_duration(lap.duration()));
 
                 let is_selected = shared.selected_lap == Some(i);
                 if ui.selectable_label(is_selected, &label).clicked() {

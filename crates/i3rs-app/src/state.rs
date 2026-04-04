@@ -1,7 +1,7 @@
 //! Shared application state accessible by all panels.
 
 use eframe::egui;
-use i3rs_core::{Lap, LdFile, LdxFile};
+use i3rs_core::{Lap, LdFile, LdxFile, Sector};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -139,8 +139,8 @@ pub struct CachedChannelStats {
     pub dec_places: i16,
     /// Full session stats: (min, max, avg, stddev).
     pub session: (f64, f64, f64, f64),
-    /// Per-lap stats: (lap_number, min, max, avg, stddev).
-    pub per_lap: Vec<(u32, f64, f64, f64, f64)>,
+    /// Per-lap stats: (lap_name, min, max, avg, stddev).
+    pub per_lap: Vec<(String, f64, f64, f64, f64)>,
 }
 
 /// Cache for report panel statistics, invalidated when channels or laps change.
@@ -202,7 +202,7 @@ impl ReportCache {
                 let end = end_sample.min(info.data.len());
                 if start < end {
                     let stats = compute_channel_stats(&info.data[start..end]);
-                    per_lap.push((lap.number, stats.0, stats.1, stats.2, stats.3));
+                    per_lap.push((lap.name.clone(), stats.0, stats.1, stats.2, stats.3));
                 }
             }
 
@@ -256,6 +256,10 @@ pub struct SharedState {
     // Report cache
     pub report_cache: ReportCache,
 
+    // Track map: sectors and reference lap
+    pub sectors: Vec<Sector>,
+    pub reference_lap: Option<usize>,
+
     // Next panel ID counter
     pub next_panel_id: u64,
 }
@@ -282,6 +286,8 @@ impl SharedState {
             math_channels: Vec::new(),
             channel_aliases: HashMap::new(),
             report_cache: ReportCache::new(),
+            sectors: Vec::new(),
+            reference_lap: None,
             next_panel_id: 1,
         }
     }

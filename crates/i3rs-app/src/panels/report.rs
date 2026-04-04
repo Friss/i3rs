@@ -65,18 +65,18 @@ impl ReportPanel {
                             ui.end_row();
 
                             // Per-lap stats
-                            for &(lap_number, lmin, lmax, lavg, lstddev) in &cached.per_lap {
+                            for (lap_name, lmin, lmax, lavg, lstddev) in &cached.per_lap {
                                 let is_selected = shared
                                     .selected_lap
                                     .and_then(|idx| shared.laps.get(idx))
-                                    .map_or(false, |l| l.number == lap_number);
-                                let label = format!("Lap {}", lap_number);
+                                    .map_or(false, |l| l.name == *lap_name);
+                                let label = lap_name.as_str();
 
                                 ui.label(""); // empty channel column
                                 if is_selected {
-                                    ui.strong(&label);
+                                    ui.strong(label);
                                 } else {
-                                    ui.label(&label);
+                                    ui.label(label);
                                 }
                                 ui.monospace(format!("{:.prec$}", lmin, prec = dec));
                                 ui.monospace(format!("{:.prec$}", lmax, prec = dec));

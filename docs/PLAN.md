@@ -163,11 +163,11 @@ crates/
 
 **Goal**: GPS track visualization.
 
-- [ ] Track map panel from GPS lat/lon channels
-- [ ] Rainbow track map coloring by any channel value (speed, throttle, brake, etc.)
-- [ ] Track section editor (define sectors by clicking on the map)
-- [ ] Section time report (split times, gained/lost per sector between overlays)
-- [ ] Reference lap selection
+- [x] Track map panel from GPS lat/lon channels
+- [x] Rainbow track map coloring by any channel value (speed, throttle, brake, etc.)
+- [x] Track section editor (define sectors by clicking on the map)
+- [x] Section time report (split times, gained/lost per sector between overlays)
+- [x] Reference lap selection
 
 ### Milestone 6: Histograms, Scatter, FFT, Gauges
 
