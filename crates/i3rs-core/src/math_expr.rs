@@ -639,7 +639,9 @@ mod tests {
     #[test]
     fn parse_simple_number() {
         assert_eq!(parse_expression("42").unwrap(), Expr::Number(42.0));
-        assert_eq!(parse_expression("3.14").unwrap(), Expr::Number(3.14));
+        #[allow(clippy::approx_constant)]
+        let expected = Expr::Number(3.14);
+        assert_eq!(parse_expression("3.14").unwrap(), expected);
         assert_eq!(parse_expression("1e3").unwrap(), Expr::Number(1000.0));
     }
 

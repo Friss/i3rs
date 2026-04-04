@@ -141,25 +141,23 @@ impl TrackMapPanel {
             }
         });
 
-        if response.response.hovered() {
-            if let Some(idx) = hover_idx {
-                shared.cursor_time = Some(track.time[idx]);
-            }
+        if response.response.hovered()
+            && let Some(idx) = hover_idx
+        {
+            shared.cursor_time = Some(track.time[idx]);
         }
 
-        if editing {
-            if let Some(idx) = clicked_idx {
-                if let Some(start) = self.pending_sector_start.take() {
-                    let sector_num = shared.sectors.len() + 1;
-                    shared.sectors.push(Sector {
-                        name: format!("S{}", sector_num),
-                        start_index: start,
-                        end_index: idx,
-                    });
-                    self.cached_sector_times = None;
-                } else {
-                    self.pending_sector_start = Some(idx);
-                }
+        if editing && let Some(idx) = clicked_idx {
+            if let Some(start) = self.pending_sector_start.take() {
+                let sector_num = shared.sectors.len() + 1;
+                shared.sectors.push(Sector {
+                    name: format!("S{}", sector_num),
+                    start_index: start,
+                    end_index: idx,
+                });
+                self.cached_sector_times = None;
+            } else {
+                self.pending_sector_start = Some(idx);
             }
         }
 
@@ -232,8 +230,11 @@ impl TrackMapPanel {
         colors: Option<&Vec<[u8; 4]>>,
     ) {
         if let Some(colors) = colors {
-            for i in 0..track.x.len().saturating_sub(1) {
-                let c = colors[i];
+            for (i, c) in colors
+                .iter()
+                .enumerate()
+                .take(track.x.len().saturating_sub(1))
+            {
                 let segment = Line::new(
                     "",
                     PlotPoints::new(vec![

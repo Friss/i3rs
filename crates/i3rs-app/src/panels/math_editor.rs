@@ -398,32 +398,31 @@ fn build_channel_data_map(
                     || r.replace('_', ".") == ch.name
                     || r.eq_ignore_ascii_case(&ch.name)
             });
-            if needed {
-                if let Some(data) = ld.read_channel_data(ch) {
-                    channel_data.insert(
-                        ch.name.clone(),
-                        ChannelData {
-                            samples: data,
-                            freq: ch.freq,
-                        },
-                    );
-                }
+            if needed && let Some(data) = ld.read_channel_data(ch) {
+                channel_data.insert(
+                    ch.name.clone(),
+                    ChannelData {
+                        samples: data,
+                        freq: ch.freq,
+                    },
+                );
             }
         }
     }
 
     // Add other evaluated math channels that are referenced
     for (i, other) in shared.math_channels.iter().enumerate() {
-        if i != exclude_idx && resolved_refs.iter().any(|r| r == &other.name) {
-            if let Some(ref data) = other.data {
-                channel_data.insert(
-                    other.name.clone(),
-                    ChannelData {
-                        samples: (**data).clone(),
-                        freq: other.freq,
-                    },
-                );
-            }
+        if i != exclude_idx
+            && resolved_refs.iter().any(|r| r == &other.name)
+            && let Some(ref data) = other.data
+        {
+            channel_data.insert(
+                other.name.clone(),
+                ChannelData {
+                    samples: (**data).clone(),
+                    freq: other.freq,
+                },
+            );
         }
     }
 
@@ -515,8 +514,8 @@ fn topological_eval_order(shared: &SharedState) -> Vec<usize> {
     }
 
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    for i in 0..n {
-        if in_degree[i] == 0 {
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
             queue.push_back(i);
         }
     }
@@ -607,14 +606,13 @@ fn is_duplicate_name(name: &str, shared: &SharedState, exclude_math_idx: Option<
         return false;
     }
     // Check physical channels
-    if let Some(ld) = &shared.ld_file {
-        if ld
+    if let Some(ld) = &shared.ld_file
+        && ld
             .channels
             .iter()
             .any(|ch| ch.name.eq_ignore_ascii_case(name))
-        {
-            return true;
-        }
+    {
+        return true;
     }
     // Check other math channels
     for (i, mc) in shared.math_channels.iter().enumerate() {

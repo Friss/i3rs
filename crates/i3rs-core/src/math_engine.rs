@@ -60,10 +60,10 @@ fn resolve_channel_name<'a>(
     }
 
     for variant in [reference, with_spaces.as_str(), with_dots.as_str()] {
-        if let Some(target) = aliases.get(variant) {
-            if let Some((k, _)) = available.get_key_value(target) {
-                return Some(k);
-            }
+        if let Some(target) = aliases.get(variant)
+            && let Some((k, _)) = available.get_key_value(target)
+        {
+            return Some(k);
         }
     }
 
@@ -74,10 +74,10 @@ fn resolve_channel_name<'a>(
     }
 
     for (alias, target) in aliases {
-        if alias.eq_ignore_ascii_case(reference) {
-            if let Some((k, _)) = available.get_key_value(target) {
-                return Some(k);
-            }
+        if alias.eq_ignore_ascii_case(reference)
+            && let Some((k, _)) = available.get_key_value(target)
+        {
+            return Some(k);
         }
     }
 

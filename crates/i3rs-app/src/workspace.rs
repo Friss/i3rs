@@ -238,37 +238,35 @@ pub fn load_workspace(
                                 // Find math channel by name
                                 if let Some(mc_idx) =
                                     shared.math_channels.iter().position(|mc| mc.name == *name)
+                                    && let Some(data) = &shared.math_channels[mc_idx].data
                                 {
-                                    if let Some(data) = &shared.math_channels[mc_idx].data {
-                                        let (cached_min, cached_max, cached_avg) =
-                                            GraphPanel::compute_stats(data);
-                                        graph.plotted_channels.push(crate::state::PlottedChannel {
-                                            channel_id: ChannelId::Math(mc_idx),
-                                            color,
-                                            data: data.clone(),
-                                            y_axis: crate::state::YAxis::Left,
-                                            cached_min,
-                                            cached_max,
-                                            cached_avg,
-                                        });
-                                    }
+                                    let (cached_min, cached_max, cached_avg) =
+                                        GraphPanel::compute_stats(data);
+                                    graph.plotted_channels.push(crate::state::PlottedChannel {
+                                        channel_id: ChannelId::Math(mc_idx),
+                                        color,
+                                        data: data.clone(),
+                                        y_axis: crate::state::YAxis::Left,
+                                        cached_min,
+                                        cached_max,
+                                        cached_avg,
+                                    });
                                 }
-                            } else if let Some(ld) = &shared.ld_file {
-                                if let Some(ch) = ld.channels.iter().find(|c| &c.name == name) {
-                                    if let Some(data) = ld.read_channel_data(ch) {
-                                        let (cached_min, cached_max, cached_avg) =
-                                            GraphPanel::compute_stats(&data);
-                                        graph.plotted_channels.push(crate::state::PlottedChannel {
-                                            channel_id: ChannelId::Physical(ch.index),
-                                            color,
-                                            data: std::sync::Arc::new(data),
-                                            y_axis: crate::state::YAxis::Left,
-                                            cached_min,
-                                            cached_max,
-                                            cached_avg,
-                                        });
-                                    }
-                                }
+                            } else if let Some(ld) = &shared.ld_file
+                                && let Some(ch) = ld.channels.iter().find(|c| &c.name == name)
+                                && let Some(data) = ld.read_channel_data(ch)
+                            {
+                                let (cached_min, cached_max, cached_avg) =
+                                    GraphPanel::compute_stats(&data);
+                                graph.plotted_channels.push(crate::state::PlottedChannel {
+                                    channel_id: ChannelId::Physical(ch.index),
+                                    color,
+                                    data: std::sync::Arc::new(data),
+                                    y_axis: crate::state::YAxis::Left,
+                                    cached_min,
+                                    cached_max,
+                                    cached_avg,
+                                });
                             }
                         }
 
