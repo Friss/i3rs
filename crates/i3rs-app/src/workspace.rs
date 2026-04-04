@@ -3,8 +3,11 @@
 use egui_dock::{DockState, NodeIndex};
 use serde::{Deserialize, Serialize};
 
+use i3rs_core::Sector;
+
 use crate::panels::PanelTab;
 use crate::panels::graph::GraphPanel;
+use crate::panels::track_map::TrackMapPanel;
 use crate::state::{CHANNEL_COLORS, ChannelId, GraphMode, SharedState};
 
 // ---------------------------------------------------------------------------
@@ -20,6 +23,10 @@ pub struct WorkspaceFile {
     pub math_channels: Vec<MathChannelConfig>,
     #[serde(default)]
     pub channel_aliases: Vec<ChannelAliasConfig>,
+    #[serde(default)]
+    pub sectors: Vec<Sector>,
+    #[serde(default)]
+    pub reference_lap: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -37,6 +44,7 @@ pub struct WorksheetConfig {
 #[derive(Serialize, Deserialize)]
 pub enum PanelConfig {
     Graph(GraphPanelConfig),
+    TrackMap(TrackMapPanelConfig),
     ChannelBrowser,
     CursorReadout,
     Report(ReportPanelConfig),
@@ -59,6 +67,14 @@ pub struct ReportPanelConfig {
     pub id: u64,
     pub title: String,
 }
+
+#[derive(Serialize, Deserialize)]
+pub struct TrackMapPanelConfig {
+    pub id: u64,
+    pub title: String,
+    pub color_channel_name: Option<String>,
+}
+
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MathChannelConfig {
@@ -122,6 +138,18 @@ pub fn save_workspace(
                             is_math,
                         })
                     }
+                    PanelTab::TrackMap(t) => {
+                        let color_channel_name = t.color_channel_idx.and_then(|idx| {
+                            shared.ld_file.as_ref().and_then(|ld| {
+                                ld.channels.get(idx).map(|ch| ch.name.clone())
+                            })
+                        });
+                        PanelConfig::TrackMap(TrackMapPanelConfig {
+                            id: t.id,
+                            title: t.title.clone(),
+                            color_channel_name,
+                        })
+                    }
                     PanelTab::ChannelBrowser => PanelConfig::ChannelBrowser,
                     PanelTab::CursorReadout => PanelConfig::CursorReadout,
                     PanelTab::Report(r) => PanelConfig::Report(ReportPanelConfig {
@@ -158,6 +186,8 @@ pub fn save_workspace(
         })
         .collect();
 
+    let sectors: Vec<Sector> = shared.sectors.clone();
+
     WorkspaceFile {
         worksheets: ws_configs,
         active_worksheet,
@@ -167,6 +197,8 @@ pub fn save_workspace(
             .map(|p| p.to_string_lossy().to_string()),
         math_channels,
         channel_aliases,
+        sectors,
+        reference_lap: shared.reference_lap,
     }
 }
 
@@ -248,6 +280,23 @@ pub fn load_workspace(
                         }
 
                         PanelTab::Graph(graph)
+                    }
+                    PanelConfig::TrackMap(tc) => {
+                        let mut track_map = TrackMapPanel::new(tc.id, &tc.title);
+                        // Resolve color channel by name
+                        if let Some(ref color_name) = tc.color_channel_name
+                            && let Some(ld) = &shared.ld_file
+                            && let Some(idx) = ld
+                                .channels
+                                .iter()
+                                .position(|ch| &ch.name == color_name)
+                        {
+                            track_map.color_channel_idx = Some(idx);
+                        }
+                        if tc.id >= shared.next_panel_id {
+                            shared.next_panel_id = tc.id + 1;
+                        }
+                        PanelTab::TrackMap(track_map)
                     }
                     PanelConfig::ChannelBrowser => PanelTab::ChannelBrowser,
                     PanelConfig::CursorReadout => PanelTab::CursorReadout,

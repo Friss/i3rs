@@ -1,7 +1,7 @@
 //! Shared application state accessible by all panels.
 
 use eframe::egui;
-use i3rs_core::{Lap, LdFile, LdxFile};
+use i3rs_core::{Lap, LdFile, LdxFile, Sector};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -256,6 +256,10 @@ pub struct SharedState {
     // Report cache
     pub report_cache: ReportCache,
 
+    // Track map: sectors and reference lap
+    pub sectors: Vec<Sector>,
+    pub reference_lap: Option<usize>,
+
     // Next panel ID counter
     pub next_panel_id: u64,
 }
@@ -282,6 +286,8 @@ impl SharedState {
             math_channels: Vec::new(),
             channel_aliases: HashMap::new(),
             report_cache: ReportCache::new(),
+            sectors: Vec::new(),
+            reference_lap: None,
             next_panel_id: 1,
         }
     }

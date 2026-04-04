@@ -1474,6 +1474,7 @@ dependencies = [
  "half",
  "memmap2",
  "quick-xml 0.39.2",
+ "serde",
 ]
 
 [[package]]

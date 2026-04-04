@@ -34,6 +34,7 @@ Three crates in `crates/`:
 - `math_expr.rs` — Recursive descent expression parser (AST: `Expr`, `BinOp`)
 - `math_engine.rs` — Expression evaluator with built-in functions, channel resampling, `evaluate_expression()` entry point
 - `export.rs` — CSV export with multi-frequency resampling
+- `track.rs` — GPS track extraction, normalization, color mapping, sector timing. Key types: `TrackData`, `Sector`, `SectorTime`. Functions: `extract_gps_track()`, `find_nearest_sample()`, `compute_color_map()`, `compute_sector_times()`
 
 ### i3rs-app (`crates/i3rs-app/src/`)
 - `app.rs` — Top-level `App` struct, egui-dock layout, file open logic, menu bar
@@ -45,6 +46,7 @@ Three crates in `crates/`:
 - `panels/timeline.rs` — Overview bar with draggable zoom window
 - `panels/math_editor.rs` — Math channel definition UI: add/edit/delete/evaluate expressions, predefined calculation templates, channel alias management
 - `panels/report.rs` — Statistics report panel: min/max/avg/stddev per channel per lap
+- `panels/track_map.rs` — GPS track map panel: rainbow coloring by channel value, sector editor, sector time report, cursor sync, reference lap selection
 
 ## Architecture Notes
 
@@ -73,4 +75,4 @@ Full format docs: `docs/ld-file-format.md`
 
 ## Current Status
 
-Milestones 1–4 complete. Next up: Milestone 5 (track map).
+Milestones 1–5 complete. Next up: Milestone 6 (histograms, scatter, FFT, gauges).

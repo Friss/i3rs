@@ -1,6 +1,6 @@
 //! Integration tests for i3rs-core using real MoTeC test data.
 
-use i3rs_core::{LdFile, LdxFile, detect_laps, downsample_minmax, find_ldx_for_ld};
+use i3rs_core::{LdFile, LdxFile, detect_laps, downsample_minmax, extract_gps_track, find_ldx_for_ld, find_nearest_sample};
 use std::path::Path;
 
 const TEST_LD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/VIR_LAP.ld");
@@ -255,4 +255,46 @@ fn known_data_types_are_readable() {
         "expected multiple data types, only saw: {:?}",
         types_seen
     );
+}
+
+// ---------------------------------------------------------------------------
+// GPS track extraction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extract_gps_track_from_test_data() {
+    let ld = LdFile::open(TEST_LD).expect("failed to open .ld file");
+    let track = extract_gps_track(&ld).expect("GPS track extraction failed");
+
+    // VIR_LAP.ld has GPS at 20 Hz with ~2660 samples
+    assert!(track.x.len() > 2000, "expected >2000 GPS samples, got {}", track.x.len());
+    assert_eq!(track.x.len(), track.y.len());
+    assert_eq!(track.x.len(), track.time.len());
+    assert_eq!(track.freq, 20);
+
+    // Coordinates should be centered near zero (mean subtracted)
+    let mean_x: f64 = track.x.iter().sum::<f64>() / track.x.len() as f64;
+    let mean_y: f64 = track.y.iter().sum::<f64>() / track.y.len() as f64;
+    assert!(mean_x.abs() < 1e-6, "mean x should be ~0, got {}", mean_x);
+    assert!(mean_y.abs() < 1e-6, "mean y should be ~0, got {}", mean_y);
+
+    // Time should be monotonically increasing
+    for i in 1..track.time.len() {
+        assert!(track.time[i] >= track.time[i - 1]);
+    }
+}
+
+#[test]
+fn find_nearest_on_real_track() {
+    let ld = LdFile::open(TEST_LD).expect("failed to open .ld file");
+    let track = extract_gps_track(&ld).expect("GPS track extraction failed");
+
+    // Find nearest to the first point should return 0
+    let idx = find_nearest_sample(&track, track.x[0], track.y[0]);
+    assert_eq!(idx, 0);
+
+    // Find nearest to the last point should return a point near the end
+    let last = track.x.len() - 1;
+    let idx = find_nearest_sample(&track, track.x[last], track.y[last]);
+    assert!(idx >= last.saturating_sub(5), "expected near end, got {}", idx);
 }

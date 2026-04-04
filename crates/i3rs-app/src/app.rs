@@ -10,6 +10,7 @@ use crate::panels::graph::GraphPanel;
 use crate::panels::math_editor::{self, MathEditorState};
 use crate::panels::report::ReportPanel;
 use crate::panels::timeline::TimelinePanel;
+use crate::panels::track_map::TrackMapPanel;
 use crate::panels::{AppTabViewer, PanelTab};
 use crate::state::SharedState;
 
@@ -28,6 +29,8 @@ pub struct App {
     show_math_editor: bool,
     timeline: TimelinePanel,
     math_editor_state: MathEditorState,
+    /// Track map panels that have been popped out into separate OS windows.
+    popped_out_track_maps: Vec<TrackMapPanel>,
 }
 
 impl App {
@@ -47,6 +50,7 @@ impl App {
             show_math_editor: false,
             timeline: TimelinePanel::new(),
             math_editor_state: MathEditorState::new(),
+            popped_out_track_maps: Vec::new(),
         }
     }
 
@@ -74,13 +78,18 @@ impl App {
                 self.shared.selected_lap = None;
                 self.shared.zoom_range = None;
 
-                // Clear all graph panels' channels across all worksheets
+                // Clear all graph panels' channels and track map caches across all worksheets
                 for ws in &mut self.worksheets {
                     for (_path, tab) in ws.dock_state.iter_all_tabs_mut() {
-                        if let PanelTab::Graph(g) = tab {
-                            g.plotted_channels.clear();
+                        match tab {
+                            PanelTab::Graph(g) => g.plotted_channels.clear(),
+                            PanelTab::TrackMap(t) => t.clear_cache(),
+                            _ => {}
                         }
                     }
+                }
+                for tm in &mut self.popped_out_track_maps {
+                    tm.clear_cache();
                 }
 
                 // Re-evaluate math channels with new file data
@@ -110,6 +119,15 @@ impl App {
             .push_to_focused_leaf(PanelTab::Report(report));
     }
 
+    fn add_track_map_panel(&mut self) {
+        let id = self.shared.next_panel_id;
+        self.shared.next_panel_id += 1;
+        let track_map = TrackMapPanel::new(id, format!("Track Map {}", id));
+        self.worksheets[self.active_worksheet]
+            .dock_state
+            .push_to_focused_leaf(PanelTab::TrackMap(track_map));
+    }
+
     fn add_worksheet(&mut self) {
         let idx = self.worksheets.len() + 1;
         let dock_state = Self::default_dock_state(&mut self.shared);
@@ -126,8 +144,28 @@ impl App {
             .iter()
             .map(|ws| (ws.name.clone(), &ws.dock_state))
             .collect();
-        let workspace =
+        let mut workspace =
             crate::workspace::save_workspace(&ws_refs, self.active_worksheet, &self.shared);
+
+        // Include popped-out track maps in the active worksheet so they're preserved
+        for tm in &self.popped_out_track_maps {
+            let color_channel_name = tm.color_channel_idx.and_then(|idx| {
+                self.shared
+                    .ld_file
+                    .as_ref()
+                    .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
+            });
+            if let Some(ws) = workspace.worksheets.get_mut(self.active_worksheet) {
+                ws.panels.push(crate::workspace::PanelConfig::TrackMap(
+                    crate::workspace::TrackMapPanelConfig {
+                        id: tm.id,
+                        title: tm.title.clone(),
+                        color_channel_name,
+                    },
+                ));
+            }
+        }
+
         if let Ok(json) = serde_json::to_string_pretty(&workspace)
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter("Workspace", &["json"])
@@ -178,6 +216,9 @@ impl App {
                                 ));
                         }
                         math_editor::evaluate_all_math_channels(&mut self.shared);
+
+                        self.shared.sectors = workspace.sectors.clone();
+                        self.shared.reference_lap = workspace.reference_lap;
 
                         let loaded = crate::workspace::load_workspace(&workspace, &mut self.shared);
                         self.worksheets = loaded
@@ -271,6 +312,10 @@ impl App {
                 }
                 if ui.button("Add Report Panel").clicked() {
                     self.add_report_panel();
+                    ui.close();
+                }
+                if ui.button("Add Track Map").clicked() {
+                    self.add_track_map_panel();
                     ui.close();
                 }
                 ui.separator();
@@ -540,6 +585,50 @@ impl eframe::App for App {
             .show_leaf_collapse_buttons(false)
             .draggable_tabs(true)
             .show_inside(ui, &mut viewer);
+
+        // Pop-out: move track map panels that requested pop-out from dock to separate windows
+        let dock = &mut self.worksheets[self.active_worksheet].dock_state;
+        while let Some(path) =
+            dock.find_tab_from(|t| matches!(t, PanelTab::TrackMap(tm) if tm.pop_out_requested))
+        {
+            if let Some(PanelTab::TrackMap(mut tm)) = dock.remove_tab(path) {
+                tm.pop_out_requested = false;
+                tm.is_popped_out = true;
+                self.popped_out_track_maps.push(tm);
+            } else {
+                break;
+            }
+        }
+
+        // Render popped-out track maps in separate OS windows
+        let shared = &mut self.shared;
+        let popped_out = &mut self.popped_out_track_maps;
+        for tm in popped_out.iter_mut() {
+            let viewport_id = egui::ViewportId::from_hash_of(format!("track_map_{}", tm.id));
+            ui.ctx().show_viewport_immediate(
+                viewport_id,
+                egui::ViewportBuilder::default()
+                    .with_title(format!("Track Map — {}", tm.title))
+                    .with_inner_size([800.0, 600.0]),
+                |viewport_ui, _class| {
+                    tm.ui(viewport_ui, shared);
+                },
+            );
+        }
+
+        // Dock-back: return panels that requested docking to the main dock
+        let dock = &mut self.worksheets[self.active_worksheet].dock_state;
+        let mut i = 0;
+        while i < self.popped_out_track_maps.len() {
+            if self.popped_out_track_maps[i].dock_requested {
+                let mut tm = self.popped_out_track_maps.remove(i);
+                tm.dock_requested = false;
+                tm.is_popped_out = false;
+                dock.push_to_focused_leaf(PanelTab::TrackMap(tm));
+            } else {
+                i += 1;
+            }
+        }
 
         // Clear per-frame flags
         self.shared.zoom_from_timeline = false;
