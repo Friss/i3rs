@@ -112,7 +112,12 @@ pub fn resolve_alias_target(reference: &str, aliases: &HashMap<String, String>) 
 
 /// Resample a channel to a target frequency using linear interpolation.
 /// Returns a borrowed slice when no resampling is needed.
-fn resample<'a>(data: &'a [f64], src_freq: u16, target_freq: u16, target_len: usize) -> Cow<'a, [f64]> {
+fn resample<'a>(
+    data: &'a [f64],
+    src_freq: u16,
+    target_freq: u16,
+    target_len: usize,
+) -> Cow<'a, [f64]> {
     if src_freq == target_freq && data.len() == target_len {
         return Cow::Borrowed(data);
     }
@@ -167,10 +172,8 @@ fn eval_impl(
 
         Expr::Channel(name) => {
             let resolved =
-                resolve_channel_name(name, channels, aliases).ok_or_else(|| {
-                    MathError {
-                        message: format!("unknown channel '{}'", name),
-                    }
+                resolve_channel_name(name, channels, aliases).ok_or_else(|| MathError {
+                    message: format!("unknown channel '{}'", name),
                 })?;
             let ch = &channels[resolved];
             Ok(resample(&ch.samples, ch.freq, output_freq, output_len).into_owned())
@@ -182,10 +185,8 @@ fn eval_impl(
         }
 
         Expr::BinaryOp(lhs, op, rhs) => {
-            let left =
-                eval_impl(lhs, channels, output_freq, output_len, aliases)?;
-            let right =
-                eval_impl(rhs, channels, output_freq, output_len, aliases)?;
+            let left = eval_impl(lhs, channels, output_freq, output_len, aliases)?;
+            let right = eval_impl(rhs, channels, output_freq, output_len, aliases)?;
             let result = left
                 .iter()
                 .zip(right.iter())
@@ -207,14 +208,62 @@ fn eval_impl(
                             l % r
                         }
                     }
-                    BinOp::Gt => if l > r { 1.0 } else { 0.0 },
-                    BinOp::Lt => if l < r { 1.0 } else { 0.0 },
-                    BinOp::Gte => if l >= r { 1.0 } else { 0.0 },
-                    BinOp::Lte => if l <= r { 1.0 } else { 0.0 },
-                    BinOp::Eq => if l == r { 1.0 } else { 0.0 },
-                    BinOp::Neq => if l != r { 1.0 } else { 0.0 },
-                    BinOp::And => if !l.is_nan() && l != 0.0 && !r.is_nan() && r != 0.0 { 1.0 } else { 0.0 },
-                    BinOp::Or => if (!l.is_nan() && l != 0.0) || (!r.is_nan() && r != 0.0) { 1.0 } else { 0.0 },
+                    BinOp::Gt => {
+                        if l > r {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    BinOp::Lt => {
+                        if l < r {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    BinOp::Gte => {
+                        if l >= r {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    BinOp::Lte => {
+                        if l <= r {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    BinOp::Eq => {
+                        if l == r {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    BinOp::Neq => {
+                        if l != r {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    BinOp::And => {
+                        if !l.is_nan() && l != 0.0 && !r.is_nan() && r != 0.0 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    BinOp::Or => {
+                        if (!l.is_nan() && l != 0.0) || (!r.is_nan() && r != 0.0) {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
                 })
                 .collect();
             Ok(result)
@@ -334,7 +383,9 @@ fn eval_function(
         "if_then" => {
             if args.len() != 3 {
                 return Err(MathError {
-                    message: "if_then() requires 3 arguments: if_then(condition, true_val, false_val)".into(),
+                    message:
+                        "if_then() requires 3 arguments: if_then(condition, true_val, false_val)"
+                            .into(),
                 });
             }
             let cond = eval_impl(&args[0], channels, freq, len, aliases)?;
@@ -352,7 +403,9 @@ fn eval_function(
         "kmh_to_mph" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.621371),
         "mph_to_kmh" => unary_fn(args, channels, freq, len, aliases, |v| v * 1.60934),
         "c_to_f" => unary_fn(args, channels, freq, len, aliases, |v| v * 9.0 / 5.0 + 32.0),
-        "f_to_c" => unary_fn(args, channels, freq, len, aliases, |v| (v - 32.0) * 5.0 / 9.0),
+        "f_to_c" => unary_fn(args, channels, freq, len, aliases, |v| {
+            (v - 32.0) * 5.0 / 9.0
+        }),
         "kpa_to_psi" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.145038),
         "psi_to_kpa" => unary_fn(args, channels, freq, len, aliases, |v| v * 6.89476),
         "bar_to_psi" => unary_fn(args, channels, freq, len, aliases, |v| v * 14.5038),
@@ -465,10 +518,7 @@ fn cumulative_integral(data: &[f64], freq: u16) -> Vec<f64> {
 // ---------------------------------------------------------------------------
 
 /// Determine the output frequency for an expression: max freq of all referenced channels.
-pub fn determine_output_freq(
-    expr: &Expr,
-    channels: &HashMap<String, ChannelData>,
-) -> u16 {
+pub fn determine_output_freq(expr: &Expr, channels: &HashMap<String, ChannelData>) -> u16 {
     output_freq_impl(expr, channels, &EMPTY_ALIASES)
 }
 
@@ -541,8 +591,7 @@ pub fn evaluate_expression_with_aliases(
     if len == 0 {
         return Err("expression references no channels with data".into());
     }
-    let samples = eval_impl(&expr, channels, freq, len, aliases)
-        .map_err(|e| e.to_string())?;
+    let samples = eval_impl(&expr, channels, freq, len, aliases).map_err(|e| e.to_string())?;
     Ok((samples, freq))
 }
 
@@ -785,7 +834,12 @@ mod tests {
         let (result, _) = evaluate_expression("mph_to_kmh(kmh_to_mph(Speed))", &channels).unwrap();
         for (i, &v) in result.iter().enumerate() {
             let expected = (i as f64 + 1.0) * 10.0;
-            assert!((v - expected).abs() < 1e-3, "round-trip mismatch: {} vs {}", v, expected);
+            assert!(
+                (v - expected).abs() < 1e-3,
+                "round-trip mismatch: {} vs {}",
+                v,
+                expected
+            );
         }
     }
 

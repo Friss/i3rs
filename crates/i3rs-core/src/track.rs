@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ld_parser::LdFile;
 use crate::Lap;
+use crate::ld_parser::LdFile;
 
 /// Normalized GPS track data ready for rendering.
 pub struct TrackData {
@@ -134,7 +134,11 @@ pub fn compute_color_map(
 
     let resampled = resample_to_track(track, channel_data, channel_freq);
     let (vmin, vmax) = color_channel_range(&resampled);
-    let range = if (vmax - vmin).abs() < 1e-10 { 1.0 } else { vmax - vmin };
+    let range = if (vmax - vmin).abs() < 1e-10 {
+        1.0
+    } else {
+        vmax - vmin
+    };
 
     for &v in &resampled {
         let t = if v.is_finite() {
@@ -156,11 +160,19 @@ pub fn color_channel_range(channel_data: &[f64]) -> (f64, f64) {
     let mut vmax = f64::MIN;
     for &v in channel_data {
         if v.is_finite() {
-            if v < vmin { vmin = v; }
-            if v > vmax { vmax = v; }
+            if v < vmin {
+                vmin = v;
+            }
+            if v > vmax {
+                vmax = v;
+            }
         }
     }
-    if vmin > vmax { (0.0, 0.0) } else { (vmin, vmax) }
+    if vmin > vmax {
+        (0.0, 0.0)
+    } else {
+        (vmin, vmax)
+    }
 }
 
 /// Resample channel data to match GPS track sample times via linear interpolation.
@@ -213,18 +225,9 @@ pub fn compute_sector_times(
                 .map(|sector| {
                     // Find when the car crosses the sector start and end boundaries during this lap.
                     // Use nearest-approach to the sector boundary points.
-                    let start_time = find_crossing_time(
-                        track,
-                        sector.start_index,
-                        lap_start,
-                        lap_end,
-                    );
-                    let end_time = find_crossing_time(
-                        track,
-                        sector.end_index,
-                        lap_start,
-                        lap_end,
-                    );
+                    let start_time =
+                        find_crossing_time(track, sector.start_index, lap_start, lap_end);
+                    let end_time = find_crossing_time(track, sector.end_index, lap_start, lap_end);
 
                     let lap_duration = lap.end_time - lap.start_time;
                     let time_secs = if end_time > start_time {

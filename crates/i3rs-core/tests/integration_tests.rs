@@ -1,6 +1,9 @@
 //! Integration tests for i3rs-core using real MoTeC test data.
 
-use i3rs_core::{LdFile, LdxFile, detect_laps, downsample_minmax, extract_gps_track, find_ldx_for_ld, find_nearest_sample};
+use i3rs_core::{
+    LdFile, LdxFile, detect_laps, downsample_minmax, extract_gps_track, find_ldx_for_ld,
+    find_nearest_sample,
+};
 use std::path::Path;
 
 const TEST_LD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/VIR_LAP.ld");
@@ -275,7 +278,11 @@ fn extract_gps_track_from_test_data() {
     let track = extract_gps_track(&ld).expect("GPS track extraction failed");
 
     // VIR_LAP.ld has GPS at 20 Hz with ~2660 samples
-    assert!(track.x.len() > 2000, "expected >2000 GPS samples, got {}", track.x.len());
+    assert!(
+        track.x.len() > 2000,
+        "expected >2000 GPS samples, got {}",
+        track.x.len()
+    );
     assert_eq!(track.x.len(), track.y.len());
     assert_eq!(track.x.len(), track.time.len());
     assert_eq!(track.freq, 20);
@@ -304,5 +311,9 @@ fn find_nearest_on_real_track() {
     // Find nearest to the last point should return a point near the end
     let last = track.x.len() - 1;
     let idx = find_nearest_sample(&track, track.x[last], track.y[last]);
-    assert!(idx >= last.saturating_sub(5), "expected near end, got {}", idx);
+    assert!(
+        idx >= last.saturating_sub(5),
+        "expected near end, got {}",
+        idx
+    );
 }

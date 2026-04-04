@@ -141,7 +141,11 @@ fn show_lap_selector(ui: &mut egui::Ui, shared: &mut SharedState) {
             }
 
             for (i, lap) in shared.laps.iter().enumerate() {
-                let label = format!("{} - {}", lap.name, i3rs_core::format_duration(lap.duration()));
+                let label = format!(
+                    "{} - {}",
+                    lap.name,
+                    i3rs_core::format_duration(lap.duration())
+                );
 
                 let is_selected = shared.selected_lap == Some(i);
                 if ui.selectable_label(is_selected, &label).clicked() {

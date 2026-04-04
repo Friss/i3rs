@@ -265,7 +265,13 @@ impl GraphPanel {
             shared.cursor_time = Some(t);
         }
 
-        Self::draw_legend(ui, response.response.rect, &plotted, shared, shared.cursor_time);
+        Self::draw_legend(
+            ui,
+            response.response.rect,
+            &plotted,
+            shared,
+            shared.cursor_time,
+        );
 
         if needs_zoom_reset {
             shared.zoom_range = Some((0.0, data_duration));

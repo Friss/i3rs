@@ -204,9 +204,11 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
         ui.group(|ui| {
             ui.label("Predefined Calculations");
             ui.label(
-                egui::RichText::new("Click to populate the form above. Adjust channel names to match your data.")
-                    .small()
-                    .weak(),
+                egui::RichText::new(
+                    "Click to populate the form above. Adjust channel names to match your data.",
+                )
+                .small()
+                .weak(),
             );
 
             let mut current_category = "";
@@ -217,14 +219,16 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
                     ui.strong(current_category);
                 }
                 ui.horizontal(|ui| {
-                    if ui.small_button("+").on_hover_text(calc.description).clicked() {
+                    if ui
+                        .small_button("+")
+                        .on_hover_text(calc.description)
+                        .clicked()
+                    {
                         editor.new_name = calc.name.to_string();
                         editor.new_expression = calc.expression.to_string();
                         editor.new_unit = calc.unit.to_string();
                     }
-                    ui.label(
-                        egui::RichText::new(calc.name).strong(),
-                    );
+                    ui.label(egui::RichText::new(calc.name).strong());
                     ui.weak(format!("[{}]", calc.unit));
                 });
             }
@@ -255,7 +259,11 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
                             ui.label(err);
                         } else if mc.data.is_some() {
                             ui.colored_label(egui::Color32::from_rgb(100, 255, 100), "\u{2713}");
-                            ui.label(format!("{}Hz, {} samples", mc.freq, mc.data.as_ref().map_or(0, |d| d.len())));
+                            ui.label(format!(
+                                "{}Hz, {} samples",
+                                mc.freq,
+                                mc.data.as_ref().map_or(0, |d| d.len())
+                            ));
                         }
                     });
 
@@ -317,9 +325,7 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
             );
             ui.horizontal(|ui| {
                 ui.label("Alias:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut editor.new_alias_name).desired_width(100.0),
-                );
+                ui.add(egui::TextEdit::singleline(&mut editor.new_alias_name).desired_width(100.0));
                 ui.label("\u{2192}");
                 ui.label("Target:");
                 ui.add(
@@ -602,7 +608,11 @@ fn is_duplicate_name(name: &str, shared: &SharedState, exclude_math_idx: Option<
     }
     // Check physical channels
     if let Some(ld) = &shared.ld_file {
-        if ld.channels.iter().any(|ch| ch.name.eq_ignore_ascii_case(name)) {
+        if ld
+            .channels
+            .iter()
+            .any(|ch| ch.name.eq_ignore_ascii_case(name))
+        {
             return true;
         }
     }

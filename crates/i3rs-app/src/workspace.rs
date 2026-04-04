@@ -75,7 +75,6 @@ pub struct TrackMapPanelConfig {
     pub color_channel_name: Option<String>,
 }
 
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MathChannelConfig {
     pub name: String,
@@ -140,9 +139,10 @@ pub fn save_workspace(
                     }
                     PanelTab::TrackMap(t) => {
                         let color_channel_name = t.color_channel_idx.and_then(|idx| {
-                            shared.ld_file.as_ref().and_then(|ld| {
-                                ld.channels.get(idx).map(|ch| ch.name.clone())
-                            })
+                            shared
+                                .ld_file
+                                .as_ref()
+                                .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
                         });
                         PanelConfig::TrackMap(TrackMapPanelConfig {
                             id: t.id,
@@ -236,10 +236,8 @@ pub fn load_workspace(
 
                             if is_math {
                                 // Find math channel by name
-                                if let Some(mc_idx) = shared
-                                    .math_channels
-                                    .iter()
-                                    .position(|mc| mc.name == *name)
+                                if let Some(mc_idx) =
+                                    shared.math_channels.iter().position(|mc| mc.name == *name)
                                 {
                                     if let Some(data) = &shared.math_channels[mc_idx].data {
                                         let (cached_min, cached_max, cached_avg) =
@@ -286,10 +284,8 @@ pub fn load_workspace(
                         // Resolve color channel by name
                         if let Some(ref color_name) = tc.color_channel_name
                             && let Some(ld) = &shared.ld_file
-                            && let Some(idx) = ld
-                                .channels
-                                .iter()
-                                .position(|ch| &ch.name == color_name)
+                            && let Some(idx) =
+                                ld.channels.iter().position(|ch| &ch.name == color_name)
                         {
                             track_map.color_channel_idx = Some(idx);
                         }

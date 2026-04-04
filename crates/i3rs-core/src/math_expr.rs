@@ -79,7 +79,11 @@ pub struct ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "parse error at position {}: {}", self.position, self.message)
+        write!(
+            f,
+            "parse error at position {}: {}",
+            self.position, self.message
+        )
     }
 }
 
@@ -139,15 +143,31 @@ impl<'a> Tokenizer<'a> {
             let start = self.pos;
             let ch = self.input.as_bytes()[self.pos];
             let tok = match ch {
-                b'+' => { self.pos += 1; Token::Plus }
-                b'-' => { self.pos += 1; Token::Minus }
-                b'*' => { self.pos += 1; Token::Star }
-                b'/' => { self.pos += 1; Token::Slash }
-                b'%' => { self.pos += 1; Token::Percent }
+                b'+' => {
+                    self.pos += 1;
+                    Token::Plus
+                }
+                b'-' => {
+                    self.pos += 1;
+                    Token::Minus
+                }
+                b'*' => {
+                    self.pos += 1;
+                    Token::Star
+                }
+                b'/' => {
+                    self.pos += 1;
+                    Token::Slash
+                }
+                b'%' => {
+                    self.pos += 1;
+                    Token::Percent
+                }
                 b'>' => {
                     self.pos += 1;
                     if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'=' {
-                        self.pos += 1; Token::Gte
+                        self.pos += 1;
+                        Token::Gte
                     } else {
                         Token::Gt
                     }
@@ -155,7 +175,8 @@ impl<'a> Tokenizer<'a> {
                 b'<' => {
                     self.pos += 1;
                     if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'=' {
-                        self.pos += 1; Token::Lte
+                        self.pos += 1;
+                        Token::Lte
                     } else {
                         Token::Lt
                     }
@@ -163,7 +184,8 @@ impl<'a> Tokenizer<'a> {
                 b'=' => {
                     self.pos += 1;
                     if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'=' {
-                        self.pos += 1; Token::EqEq
+                        self.pos += 1;
+                        Token::EqEq
                     } else {
                         return Err(ParseError {
                             message: "use '==' for equality comparison".into(),
@@ -174,7 +196,8 @@ impl<'a> Tokenizer<'a> {
                 b'!' => {
                     self.pos += 1;
                     if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'=' {
-                        self.pos += 1; Token::BangEq
+                        self.pos += 1;
+                        Token::BangEq
                     } else {
                         Token::Bang
                     }
@@ -182,7 +205,8 @@ impl<'a> Tokenizer<'a> {
                 b'&' => {
                     self.pos += 1;
                     if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'&' {
-                        self.pos += 1; Token::AmpAmp
+                        self.pos += 1;
+                        Token::AmpAmp
                     } else {
                         return Err(ParseError {
                             message: "use '&&' for logical AND".into(),
@@ -193,7 +217,8 @@ impl<'a> Tokenizer<'a> {
                 b'|' => {
                     self.pos += 1;
                     if self.pos < self.input.len() && self.input.as_bytes()[self.pos] == b'|' {
-                        self.pos += 1; Token::PipePipe
+                        self.pos += 1;
+                        Token::PipePipe
                     } else {
                         return Err(ParseError {
                             message: "use '||' for logical OR".into(),
@@ -201,9 +226,18 @@ impl<'a> Tokenizer<'a> {
                         });
                     }
                 }
-                b'(' => { self.pos += 1; Token::LParen }
-                b')' => { self.pos += 1; Token::RParen }
-                b',' => { self.pos += 1; Token::Comma }
+                b'(' => {
+                    self.pos += 1;
+                    Token::LParen
+                }
+                b')' => {
+                    self.pos += 1;
+                    Token::RParen
+                }
+                b',' => {
+                    self.pos += 1;
+                    Token::Comma
+                }
                 b'"' => self.read_quoted_string()?,
                 b'0'..=b'9' | b'.' => self.read_number()?,
                 b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.read_ident(),
@@ -235,7 +269,8 @@ impl<'a> Tokenizer<'a> {
         // Exponent
         if self.pos < self.input.len() && matches!(self.input.as_bytes()[self.pos], b'e' | b'E') {
             self.pos += 1;
-            if self.pos < self.input.len() && matches!(self.input.as_bytes()[self.pos], b'+' | b'-') {
+            if self.pos < self.input.len() && matches!(self.input.as_bytes()[self.pos], b'+' | b'-')
+            {
                 self.pos += 1;
             }
             while self.pos < self.input.len() && self.input.as_bytes()[self.pos].is_ascii_digit() {
@@ -287,27 +322,54 @@ impl<'a> Tokenizer<'a> {
 // ---------------------------------------------------------------------------
 
 const BUILTIN_FUNCTIONS: &[&str] = &[
-    "smooth", "derivative", "integrate",
-    "abs", "sqrt", "min", "max",
-    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-    "log", "ln", "exp", "pow",
-    "floor", "ceil", "round",
+    "smooth",
+    "derivative",
+    "integrate",
+    "abs",
+    "sqrt",
+    "min",
+    "max",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "log",
+    "ln",
+    "exp",
+    "pow",
+    "floor",
+    "ceil",
+    "round",
     "clamp",
     // Data gating
-    "gate", "if_then",
+    "gate",
+    "if_then",
     // Unit conversion
-    "kmh_to_mph", "mph_to_kmh",
-    "c_to_f", "f_to_c",
-    "kpa_to_psi", "psi_to_kpa",
-    "bar_to_psi", "psi_to_bar",
-    "deg_to_rad", "rad_to_deg",
-    "kg_to_lb", "lb_to_kg",
-    "m_to_ft", "ft_to_m",
-    "nm_to_lbft", "lbft_to_nm",
+    "kmh_to_mph",
+    "mph_to_kmh",
+    "c_to_f",
+    "f_to_c",
+    "kpa_to_psi",
+    "psi_to_kpa",
+    "bar_to_psi",
+    "psi_to_bar",
+    "deg_to_rad",
+    "rad_to_deg",
+    "kg_to_lb",
+    "lb_to_kg",
+    "m_to_ft",
+    "ft_to_m",
+    "nm_to_lbft",
+    "lbft_to_nm",
 ];
 
 fn is_builtin_function(name: &str) -> bool {
-    BUILTIN_FUNCTIONS.iter().any(|&f| f.eq_ignore_ascii_case(name))
+    BUILTIN_FUNCTIONS
+        .iter()
+        .any(|&f| f.eq_ignore_ascii_case(name))
 }
 
 // ---------------------------------------------------------------------------
@@ -325,7 +387,10 @@ impl Parser {
     }
 
     fn current_pos(&self) -> usize {
-        self.tokens.get(self.pos).map(|(_, p)| *p).unwrap_or(usize::MAX)
+        self.tokens
+            .get(self.pos)
+            .map(|(_, p)| *p)
+            .unwrap_or(usize::MAX)
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -658,7 +723,10 @@ mod tests {
             expr,
             Expr::FuncCall(
                 "abs".into(),
-                vec![Expr::FuncCall("derivative".into(), vec![Expr::Channel("x".into())])]
+                vec![Expr::FuncCall(
+                    "derivative".into(),
+                    vec![Expr::Channel("x".into())]
+                )]
             )
         );
     }
