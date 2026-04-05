@@ -6,9 +6,14 @@ use serde::{Deserialize, Serialize};
 use i3rs_core::Sector;
 
 use crate::panels::PanelTab;
+use crate::panels::fft::FftPanel;
+use crate::panels::gauge::GaugePanel;
 use crate::panels::graph::GraphPanel;
+use crate::panels::histogram::HistogramPanel;
+use crate::panels::mixture_map::MixtureMapPanel;
+use crate::panels::scatter::ScatterPanel;
 use crate::panels::track_map::TrackMapPanel;
-use crate::state::{CHANNEL_COLORS, ChannelId, GraphMode, SharedState};
+use crate::state::{CHANNEL_COLORS, ChannelId, GraphMode, SharedState, compute_channel_stats};
 
 // ---------------------------------------------------------------------------
 // Serializable workspace types
@@ -48,6 +53,11 @@ pub enum PanelConfig {
     ChannelBrowser,
     CursorReadout,
     Report(ReportPanelConfig),
+    Histogram(HistogramPanelConfig),
+    Scatter(ScatterPanelConfig),
+    Fft(FftPanelConfig),
+    Gauge(GaugePanelConfig),
+    MixtureMap(MixtureMapPanelConfig),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,6 +83,40 @@ pub struct TrackMapPanelConfig {
     pub id: u64,
     pub title: String,
     pub color_channel_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct HistogramPanelConfig {
+    pub id: u64,
+    pub title: String,
+    pub bin_count: usize,
+    pub per_lap: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ScatterPanelConfig {
+    pub id: u64,
+    pub title: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FftPanelConfig {
+    pub id: u64,
+    pub title: String,
+    pub log_scale: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GaugePanelConfig {
+    pub id: u64,
+    pub title: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MixtureMapPanelConfig {
+    pub id: u64,
+    pub title: String,
+    pub bins: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -155,6 +199,30 @@ pub fn save_workspace(
                     PanelTab::Report(r) => PanelConfig::Report(ReportPanelConfig {
                         id: r.id,
                         title: r.title.clone(),
+                    }),
+                    PanelTab::Histogram(h) => PanelConfig::Histogram(HistogramPanelConfig {
+                        id: h.id,
+                        title: h.title.clone(),
+                        bin_count: h.bin_count,
+                        per_lap: h.per_lap,
+                    }),
+                    PanelTab::Scatter(s) => PanelConfig::Scatter(ScatterPanelConfig {
+                        id: s.id,
+                        title: s.title.clone(),
+                    }),
+                    PanelTab::Fft(f) => PanelConfig::Fft(FftPanelConfig {
+                        id: f.id,
+                        title: f.title.clone(),
+                        log_scale: f.log_scale,
+                    }),
+                    PanelTab::Gauge(g) => PanelConfig::Gauge(GaugePanelConfig {
+                        id: g.id,
+                        title: g.title.clone(),
+                    }),
+                    PanelTab::MixtureMap(m) => PanelConfig::MixtureMap(MixtureMapPanelConfig {
+                        id: m.id,
+                        title: m.title.clone(),
+                        bins: m.bins,
                     }),
                 };
                 panels.push(config);
@@ -240,8 +308,8 @@ pub fn load_workspace(
                                     shared.math_channels.iter().position(|mc| mc.name == *name)
                                     && let Some(data) = &shared.math_channels[mc_idx].data
                                 {
-                                    let (cached_min, cached_max, cached_avg) =
-                                        GraphPanel::compute_stats(data);
+                                    let (cached_min, cached_max, cached_avg, _) =
+                                        compute_channel_stats(data);
                                     graph.plotted_channels.push(crate::state::PlottedChannel {
                                         channel_id: ChannelId::Math(mc_idx),
                                         color,
@@ -256,8 +324,8 @@ pub fn load_workspace(
                                 && let Some(ch) = ld.channels.iter().find(|c| &c.name == name)
                                 && let Some(data) = ld.read_channel_data(ch)
                             {
-                                let (cached_min, cached_max, cached_avg) =
-                                    GraphPanel::compute_stats(&data);
+                                let (cached_min, cached_max, cached_avg, _) =
+                                    compute_channel_stats(&data);
                                 graph.plotted_channels.push(crate::state::PlottedChannel {
                                     channel_id: ChannelId::Physical(ch.index),
                                     color,
@@ -300,6 +368,45 @@ pub fn load_workspace(
                             shared.next_panel_id = rc.id + 1;
                         }
                         PanelTab::Report(report)
+                    }
+                    PanelConfig::Histogram(hc) => {
+                        let mut histogram = HistogramPanel::new(hc.id, &hc.title);
+                        histogram.bin_count = hc.bin_count;
+                        histogram.per_lap = hc.per_lap;
+                        if hc.id >= shared.next_panel_id {
+                            shared.next_panel_id = hc.id + 1;
+                        }
+                        PanelTab::Histogram(histogram)
+                    }
+                    PanelConfig::Scatter(sc) => {
+                        let scatter = ScatterPanel::new(sc.id, &sc.title);
+                        if sc.id >= shared.next_panel_id {
+                            shared.next_panel_id = sc.id + 1;
+                        }
+                        PanelTab::Scatter(scatter)
+                    }
+                    PanelConfig::Fft(fc) => {
+                        let mut fft = FftPanel::new(fc.id, &fc.title);
+                        fft.log_scale = fc.log_scale;
+                        if fc.id >= shared.next_panel_id {
+                            shared.next_panel_id = fc.id + 1;
+                        }
+                        PanelTab::Fft(fft)
+                    }
+                    PanelConfig::Gauge(gc) => {
+                        let gauge = GaugePanel::new(gc.id, &gc.title);
+                        if gc.id >= shared.next_panel_id {
+                            shared.next_panel_id = gc.id + 1;
+                        }
+                        PanelTab::Gauge(gauge)
+                    }
+                    PanelConfig::MixtureMap(mc) => {
+                        let mut mixture_map = MixtureMapPanel::new(mc.id, &mc.title);
+                        mixture_map.bins = mc.bins;
+                        if mc.id >= shared.next_panel_id {
+                            shared.next_panel_id = mc.id + 1;
+                        }
+                        PanelTab::MixtureMap(mixture_map)
                     }
                 })
                 .collect();

@@ -6,9 +6,14 @@ use i3rs_core::{ExportChannel, LdFile, detect_laps, export_csv, find_ldx_for_ld}
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::panels::fft::FftPanel;
+use crate::panels::gauge::GaugePanel;
 use crate::panels::graph::GraphPanel;
+use crate::panels::histogram::HistogramPanel;
 use crate::panels::math_editor::{self, MathEditorState};
+use crate::panels::mixture_map::MixtureMapPanel;
 use crate::panels::report::ReportPanel;
+use crate::panels::scatter::ScatterPanel;
 use crate::panels::timeline::TimelinePanel;
 use crate::panels::track_map::TrackMapPanel;
 use crate::panels::{AppTabViewer, PanelTab};
@@ -78,12 +83,17 @@ impl App {
                 self.shared.selected_lap = None;
                 self.shared.zoom_range = None;
 
-                // Clear all graph panels' channels and track map caches across all worksheets
+                // Clear all panels' channels and caches across all worksheets
                 for ws in &mut self.worksheets {
                     for (_path, tab) in ws.dock_state.iter_all_tabs_mut() {
                         match tab {
                             PanelTab::Graph(g) => g.plotted_channels.clear(),
                             PanelTab::TrackMap(t) => t.clear_cache(),
+                            PanelTab::Histogram(h) => h.clear_channels(),
+                            PanelTab::Scatter(s) => s.clear_channels(),
+                            PanelTab::Fft(f) => f.clear_channels(),
+                            PanelTab::Gauge(g) => g.clear_channels(),
+                            PanelTab::MixtureMap(m) => m.clear_channels(),
                             _ => {}
                         }
                     }
@@ -126,6 +136,51 @@ impl App {
         self.worksheets[self.active_worksheet]
             .dock_state
             .push_to_focused_leaf(PanelTab::TrackMap(track_map));
+    }
+
+    fn add_histogram_panel(&mut self) {
+        let id = self.shared.next_panel_id;
+        self.shared.next_panel_id += 1;
+        let histogram = HistogramPanel::new(id, format!("Histogram {}", id));
+        self.worksheets[self.active_worksheet]
+            .dock_state
+            .push_to_focused_leaf(PanelTab::Histogram(histogram));
+    }
+
+    fn add_scatter_panel(&mut self) {
+        let id = self.shared.next_panel_id;
+        self.shared.next_panel_id += 1;
+        let scatter = ScatterPanel::new(id, format!("Scatter {}", id));
+        self.worksheets[self.active_worksheet]
+            .dock_state
+            .push_to_focused_leaf(PanelTab::Scatter(scatter));
+    }
+
+    fn add_fft_panel(&mut self) {
+        let id = self.shared.next_panel_id;
+        self.shared.next_panel_id += 1;
+        let fft = FftPanel::new(id, format!("FFT {}", id));
+        self.worksheets[self.active_worksheet]
+            .dock_state
+            .push_to_focused_leaf(PanelTab::Fft(fft));
+    }
+
+    fn add_gauge_panel(&mut self) {
+        let id = self.shared.next_panel_id;
+        self.shared.next_panel_id += 1;
+        let gauge = GaugePanel::new(id, format!("Gauges {}", id));
+        self.worksheets[self.active_worksheet]
+            .dock_state
+            .push_to_focused_leaf(PanelTab::Gauge(gauge));
+    }
+
+    fn add_mixture_map_panel(&mut self) {
+        let id = self.shared.next_panel_id;
+        self.shared.next_panel_id += 1;
+        let mixture_map = MixtureMapPanel::new(id, format!("Mixture Map {}", id));
+        self.worksheets[self.active_worksheet]
+            .dock_state
+            .push_to_focused_leaf(PanelTab::MixtureMap(mixture_map));
     }
 
     fn add_worksheet(&mut self) {
@@ -315,6 +370,26 @@ impl App {
                 }
                 if ui.button("Add Track Map").clicked() {
                     self.add_track_map_panel();
+                    ui.close();
+                }
+                if ui.button("Add Histogram").clicked() {
+                    self.add_histogram_panel();
+                    ui.close();
+                }
+                if ui.button("Add Scatter Plot").clicked() {
+                    self.add_scatter_panel();
+                    ui.close();
+                }
+                if ui.button("Add FFT").clicked() {
+                    self.add_fft_panel();
+                    ui.close();
+                }
+                if ui.button("Add Gauges").clicked() {
+                    self.add_gauge_panel();
+                    ui.close();
+                }
+                if ui.button("Add Mixture Map").clicked() {
+                    self.add_mixture_map_panel();
                     ui.close();
                 }
                 ui.separator();

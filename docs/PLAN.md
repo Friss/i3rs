@@ -173,13 +173,13 @@ crates/
 
 **Goal**: Advanced analysis components.
 
-- [ ] Histogram panel (distribution of values, per-lap breakdown)
-- [ ] Scatter/XY plot (channel vs channel, e.g., throttle vs RPM)
-- [ ] FFT panel (frequency analysis for vibration diagnosis)
-- [ ] Mixture map (2D heatmap: mixture vs RPM vs load)
-- [ ] Gauges panel (analog/digital/bar gauges showing value at cursor time)
-- [ ] Steering wheel angle widget/gauge
-- [ ] All components synchronized with cursor/zoom
+- [x] Histogram panel (distribution of values, per-lap breakdown)
+- [x] Scatter/XY plot (channel vs channel, e.g., throttle vs RPM)
+- [x] FFT panel (frequency analysis for vibration diagnosis)
+- [x] Mixture map (2D heatmap: mixture vs RPM vs load)
+- [x] Gauges panel (analog/digital/bar gauges showing value at cursor time)
+- [x] Steering wheel angle widget/gauge
+- [x] All components synchronized with cursor/zoom
 
 ### Milestone 7: Overlays
 

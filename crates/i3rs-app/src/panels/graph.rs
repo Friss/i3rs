@@ -1,7 +1,6 @@
 //! Graph panel: time-series plotting with overlay and tiled modes.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
@@ -11,27 +10,7 @@ use crate::state::{
     CHANNEL_COLORS, ChannelId, GraphMode, PlottedChannel, PlottedChannelInfo, SharedState, YAxis,
 };
 
-/// Resolve channel metadata (name, unit, freq, dec_places) from a ChannelId.
-fn resolve_channel_meta(id: ChannelId, shared: &SharedState) -> (String, String, u16, i16) {
-    match id {
-        ChannelId::Physical(idx) => {
-            if let Some(ld) = &shared.ld_file
-                && let Some(ch) = ld.channels.get(idx)
-            {
-                (ch.name.clone(), ch.unit.clone(), ch.freq, ch.dec_places)
-            } else {
-                ("???".into(), String::new(), 0, 0)
-            }
-        }
-        ChannelId::Math(idx) => {
-            if let Some(mc) = shared.math_channels.get(idx) {
-                (mc.name.clone(), mc.unit.clone(), mc.freq, mc.dec_places)
-            } else {
-                ("???".into(), String::new(), 0, 0)
-            }
-        }
-    }
-}
+use super::utils::resolve_channel_meta;
 
 /// Build a freq map for a set of plotted channels (used to pass into closures).
 fn build_freq_map(channels: &[&PlottedChannel], shared: &SharedState) -> HashMap<ChannelId, u16> {
@@ -78,45 +57,11 @@ impl GraphPanel {
         if self.is_channel_plotted(channel_id) {
             return;
         }
-        let (data, _name) = match channel_id {
-            ChannelId::Physical(idx) => {
-                let ld = match &shared.ld_file {
-                    Some(ld) => ld,
-                    None => return,
-                };
-                let ch = &ld.channels[idx];
-                match ld.read_channel_data(ch) {
-                    Some(d) => (d, ch.name.clone()),
-                    None => return,
-                }
-            }
-            ChannelId::Math(idx) => {
-                let mc = match shared.math_channels.get(idx) {
-                    Some(mc) => mc,
-                    None => return,
-                };
-                match &mc.data {
-                    Some(d) => ((**d).clone(), mc.name.clone()),
-                    None => return,
-                }
-            }
-        };
-        let (cached_min, cached_max, cached_avg) = Self::compute_stats(&data);
         let color_idx = self.plotted_channels.len() % self.colors.len();
-        self.plotted_channels.push(PlottedChannel {
-            channel_id,
-            color: self.colors[color_idx],
-            data: Arc::new(data),
-            y_axis: YAxis::Left,
-            cached_min,
-            cached_max,
-            cached_avg,
-        });
-    }
-
-    pub fn compute_stats(data: &[f64]) -> (f64, f64, f64) {
-        let (min, max, avg, _stddev) = crate::state::compute_channel_stats(data);
-        (min, max, avg)
+        if let Some(mut pc) = super::utils::create_plotted_channel(channel_id, shared, color_idx) {
+            pc.color = self.colors[color_idx];
+            self.plotted_channels.push(pc);
+        }
     }
 
     pub fn remove_channel(&mut self, channel_id: ChannelId) {
@@ -152,8 +97,8 @@ impl GraphPanel {
         // Handle drop from channel browser
         if shared.dragging_channel.is_some()
             && ui.input(|i| i.pointer.any_released())
-            && let Some(ch_id) = shared.dragging_channel.take()
             && ui.ui_contains_pointer()
+            && let Some(ch_id) = shared.dragging_channel.take()
         {
             let was_empty = self.plotted_channels.is_empty();
             self.add_channel(ch_id, shared);
