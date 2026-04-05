@@ -18,6 +18,16 @@ pub struct FftResult {
 /// Returns frequency/magnitude pairs for the positive-frequency half of the spectrum.
 /// Applies a Hann window to reduce spectral leakage.
 pub fn compute_fft(data: &[f64], sample_rate: f64) -> FftResult {
+    compute_fft_with_planner(data, sample_rate, &mut FftPlanner::new())
+}
+
+/// Like [`compute_fft`], but accepts a reusable [`FftPlanner`] to avoid
+/// re-planning when called repeatedly with the same data length.
+pub fn compute_fft_with_planner(
+    data: &[f64],
+    sample_rate: f64,
+    planner: &mut FftPlanner<f64>,
+) -> FftResult {
     let n = data.len();
     if n == 0 {
         return FftResult {
@@ -26,17 +36,17 @@ pub fn compute_fft(data: &[f64], sample_rate: f64) -> FftResult {
         };
     }
 
-    // Apply Hann window
+    // Apply Hann window, replacing non-finite values with 0.0 to preserve temporal alignment
     let mut buffer: Vec<Complex<f64>> = data
         .iter()
         .enumerate()
         .map(|(i, &v)| {
+            let val = if v.is_finite() { v } else { 0.0 };
             let window = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos());
-            Complex::new(v * window, 0.0)
+            Complex::new(val * window, 0.0)
         })
         .collect();
 
-    let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(n);
     fft.process(&mut buffer);
 

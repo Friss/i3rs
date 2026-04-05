@@ -4,11 +4,22 @@ use std::sync::Arc;
 
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
-use i3rs_core::compute_fft;
+use i3rs_core::{FftPlanner, compute_fft_with_planner};
 
 use crate::state::{ChannelId, PlottedChannel, PlottedChannelInfo, SharedState};
 
-use super::utils::{create_plotted_channel, get_visible_slice, resolve_channel_meta};
+use super::utils::{create_plotted_channel, resolve_channel_meta};
+
+/// Return the sub-slice of data visible in the current zoom range (no copy).
+fn visible_subslice<'a>(data: &'a [f64], freq: u16, shared: &SharedState) -> &'a [f64] {
+    if let Some((t0, t1)) = shared.zoom_range {
+        let start = (t0 * freq as f64).floor() as usize;
+        let end = (t1 * freq as f64).ceil() as usize;
+        &data[start.min(data.len())..end.min(data.len())]
+    } else {
+        data
+    }
+}
 
 /// Cached FFT result.
 struct FftCache {
@@ -26,6 +37,8 @@ pub struct FftPanel {
     pub log_scale: bool,
     /// Cached FFT results per channel.
     caches: Vec<Option<FftCache>>,
+    /// Reusable FFT planner (caches algorithm selection per data length).
+    planner: FftPlanner<f64>,
 }
 
 impl FftPanel {
@@ -36,6 +49,7 @@ impl FftPanel {
             channels: Vec::new(),
             log_scale: false,
             caches: Vec::new(),
+            planner: FftPlanner::new(),
         }
     }
 
@@ -150,8 +164,8 @@ impl FftPanel {
             let needs_recompute = cache.as_ref().is_none_or(|c| c.fingerprint != fingerprint);
 
             if needs_recompute {
-                let data_slice = get_visible_slice(&pc.data, freq, shared);
-                let result = compute_fft(&data_slice, freq as f64);
+                let data_slice = visible_subslice(&pc.data, freq, shared);
+                let result = compute_fft_with_planner(data_slice, freq as f64, &mut self.planner);
                 *cache = Some(FftCache {
                     fingerprint,
                     frequencies: result.frequencies,
