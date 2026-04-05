@@ -8,4 +8,5 @@ description = "MoTeC i2 .ld log file parser and data access library"
 half = { workspace = true }
 memmap2 = { workspace = true }
 quick-xml = { workspace = true }
+rustfft = { workspace = true }
 serde = { workspace = true }

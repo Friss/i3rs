@@ -5,7 +5,6 @@ use i3rs_core::math_engine::ChannelData;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::panels::graph::GraphPanel;
 use crate::state::{MathChannelDef, SharedState};
 
 /// A predefined math channel template.
@@ -450,7 +449,7 @@ fn eval_mc(
 ) {
     match i3rs_core::evaluate_expression_with_aliases(&mc.expression, channel_data, aliases) {
         Ok((samples, freq)) => {
-            let (min, max, avg) = GraphPanel::compute_stats(&samples);
+            let (min, max, avg, _) = crate::state::compute_channel_stats(&samples);
             mc.freq = freq;
             mc.data = Some(Arc::new(samples));
             mc.error = None;

@@ -47,6 +47,11 @@ Three crates in `crates/`:
 - `panels/math_editor.rs` — Math channel definition UI: add/edit/delete/evaluate expressions, predefined calculation templates, channel alias management
 - `panels/report.rs` — Statistics report panel: min/max/avg/stddev per channel per lap
 - `panels/track_map.rs` — GPS track map panel: rainbow coloring by channel value, sector editor, sector time report, cursor sync, reference lap selection
+- `panels/histogram.rs` — Distribution histogram with configurable bins, per-lap breakdown, cursor value lines
+- `panels/scatter.rs` — XY scatter plot (channel vs channel), cursor highlight point
+- `panels/fft.rs` — FFT frequency spectrum analysis with Hann window, log scale option, cached computation
+- `panels/gauge.rs` — Gauges panel: analog arc, bar, digital, and steering wheel angle widgets at cursor time
+- `panels/mixture_map.rs` — 2D heatmap (e.g., AFR vs RPM vs TPS), binned with heat color scale
 
 ## Architecture Notes
 
@@ -75,4 +80,4 @@ Full format docs: `docs/ld-file-format.md`
 
 ## Current Status
 
-Milestones 1–5 complete. Next up: Milestone 6 (histograms, scatter, FFT, gauges).
+Milestones 1–6 complete. Next up: Milestone 7 (overlays — compare laps across sessions).

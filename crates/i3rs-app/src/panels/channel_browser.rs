@@ -56,7 +56,10 @@ pub fn show_standalone(ui: &mut egui::Ui, shared: &mut SharedState) {
                             ch.freq
                         );
 
-                        let response = ui.selectable_label(false, &label);
+                        let response = ui.add(
+                            egui::Button::selectable(false, &label)
+                                .sense(egui::Sense::click_and_drag()),
+                        );
 
                         if response.dragged() {
                             drag_start = Some(ChannelId::Physical(ch.index));
@@ -91,7 +94,10 @@ pub fn show_standalone(ui: &mut egui::Ui, shared: &mut SharedState) {
                             mc.freq
                         );
 
-                        let response = ui.selectable_label(false, &label);
+                        let response = ui.add(
+                            egui::Button::selectable(false, &label)
+                                .sense(egui::Sense::click_and_drag()),
+                        );
 
                         if response.dragged() {
                             drag_start = Some(ChannelId::Math(i));
