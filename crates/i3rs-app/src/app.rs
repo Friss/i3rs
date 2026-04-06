@@ -104,6 +104,31 @@ impl App {
 
                 // Re-evaluate math channels with new file data
                 math_editor::evaluate_all_math_channels(&mut self.shared);
+
+                // Auto-populate default worksheets if current layout is empty
+                let is_empty_default = self.worksheets.len() == 1
+                    && self.worksheets[0]
+                        .dock_state
+                        .iter_all_tabs()
+                        .all(|(_, tab)| match tab {
+                            PanelTab::Graph(g) => g.plotted_channels.is_empty(),
+                            _ => true,
+                        });
+
+                if is_empty_default {
+                    let ld_ref = self.shared.ld_file.clone().unwrap();
+                    let defaults = crate::default_layouts::create_default_worksheets(
+                        &ld_ref,
+                        &mut self.shared,
+                    );
+                    if !defaults.is_empty() {
+                        self.worksheets = defaults
+                            .into_iter()
+                            .map(|(name, dock_state)| Worksheet { name, dock_state })
+                            .collect();
+                        self.active_worksheet = 0;
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Failed to open file: {}", e);

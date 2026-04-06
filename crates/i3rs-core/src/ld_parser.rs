@@ -6,9 +6,10 @@
 
 use half::f16;
 use memmap2::Mmap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -176,6 +177,9 @@ pub struct ChannelMeta {
     pub scale: i16,
     pub dec_places: i16,
     data_ptr: u32,
+    /// Enum/state value labels parsed from the file (value → label).
+    /// Empty for non-enum channels. Wrapped in Arc for cheap cloning.
+    pub enum_labels: Arc<HashMap<i64, String>>,
 }
 
 impl ChannelMeta {
@@ -228,9 +232,11 @@ impl LdFile {
 
         let session = parse_session(&mmap);
         let chan_meta_ptr = read_u32(&mmap, 0x08);
+        let chan_data_ptr = read_u32(&mmap, 0x0C);
         let event_ptr = read_u32(&mmap, 0x24);
         let event = parse_event(&mmap, event_ptr);
-        let channels = parse_channel_metadata(&mmap, chan_meta_ptr);
+        let enum_tables = parse_enum_tables(&mmap, chan_data_ptr as usize);
+        let channels = parse_channel_metadata(&mmap, chan_meta_ptr, &enum_tables);
 
         Ok(LdFile {
             mmap,
@@ -306,6 +312,20 @@ impl LdFile {
 
         let raw = self.read_raw_samples(offset, actual, channel.data_type);
         Some(self.apply_scaling(&raw, channel))
+    }
+
+    /// Look up a text label for a state/enum channel value.
+    /// Returns `None` if the channel has no enum labels or the value isn't mapped.
+    pub fn format_channel_value<'a>(
+        &self,
+        channel: &'a ChannelMeta,
+        value: f64,
+    ) -> Option<&'a str> {
+        if channel.enum_labels.is_empty() {
+            return None;
+        }
+        let v = value.round() as i64;
+        channel.enum_labels.get(&v).map(|s| s.as_str())
     }
 
     fn read_raw_samples(&self, offset: usize, count: usize, dtype: DataType) -> Vec<f64> {
@@ -396,7 +416,14 @@ fn parse_event(data: &[u8], event_ptr: u32) -> Event {
     e
 }
 
-fn parse_channel_metadata(data: &[u8], mut meta_ptr: u32) -> Vec<ChannelMeta> {
+/// Extended channel record size (120 base + 92 extended metadata).
+const CHAN_RECORD_SIZE: usize = 212;
+
+fn parse_channel_metadata(
+    data: &[u8],
+    mut meta_ptr: u32,
+    enum_tables: &HashMap<u16, Arc<HashMap<i64, String>>>,
+) -> Vec<ChannelMeta> {
     let mut channels = Vec::new();
     let mut visited = HashSet::new();
 
@@ -462,6 +489,20 @@ fn parse_channel_metadata(data: &[u8], mut meta_ptr: u32) -> Vec<ChannelMeta> {
 
         let data_type = DataType::from_codes(dtype_a, dtype_code);
 
+        // Extract enum reference from extended metadata:
+        //   +208: u16 enum_type (0x0002 = uses enum table)
+        //   +210: u16 enum_id   (indexes into parsed enum tables)
+        let enum_labels =
+            if off + CHAN_RECORD_SIZE <= data.len() && read_u16(data, off + 208) == 0x0002 {
+                let enum_id = read_u16(data, off + 210);
+                enum_tables
+                    .get(&enum_id)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(HashMap::new()))
+            } else {
+                Arc::new(HashMap::new())
+            };
+
         channels.push(ChannelMeta {
             index: channels.len(),
             name,
@@ -475,10 +516,151 @@ fn parse_channel_metadata(data: &[u8], mut meta_ptr: u32) -> Vec<ChannelMeta> {
             scale,
             dec_places,
             data_ptr,
+            enum_labels,
         });
 
         meta_ptr = next_addr;
     }
 
     channels
+}
+
+// ---------------------------------------------------------------------------
+// Enum table parsing — extracts value→label mappings from the ECU config section
+// ---------------------------------------------------------------------------
+
+fn enum_scan_bounds(chan_data_ptr: usize, file_len: usize) -> (usize, usize) {
+    let file_end = file_len.saturating_sub(12);
+    let search_end = if chan_data_ptr == 0 {
+        file_end
+    } else {
+        chan_data_ptr.min(file_end)
+    };
+    let search_start = HEAD_SIZE.min(search_end);
+    (search_start, search_end)
+}
+
+/// Parse all enum tables embedded in the file.
+/// Returns a map from enum_id → (value → label).
+fn parse_enum_tables(data: &[u8], chan_data_ptr: usize) -> HashMap<u16, Arc<HashMap<i64, String>>> {
+    let mut tables: HashMap<u16, Arc<HashMap<i64, String>>> = HashMap::new();
+
+    // Enum tables are in the ECU config section, after the raw sample data region.
+    // Each table starts with: [u16 count] [u16 type=2] [u16 enum_id]
+    // Followed by entries with marker bytes 03.
+    // We search for the pattern: [xx xx] [02 00] [xx xx] [03 00 00 00]
+    let (search_start, search_end) = enum_scan_bounds(chan_data_ptr, data.len());
+
+    let mut pos = search_start;
+    while pos < search_end {
+        // Check for enum header: type field = 0x0002
+        let type_val = read_u16(data, pos + 2);
+        if type_val != 2 {
+            pos += 1;
+            continue;
+        }
+
+        // Check that it's followed by a 03-marker
+        if pos + 10 >= data.len() || data[pos + 6] != 0x03 || data[pos + 7] != 0x00 {
+            pos += 1;
+            continue;
+        }
+
+        let count = read_u16(data, pos) as usize;
+        let enum_id = read_u16(data, pos + 4);
+
+        if count == 0 || count > 500 {
+            pos += 1;
+            continue;
+        }
+
+        // Scan forward to collect entries with 03-marker
+        if let Some((entries, next_pos)) = scan_enum_entries(data, pos + 6, count) {
+            tables.entry(enum_id).or_insert_with(|| Arc::new(entries));
+            pos = next_pos;
+            continue;
+        }
+
+        pos += 1;
+    }
+
+    tables
+}
+
+/// Scan forward from `start` collecting up to `expected` enum entries.
+/// Each entry is preceded by a 6-byte marker starting with 0x03.
+fn scan_enum_entries(
+    data: &[u8],
+    start: usize,
+    expected: usize,
+) -> Option<(HashMap<i64, String>, usize)> {
+    let mut entries = HashMap::new();
+    let end = (start + 20000).min(data.len());
+    let mut pos = start;
+
+    while entries.len() < expected && pos + 10 < end {
+        if data[pos] == 0x06 && data[pos + 1] == 0x00 {
+            pos += 2;
+            continue;
+        }
+
+        if data[pos] == 0x03 && data[pos + 1] == 0x00 {
+            // Entry: [03 00 xx xx xx xx] [u16 size] [u16 value] [null-terminated string]
+            let entry_size = read_u16(data, pos + 6) as usize;
+            let entry_value = read_u16(data, pos + 8) as i64;
+            // Handle special MoTeC sentinel values
+            let entry_value = if entry_value == 0xFFFF {
+                -1 // Map 65535 to -1 for display
+            } else if entry_value == 0xFFFE {
+                -2
+            } else {
+                entry_value
+            };
+            let str_len = entry_size.wrapping_sub(2);
+            let next_pos = pos + 8 + entry_size;
+            if str_len > 0 && str_len < 200 && next_pos <= data.len() {
+                let raw = &data[pos + 10..pos + 10 + str_len];
+                let label = decode_string(raw);
+                if !label.is_empty() {
+                    entries.insert(entry_value, label);
+                    pos = next_pos;
+                    continue;
+                }
+            }
+        }
+        pos += 1;
+    }
+
+    (entries.len() == expected).then_some((entries, pos))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enum_scan_bounds_stay_out_of_header_and_sample_data() {
+        assert_eq!(enum_scan_bounds(4_000, 5_000), (HEAD_SIZE, 4_000));
+        assert_eq!(enum_scan_bounds(0, 5_000), (HEAD_SIZE, 4_988));
+    }
+
+    #[test]
+    fn scan_enum_entries_reports_end_of_table() {
+        let mut data = Vec::new();
+
+        data.extend_from_slice(&[0x03, 0x00, 0, 0, 0, 0]);
+        data.extend_from_slice(&(6u16).to_le_bytes());
+        data.extend_from_slice(&(1u16).to_le_bytes());
+        data.extend_from_slice(b"Off\0");
+
+        data.extend_from_slice(&[0x03, 0x00, 0, 0, 0, 0]);
+        data.extend_from_slice(&(5u16).to_le_bytes());
+        data.extend_from_slice(&(2u16).to_le_bytes());
+        data.extend_from_slice(b"On\0");
+
+        let (entries, next_pos) = scan_enum_entries(&data, 0, 2).expect("expected valid table");
+        assert_eq!(entries.get(&1).map(String::as_str), Some("Off"));
+        assert_eq!(entries.get(&2).map(String::as_str), Some("On"));
+        assert_eq!(next_pos, data.len());
+    }
 }

@@ -3,9 +3,11 @@
 
 use eframe::egui;
 
-use crate::state::{ChannelId, PlottedChannel, PlottedChannelInfo, SharedState};
+use crate::state::{ChannelId, PlottedChannel, SharedState};
 
-use super::utils::{create_plotted_channel, interp_at_time, resolve_channel_meta};
+use super::utils::{
+    build_plotted_channel_info, create_plotted_channel, interp_at_time, resolve_channel_meta,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GaugeStyle {
@@ -96,16 +98,14 @@ impl GaugePanel {
 
         // Register channels for readout
         for gc in &self.gauges {
-            let (name, unit, freq, dec_places) =
-                resolve_channel_meta(gc.channel.channel_id, shared);
-            shared.plotted_channel_registry.push(PlottedChannelInfo {
-                name,
-                unit,
-                freq,
-                dec_places,
-                color: gc.channel.color,
-                data: gc.channel.data.clone(),
-            });
+            shared
+                .plotted_channel_registry
+                .push(build_plotted_channel_info(
+                    gc.channel.channel_id,
+                    gc.channel.color,
+                    gc.channel.data.clone(),
+                    shared,
+                ));
         }
 
         egui::ScrollArea::both()

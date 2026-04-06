@@ -1,7 +1,7 @@
 //! Shared application state accessible by all panels.
 
 use eframe::egui;
-use i3rs_core::{Lap, LdFile, LdxFile, Sector};
+use i3rs_core::{Lap, LdFile, LdxFile, Sector, format_state_value, is_state_channel};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +44,26 @@ pub struct PlottedChannelInfo {
     pub dec_places: i16,
     pub color: egui::Color32,
     pub data: Arc<Vec<f64>>,
+    /// Enum/state labels parsed from the .ld file (value → label).
+    pub enum_labels: Arc<HashMap<i64, String>>,
+}
+
+impl PlottedChannelInfo {
+    /// Returns true when the channel should be treated as discrete state data.
+    pub fn uses_discrete_values(&self) -> bool {
+        !self.enum_labels.is_empty() || is_state_channel(&self.name)
+    }
+
+    /// Format a value using file-parsed enum labels, falling back to hardcoded labels.
+    pub fn format_value(&self, value: f64) -> Option<String> {
+        if !self.enum_labels.is_empty() {
+            let v = value.round() as i64;
+            if let Some(label) = self.enum_labels.get(&v) {
+                return Some(label.clone());
+            }
+        }
+        format_state_value(&self.name, value)
+    }
 }
 
 /// A user-defined math channel.

@@ -5,10 +5,11 @@ use std::sync::Arc;
 use eframe::egui;
 use egui_plot::{Bar, BarChart, Legend, Plot};
 
-use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, PlottedChannelInfo, SharedState};
+use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
-    create_plotted_channel, get_visible_slice, interp_at_time, resolve_channel_meta,
+    build_plotted_channel_info, create_plotted_channel, get_visible_slice, interp_at_time,
+    resolve_channel_meta,
 };
 
 /// Cached histogram bin counts for a single channel.
@@ -93,15 +94,14 @@ impl HistogramPanel {
 
         // Register channels for readout
         for pc in &self.channels {
-            let (name, unit, freq, dec_places) = resolve_channel_meta(pc.channel_id, shared);
-            shared.plotted_channel_registry.push(PlottedChannelInfo {
-                name,
-                unit,
-                freq,
-                dec_places,
-                color: pc.color,
-                data: pc.data.clone(),
-            });
+            shared
+                .plotted_channel_registry
+                .push(build_plotted_channel_info(
+                    pc.channel_id,
+                    pc.color,
+                    pc.data.clone(),
+                    shared,
+                ));
         }
 
         // Toolbar

@@ -317,3 +317,48 @@ fn find_nearest_on_real_track() {
         idx
     );
 }
+
+// ---------------------------------------------------------------------------
+// Enum label parsing from .ld file
+// ---------------------------------------------------------------------------
+
+#[test]
+fn enum_labels_parsed_for_state_channels() {
+    let ld = LdFile::open(TEST_LD).expect("failed to open .ld file");
+
+    // Engine Speed Limit State should have file-parsed enum labels
+    let esls = ld
+        .channels
+        .iter()
+        .find(|c| c.name == "Engine Speed Limit State")
+        .expect("Engine Speed Limit State channel not found");
+    assert!(
+        !esls.enum_labels.is_empty(),
+        "Engine Speed Limit State should have enum labels from file"
+    );
+    // Value 0 should map to "Maximum" (or similar label)
+    assert!(
+        esls.enum_labels.contains_key(&0),
+        "enum_labels should contain key 0"
+    );
+
+    // Gear should also have enum labels
+    let gear = ld
+        .channels
+        .iter()
+        .find(|c| c.name == "Gear")
+        .expect("Gear channel not found");
+    eprintln!("Gear enum_labels: {:?}", gear.enum_labels);
+
+    // If Gear has no file-parsed labels, that's fine - the hardcoded fallback covers it.
+    // Some channels may not have enum tables in this particular file.
+    if !gear.enum_labels.is_empty() {
+        let label = ld.format_channel_value(gear, 3.0);
+        assert!(label.is_some(), "Gear value 3 should have a label");
+    }
+
+    // Verify format_channel_value works for Engine Speed Limit State
+    let label = ld.format_channel_value(esls, 0.0);
+    assert!(label.is_some(), "ESLS value 0 should have a label");
+    eprintln!("ESLS value 0 = {:?}", label);
+}

@@ -1,6 +1,7 @@
 //! MoTeC telemetry data analysis application.
 
 mod app;
+mod default_layouts;
 mod panels;
 mod state;
 mod workspace;
