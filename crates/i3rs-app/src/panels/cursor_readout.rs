@@ -32,7 +32,12 @@ pub fn show(ui: &mut egui::Ui, shared: &SharedState) {
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
                     for info in &shared.display_channel_registry {
-                        let value = interpolate_at_time(&info.data, info.freq, cursor_time);
+                        let value = value_at_time(
+                            &info.data,
+                            info.freq,
+                            cursor_time,
+                            info.uses_discrete_values(),
+                        );
 
                         // Color swatch
                         let (rect, _) =
@@ -42,18 +47,31 @@ pub fn show(ui: &mut egui::Ui, shared: &SharedState) {
                         // Channel name
                         ui.label(&info.name);
 
-                        // Value + unit
-                        let dec = info.dec_places.max(0) as usize;
-                        if info.unit.is_empty() {
-                            ui.monospace(format!("{:.prec$}", value, prec = dec));
+                        // Value + unit (use text labels for state channels)
+                        if let Some(label) = info.format_value(value) {
+                            ui.monospace(label);
                         } else {
-                            ui.monospace(format!("{:.prec$} {}", value, info.unit, prec = dec));
+                            let dec = info.dec_places.max(0) as usize;
+                            if info.unit.is_empty() {
+                                ui.monospace(format!("{:.prec$}", value, prec = dec));
+                            } else {
+                                ui.monospace(format!("{:.prec$} {}", value, info.unit, prec = dec));
+                            }
                         }
 
                         ui.end_row();
                     }
                 });
         });
+}
+
+/// Read a channel value at a given time, using sample-hold semantics for discrete channels.
+pub fn value_at_time(data: &[f64], freq: u16, time: f64, discrete: bool) -> f64 {
+    if discrete {
+        sample_hold_at_time(data, freq, time)
+    } else {
+        interpolate_at_time(data, freq, time)
+    }
 }
 
 /// Linearly interpolate a channel value at a given time.
@@ -76,4 +94,36 @@ pub fn interpolate_at_time(data: &[f64], freq: u16, time: f64) -> f64 {
 
     let frac = sample_f - idx as f64;
     data[idx] * (1.0 - frac) + data[next_idx] * frac
+}
+
+/// Read the most recent sample at or before the given time.
+pub fn sample_hold_at_time(data: &[f64], freq: u16, time: f64) -> f64 {
+    if data.is_empty() || freq == 0 {
+        return 0.0;
+    }
+
+    let idx = (time * freq as f64).floor() as usize;
+    if idx >= data.len() {
+        return *data.last().unwrap_or(&0.0);
+    }
+
+    data[idx]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interpolation_blends_between_samples() {
+        let data = [0.0, 10.0];
+        assert_eq!(interpolate_at_time(&data, 1, 0.5), 5.0);
+    }
+
+    #[test]
+    fn sample_hold_uses_current_sample_for_discrete_channels() {
+        let data = [0.0, 10.0];
+        assert_eq!(sample_hold_at_time(&data, 1, 0.5), 0.0);
+        assert_eq!(value_at_time(&data, 1, 0.5, true), 0.0);
+    }
 }

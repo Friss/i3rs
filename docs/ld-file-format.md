@@ -102,7 +102,8 @@ Located at `vehicle_ptr`:
 ## Channel Metadata (Linked List)
 
 Channel metadata entries form a **doubly-linked list**. The first entry is at the absolute
-offset `chan_meta_ptr` from the file header. Each entry is **120 bytes**.
+offset `chan_meta_ptr` from the file header. Each entry is **212 bytes** (120 base + 92
+extended metadata).
 
 | Offset | Size | Type     | Field       | Description |
 |--------|------|----------|-------------|-------------|
@@ -121,7 +122,30 @@ offset `chan_meta_ptr` from the file header. Each entry is **120 bytes**.
 | 0x20   | 32   | char[32] | name        | Channel name (e.g. `"Engine.Speed"`), null-padded |
 | 0x40   | 8    | char[8]  | short_name  | Short name — often holds the unit on M1 ECUs (see below) |
 | 0x48   | 12   | char[12] | unit        | Unit string (e.g. `"rpm"`, `"kPa"`), null-padded |
-| 0x54   | 40   | —        | (padding)   | Zeroed padding |
+| 0x54   | 40   | —        | (padding)   | Zeroed padding to 120 bytes |
+| 0x78   | 92   | —        | extended    | Extended metadata (see below) |
+
+Total channel record size: **212 bytes** (120 base + 92 extended).
+
+### Extended Channel Metadata
+
+Beyond the base 120-byte record, each channel entry has 92 bytes of extended metadata.
+Most of this region is unknown/zeroed, but it contains a reference to the channel's
+enum table (if any).
+
+| Offset | Size | Type   | Field      | Description |
+|--------|------|--------|------------|-------------|
+| 0xD0   | 2    | uint16 | enum_type  | `0x0002` if channel uses an enum table, `0x0000` otherwise |
+| 0xD2   | 2    | uint16 | enum_id    | ID of the enum table (indexes into the enum tables section) |
+
+(Offsets are relative to the start of the channel metadata entry, i.e. `meta_ptr + 0xD0`.)
+
+When `enum_type == 0x0002`, the channel's sample values are integer codes that map to
+human-readable labels via the enum table identified by `enum_id`. See the
+**Enum/State Tables** section below.
+
+**Status:** The exact layout of the remaining ~88 bytes of extended metadata is not
+fully decoded. Only the enum reference at offset 0xD0–0xD3 has been verified.
 
 ### Terminator Entry
 
@@ -235,6 +259,102 @@ time axes have different lengths. All channels start at t=0.
 | 20 Hz  | Engine speed, throttle position/pedal, lambda, wheel speeds, GPS |
 | 50 Hz  | Torque channels, traction control, cruise state |
 | 100 Hz | Per-cylinder knock levels, camshaft actuator voltages |
+
+---
+
+## Enum/State Tables
+
+The ECU configuration section of the file embeds **enum tables** that map integer
+sample values to human-readable text labels. These are used for state/enum channels
+such as Gear, Brake State, Engine Speed Limit State, Torque Limit State, etc.
+
+Enum tables are located in the latter portion of the file, after the channel sample
+data. In observed M1 ECU logs, they appear roughly in the last quarter of the file.
+There is no pointer from the header to this section — the tables must be found by
+scanning for their header signature.
+
+### Enum Table Header
+
+Each table begins with a 6-byte header:
+
+| Offset | Size | Type   | Field    | Description |
+|--------|------|--------|----------|-------------|
+| 0x00   | 2    | uint16 | count    | Number of entries in this table |
+| 0x02   | 2    | uint16 | type     | Always `0x0002` — used as a signature for scanning |
+| 0x04   | 2    | uint16 | enum_id  | Table ID (matches the `enum_id` in channel extended metadata) |
+
+The header is immediately followed by the table entries.
+
+### Enum Table Entries
+
+Each entry is preceded by a 6-byte marker and contains a value–label pair:
+
+```
+[03 00 xx xx xx xx] [u16 entry_size] [u16 value] [null-terminated label string]
+```
+
+| Offset | Size | Type   | Field      | Description |
+|--------|------|--------|------------|-------------|
+| 0x00   | 2    | bytes  | marker     | Always `03 00` |
+| 0x02   | 4    | bytes  | (unknown)  | Varies per entry, purpose unknown |
+| 0x06   | 2    | uint16 | entry_size | Size in bytes of `value` + `label` (i.e. 2 + string length including null) |
+| 0x08   | 2    | uint16 | value      | The integer sample value this label maps to |
+| 0x0A   | var  | char[] | label      | Null-terminated ASCII label string |
+
+Entries are packed contiguously. Some tables contain `06 00` separator bytes between
+sub-groups of entries — these can be skipped during scanning.
+
+Special value codes:
+- `0xFFFF` — sentinel, typically mapped to value `-1` for display
+- `0xFFFE` — sentinel, typically mapped to value `-2` for display
+
+### Scanning Algorithm
+
+Since there is no direct pointer to the enum tables section:
+
+1. Read `chan_data_ptr` from the file header to identify the start of the raw sample-data region
+2. Scan only the non-sample prefix of the file: from `HEAD_SIZE` up to `chan_data_ptr`
+3. Search for the signature pattern: `[u16 count] [02 00] [u16 id]` followed by `[03 00]`
+4. Validate by checking `count` is in range 1–500
+5. Attempt to parse `count` entries starting after the header
+6. Accept the table only if exactly `count` entries were successfully parsed
+7. After a successful parse, advance to the end of that table instead of rescanning its entry bytes
+
+### Linking Channels to Enum Tables
+
+Each channel's extended metadata at offset `+0xD0` contains:
+- uint16 at `+0xD0`: enum type — `0x0002` means this channel references an enum table
+- uint16 at `+0xD2`: enum ID — matches the `enum_id` field in the table header
+
+When displaying values for a channel with `enum_type == 0x0002`, look up the channel's
+sample value in the enum table identified by `enum_id` to get the text label.
+
+### Observed Enum Tables
+
+From a Lotus Evora M1 ECU log (VIR_LAP.ld), **275 enum tables** were found. Examples:
+
+| enum_id | Channel                    | count | Example entries |
+|---------|----------------------------|-------|-----------------|
+| 217     | Gear                       | 10    | 0=Neutral, 1=First, 2=Second, …, 7=Seventh, 65534=Default, 65535=Reverse |
+| 149     | Brake State                | 4     | 0=Unknown, 1=Off, 2=On, 65535=Sensor Fault |
+| 137     | Engine State               | 4     | 0=Startup, 1=Stop, 2=Run, 3=Crank |
+| 205     | Engine Speed Limit State   | 35    | 0=Maximum, 1=Engine Load Average, 2=Throttle Servo Fault, 3=Coolant Temperature, 4=Traction Control, … |
+| 194     | Torque Limit State         | 12    | 0=Maximum, 1=Coolant Temperature, 2=Engine Oil Temperature, 3=Lotus ESP, … |
+| 175     | Clutch State               | 4     | 0=Clutch Fully Engaged, 1=Clutch Slipping, 2=Clutch Fully Disengaged, 3=Invalid Signal |
+| 138     | Traction State / Launch State | 2  | 0=Disabled, 1=Enabled |
+
+The Engine Speed Limit State table (id 205) is notably large (35 entries), covering
+limiter states like Maximum, Engine Load Average, Traction Control, Launch, Vehicle
+Speed Limit, Anti Lag, Gear Shift, and various warning-based limiters (Coolant,
+Oil Temperature/Pressure, Fuel Pressure, Exhaust Lambda/Temperature, etc.).
+
+Multiple channels can reference the same enum table (e.g., Traction State and
+Launch State both use table 138).
+
+**Status:** The enum table parsing and channel-to-table linking via extended metadata
+offset `+0xD0`/`+0xD2` has been verified against all state channels in the test data.
+The exact meaning of the 4 unknown bytes in each entry marker (`03 00 xx xx xx xx`)
+and the `06 00` sub-group separators is not fully understood.
 
 ---
 

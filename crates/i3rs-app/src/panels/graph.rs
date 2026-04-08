@@ -4,20 +4,43 @@ use std::collections::HashMap;
 
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
-use i3rs_core::{Lap, downsample_minmax};
+use i3rs_core::{Lap, downsample_minmax, format_state_value, is_state_channel};
 
-use crate::state::{
-    CHANNEL_COLORS, ChannelId, GraphMode, PlottedChannel, PlottedChannelInfo, SharedState, YAxis,
+use crate::state::{CHANNEL_COLORS, ChannelId, GraphMode, PlottedChannel, SharedState, YAxis};
+
+use super::utils::{
+    ChannelDisplayMeta, build_plotted_channel_info, create_plotted_channel,
+    resolve_channel_display_meta, resolve_channel_meta,
 };
 
-use super::utils::resolve_channel_meta;
+/// Format a value using file-parsed enum labels, falling back to hardcoded labels.
+fn format_enum_value(name: &str, enum_labels: &HashMap<i64, String>, value: f64) -> Option<String> {
+    if !enum_labels.is_empty() {
+        let v = value.round() as i64;
+        if let Some(label) = enum_labels.get(&v) {
+            return Some(label.clone());
+        }
+    }
+    format_state_value(name, value)
+}
+
+fn uses_discrete_values(name: &str, enum_labels: &HashMap<i64, String>) -> bool {
+    !enum_labels.is_empty() || is_state_channel(name)
+}
 
 /// Build a freq map for a set of plotted channels (used to pass into closures).
 fn build_freq_map(channels: &[&PlottedChannel], shared: &SharedState) -> HashMap<ChannelId, u16> {
     channels
         .iter()
         .map(|pc| {
-            let (_, _, freq, _) = resolve_channel_meta(pc.channel_id, shared);
+            let freq = match pc.channel_id {
+                ChannelId::Physical(idx) => shared
+                    .ld_file
+                    .as_ref()
+                    .and_then(|ld| ld.channels.get(idx))
+                    .map_or(0, |ch| ch.freq),
+                ChannelId::Math(idx) => shared.math_channels.get(idx).map_or(0, |mc| mc.freq),
+            };
             (pc.channel_id, freq)
         })
         .collect()
@@ -58,7 +81,7 @@ impl GraphPanel {
             return;
         }
         let color_idx = self.plotted_channels.len() % self.colors.len();
-        if let Some(mut pc) = super::utils::create_plotted_channel(channel_id, shared, color_idx) {
+        if let Some(mut pc) = create_plotted_channel(channel_id, shared, color_idx) {
             pc.color = self.colors[color_idx];
             self.plotted_channels.push(pc);
         }
@@ -115,15 +138,14 @@ impl GraphPanel {
         }
 
         for pc in &self.plotted_channels {
-            let (name, unit, freq, dec_places) = resolve_channel_meta(pc.channel_id, shared);
-            shared.plotted_channel_registry.push(PlottedChannelInfo {
-                name,
-                unit,
-                freq,
-                dec_places,
-                color: pc.color,
-                data: pc.data.clone(),
-            });
+            shared
+                .plotted_channel_registry
+                .push(build_plotted_channel_info(
+                    pc.channel_id,
+                    pc.color,
+                    pc.data.clone(),
+                    shared,
+                ));
         }
 
         let needs_zoom_reset = self.needs_zoom_reset;
@@ -248,10 +270,10 @@ impl GraphPanel {
         let n = self.plotted_channels.len();
 
         // Pre-compute metadata for each channel to avoid borrowing shared inside closures
-        let channel_meta: Vec<(String, String, u16, i16)> = self
+        let channel_meta: Vec<ChannelDisplayMeta> = self
             .plotted_channels
             .iter()
-            .map(|pc| resolve_channel_meta(pc.channel_id, shared))
+            .map(|pc| resolve_channel_display_meta(pc.channel_id, shared))
             .collect();
 
         let all_plotted: Vec<&PlottedChannel> = self.plotted_channels.iter().collect();
@@ -271,7 +293,7 @@ impl GraphPanel {
                 let mut responses = Vec::new();
 
                 for (i, pc) in self.plotted_channels.iter().enumerate() {
-                    let (ref name, ref unit, _freq, _dec) = channel_meta[i];
+                    let (ref name, ref unit, _freq, _dec, _) = channel_meta[i];
                     let plot_id = format!("tile_{}_{}", self.id, i);
                     let y_label = if unit.is_empty() {
                         name.clone()
@@ -480,7 +502,7 @@ impl GraphPanel {
         let line_height = 15.0;
         let pad = 4.0;
         for (i, pc) in channels.iter().enumerate() {
-            let meta = resolve_channel_meta(pc.channel_id, shared);
+            let meta = resolve_channel_display_meta(pc.channel_id, shared);
             let y = plot_rect.top() + pad + i as f32 * line_height;
             Self::draw_legend_entry(ui, plot_rect, pc, &meta, cursor_time, y);
         }
@@ -490,7 +512,7 @@ impl GraphPanel {
         ui: &egui::Ui,
         plot_rect: egui::Rect,
         pc: &PlottedChannel,
-        meta: &(String, String, u16, i16),
+        meta: &ChannelDisplayMeta,
         cursor_time: Option<f64>,
     ) {
         let pad = 4.0;
@@ -502,14 +524,18 @@ impl GraphPanel {
         ui: &egui::Ui,
         plot_rect: egui::Rect,
         pc: &PlottedChannel,
-        meta: &(String, String, u16, i16),
+        meta: &ChannelDisplayMeta,
         cursor_time: Option<f64>,
         y: f32,
     ) {
-        let (ref name, ref unit, freq, dec_places) = *meta;
+        let (ref name, ref unit, freq, dec_places, ref enum_labels) = *meta;
         let painter = ui.painter();
-        let font = egui::FontId::proportional(11.0);
+        let font = egui::FontId::proportional(12.0);
         let pad = 4.0;
+
+        let min_color = egui::Color32::from_rgb(80, 140, 255);
+        let max_color = egui::Color32::from_rgb(255, 80, 80);
+        let avg_color = egui::Color32::from_rgb(255, 180, 50);
 
         let swatch = egui::Rect::from_min_size(
             egui::pos2(plot_rect.left() + pad, y + 2.0),
@@ -518,42 +544,93 @@ impl GraphPanel {
         painter.rect_filled(swatch, 1.0, pc.color);
 
         let name_x = swatch.right() + 4.0;
-        let mut left_text = name.clone();
+        let label = if unit.is_empty() {
+            name.clone()
+        } else {
+            format!("{} [{}]", name, unit)
+        };
 
-        if let Some(t) = cursor_time {
-            let val = crate::panels::cursor_readout::interpolate_at_time(&pc.data, freq, t);
-            let dec = dec_places.max(0) as usize;
-            if unit.is_empty() {
-                left_text = format!("{}: {:.prec$}", name, val, prec = dec);
-            } else {
-                left_text = format!("{}: {:.prec$} {}", name, val, unit, prec = dec);
-            }
-        }
-
-        painter.text(
+        let label_rect = painter.text(
             egui::pos2(name_x, y),
             egui::Align2::LEFT_TOP,
-            &left_text,
+            &label,
             font.clone(),
             pc.color,
         );
 
-        if !pc.data.is_empty() {
-            let dec = dec_places.max(0) as usize;
-            let stats = format!(
-                "min {:.prec$}  avg {:.prec$}  max {:.prec$}",
-                pc.cached_min,
-                pc.cached_avg,
-                pc.cached_max,
-                prec = dec,
+        let dec = dec_places.max(0) as usize;
+        let fmt = |v: f64| -> String {
+            format_enum_value(name, enum_labels, v)
+                .unwrap_or_else(|| format!("{:.prec$}", v, prec = dec))
+        };
+
+        if let Some(t) = cursor_time {
+            let val = crate::panels::cursor_readout::value_at_time(
+                &pc.data,
+                freq,
+                t,
+                uses_discrete_values(name, enum_labels),
             );
             painter.text(
-                egui::pos2(plot_rect.right() - pad, y),
-                egui::Align2::RIGHT_TOP,
-                &stats,
+                egui::pos2(label_rect.right() + 16.0, y),
+                egui::Align2::LEFT_TOP,
+                fmt(val),
                 font.clone(),
-                egui::Color32::from_gray(180),
+                pc.color,
             );
+        }
+
+        // Right side: colored min/max/avg stats (i2 style)
+        if !pc.data.is_empty() {
+            let icon_size = 7.0;
+            let spacing = 6.0;
+            let mut x = plot_rect.right() - pad;
+            let icon_y = y + 3.0;
+
+            // Helper: draw a stat value with a colored square icon, positioned right-to-left
+            let draw_stat = |x: &mut f32, value: f64, color: egui::Color32| {
+                let text = fmt(value);
+                let rect = painter.text(
+                    egui::pos2(*x, y),
+                    egui::Align2::RIGHT_TOP,
+                    &text,
+                    font.clone(),
+                    color,
+                );
+                *x = rect.left() - spacing;
+                let icon = egui::Rect::from_min_size(
+                    egui::pos2(*x - icon_size, icon_y),
+                    egui::vec2(icon_size, icon_size),
+                );
+                painter.rect_filled(icon, 1.0, color);
+                *x = icon.left() - spacing * 2.0;
+            };
+
+            draw_stat(&mut x, pc.cached_avg, avg_color);
+
+            // Max uses a triangle icon instead of a square
+            let max_text = fmt(pc.cached_max);
+            let max_rect = painter.text(
+                egui::pos2(x, y),
+                egui::Align2::RIGHT_TOP,
+                &max_text,
+                font.clone(),
+                max_color,
+            );
+            x = max_rect.left() - spacing;
+            let tri_cx = x - icon_size / 2.0;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(tri_cx, icon_y),
+                    egui::pos2(tri_cx - icon_size / 2.0, icon_y + icon_size),
+                    egui::pos2(tri_cx + icon_size / 2.0, icon_y + icon_size),
+                ],
+                max_color,
+                egui::Stroke::NONE,
+            ));
+            x = tri_cx - icon_size / 2.0 - spacing * 2.0;
+
+            draw_stat(&mut x, pc.cached_min, min_color);
         }
     }
 
@@ -627,14 +704,14 @@ impl GraphPanel {
         &mut self,
         response: &egui::Response,
         ch_id: ChannelId,
-        all_meta: &[(String, String, u16, i16)],
+        all_meta: &[ChannelDisplayMeta],
     ) {
         let name = self
             .plotted_channels
             .iter()
             .position(|pc| pc.channel_id == ch_id)
             .and_then(|i| all_meta.get(i))
-            .map(|(n, _, _, _)| n.clone())
+            .map(|(n, _, _, _, _)| n.clone())
             .unwrap_or_default();
 
         response.context_menu(|ui| {

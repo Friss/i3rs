@@ -6,9 +6,9 @@ use eframe::egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use i3rs_core::{FftPlanner, compute_fft_with_planner};
 
-use crate::state::{ChannelId, PlottedChannel, PlottedChannelInfo, SharedState};
+use crate::state::{ChannelId, PlottedChannel, SharedState};
 
-use super::utils::{create_plotted_channel, resolve_channel_meta};
+use super::utils::{build_plotted_channel_info, create_plotted_channel, resolve_channel_meta};
 
 /// Return the sub-slice of data visible in the current zoom range (no copy).
 fn visible_subslice<'a>(data: &'a [f64], freq: u16, shared: &SharedState) -> &'a [f64] {
@@ -107,15 +107,14 @@ impl FftPanel {
 
         // Register channels for readout
         for pc in &self.channels {
-            let (name, unit, freq, dec_places) = resolve_channel_meta(pc.channel_id, shared);
-            shared.plotted_channel_registry.push(PlottedChannelInfo {
-                name,
-                unit,
-                freq,
-                dec_places,
-                color: pc.color,
-                data: pc.data.clone(),
-            });
+            shared
+                .plotted_channel_registry
+                .push(build_plotted_channel_info(
+                    pc.channel_id,
+                    pc.color,
+                    pc.data.clone(),
+                    shared,
+                ));
         }
 
         // Toolbar

@@ -11,6 +11,7 @@ mod ld_parser;
 mod ldx_parser;
 pub mod math_engine;
 pub mod math_expr;
+mod state_labels;
 pub mod track;
 
 pub use downsample::{DownsampledPoint, downsample_minmax};
@@ -25,6 +26,7 @@ pub use math_engine::{
 };
 pub use math_expr::{Expr, ParseError, parse_expression, referenced_channels};
 pub use rustfft::FftPlanner;
+pub use state_labels::{format_state_value, is_state_channel};
 pub use track::{
     Sector, SectorTime, TrackData, compute_color_map, compute_sector_times, extract_gps_track,
     find_nearest_sample,

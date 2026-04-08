@@ -26,8 +26,9 @@ Three crates in `crates/`:
 ## Key Source Files
 
 ### i3rs-core (`crates/i3rs-core/src/`)
-- `lib.rs` — Public API re-exports: `LdFile`, `Session`, `ChannelMeta`, `Event`, `DataType`, `LdxFile`, `LdxLap`, `Lap`, `detect_laps`, `downsample_minmax`, `DownsampledPoint`
-- `ld_parser.rs` — Binary .ld format parser using memmap2. Key types: `LdFile` (entry point), `Session` (metadata), `ChannelMeta` (channel info + lazy data access). Methods: `read_channel_data()`, `read_channel_range()`
+- `lib.rs` — Public API re-exports: `LdFile`, `Session`, `ChannelMeta`, `Event`, `DataType`, `LdxFile`, `LdxLap`, `Lap`, `detect_laps`, `downsample_minmax`, `DownsampledPoint`, `format_state_value`, `is_state_channel`
+- `ld_parser.rs` — Binary .ld format parser using memmap2. Key types: `LdFile` (entry point), `Session` (metadata), `ChannelMeta` (channel info + lazy data access + `enum_labels`). Methods: `read_channel_data()`, `read_channel_range()`, `format_channel_value()`. Internal: `parse_enum_tables()` scans for embedded enum/state label definitions
+- `state_labels.rs` — Hardcoded fallback text labels for known MoTeC M1 ECU state channels (Gear, Brake State, etc.). Used when file-parsed enum tables are unavailable
 - `ldx_parser.rs` — XML sidecar parser for lap timing. `find_ldx_for_ld()` locates the .ldx next to a .ld file
 - `lap_detect.rs` — Detects lap boundaries from "Lap Number" channel data
 - `downsample.rs` — Min-max decimation for efficient chart rendering
@@ -42,7 +43,8 @@ Three crates in `crates/`:
 - `workspace.rs` — Save/load workspace layouts + math channels as JSON
 - `panels/graph.rs` — Main graph panel: multi-channel time-series, overlay/tiled modes, dual Y-axes, zoom/pan. Uses `ChannelId` for both physical and math channels
 - `panels/channel_browser.rs` — Searchable channel list with drag-and-drop, includes math channels section
-- `panels/cursor_readout.rs` — Shows all plotted channel values at cursor time
+- `panels/cursor_readout.rs` — Shows all plotted channel values at cursor time (uses file-parsed enum labels with hardcoded fallback)
+- `default_layouts.rs` — Default i2-style worksheet templates (Driver, Braking, Engine, Fuel/Ign, Spare) auto-populated on file open
 - `panels/timeline.rs` — Overview bar with draggable zoom window
 - `panels/math_editor.rs` — Math channel definition UI: add/edit/delete/evaluate expressions, predefined calculation templates, channel alias management
 - `panels/report.rs` — Statistics report panel: min/max/avg/stddev per channel per lap
@@ -65,9 +67,11 @@ Three crates in `crates/`:
 
 The .ld format is little-endian throughout. Key constants in `ld_parser.rs`:
 - Header size: `0x6E2` (1762 bytes)
-- Channel metadata entry size: 120 bytes
+- Channel metadata entry size: 212 bytes (120 base + 92 extended)
 - Magic byte: `0x40`
 - Channel metadata is a linked list (each entry has `next_chan_meta_ptr`)
+- Extended metadata contains enum table reference at offset +0xD0 (type u16) and +0xD2 (id u16)
+- Enum/state tables are embedded in the ECU config section (latter portion of file), parsed by scanning
 - Data types: u8/u16/u32/i8/i16/i32/f16/f32 (see `DataType` enum)
 
 Full format docs: `docs/ld-file-format.md`
