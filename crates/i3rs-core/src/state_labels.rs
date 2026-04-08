@@ -42,6 +42,7 @@ pub fn is_state_channel(channel_name: &str) -> bool {
 fn match_channel(name: &str, v: i64) -> Option<String> {
     if name.eq_ignore_ascii_case("gear") || name.eq_ignore_ascii_case("gear estimate") {
         return Some(match v {
+            -1 => "Reverse".into(),
             0 => "Neutral".into(),
             1 => "First".into(),
             2 => "Second".into(),
@@ -171,6 +172,7 @@ mod tests {
         assert_eq!(format_state_value("Gear", 3.0), Some("Third".into()));
         assert_eq!(format_state_value("Gear", 0.0), Some("Neutral".into()));
         assert_eq!(format_state_value("Gear", 5.0), Some("Fifth".into()));
+        assert_eq!(format_state_value("Gear", -1.0), Some("Reverse".into()));
     }
 
     #[test]

@@ -25,6 +25,18 @@ struct Worksheet {
     dock_state: DockState<PanelTab>,
 }
 
+fn is_startup_default_layout(worksheets: &[Worksheet]) -> bool {
+    if worksheets.len() != 1 {
+        return false;
+    }
+
+    let mut tabs = worksheets[0].dock_state.iter_all_tabs();
+    matches!(
+        (tabs.next(), tabs.next()),
+        (Some((_, PanelTab::Graph(graph))), None) if graph.plotted_channels.is_empty()
+    )
+}
+
 pub struct App {
     shared: SharedState,
     worksheets: Vec<Worksheet>,
@@ -106,14 +118,7 @@ impl App {
                 math_editor::evaluate_all_math_channels(&mut self.shared);
 
                 // Auto-populate default worksheets if current layout is empty
-                let is_empty_default = self.worksheets.len() == 1
-                    && self.worksheets[0]
-                        .dock_state
-                        .iter_all_tabs()
-                        .all(|(_, tab)| match tab {
-                            PanelTab::Graph(g) => g.plotted_channels.is_empty(),
-                            _ => true,
-                        });
+                let is_empty_default = is_startup_default_layout(&self.worksheets);
 
                 if is_empty_default {
                     let ld_ref = self.shared.ld_file.clone().unwrap();
@@ -724,5 +729,51 @@ impl eframe::App for App {
 
         // Clear per-frame flags
         self.shared.zoom_from_timeline = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::panels::histogram::HistogramPanel;
+    use crate::state::{ChannelId, PlottedChannel, YAxis};
+
+    fn worksheet_with_tabs(tabs: Vec<PanelTab>) -> Worksheet {
+        Worksheet {
+            name: "Test".into(),
+            dock_state: DockState::new(tabs),
+        }
+    }
+
+    #[test]
+    fn startup_default_layout_is_detected() {
+        let worksheet = worksheet_with_tabs(vec![PanelTab::Graph(GraphPanel::new(1, "Graph"))]);
+        assert!(is_startup_default_layout(&[worksheet]));
+    }
+
+    #[test]
+    fn custom_single_sheet_layout_is_not_treated_as_default() {
+        let worksheet = worksheet_with_tabs(vec![
+            PanelTab::Graph(GraphPanel::new(1, "Graph")),
+            PanelTab::Histogram(HistogramPanel::new(2, "Histogram")),
+        ]);
+        assert!(!is_startup_default_layout(&[worksheet]));
+    }
+
+    #[test]
+    fn graph_with_channels_is_not_treated_as_default() {
+        let mut graph = GraphPanel::new(1, "Graph");
+        graph.plotted_channels.push(PlottedChannel {
+            channel_id: ChannelId::Physical(0),
+            color: egui::Color32::WHITE,
+            data: Arc::new(vec![1.0]),
+            y_axis: YAxis::Left,
+            cached_min: 1.0,
+            cached_max: 1.0,
+            cached_avg: 1.0,
+        });
+
+        let worksheet = worksheet_with_tabs(vec![PanelTab::Graph(graph)]);
+        assert!(!is_startup_default_layout(&[worksheet]));
     }
 }
