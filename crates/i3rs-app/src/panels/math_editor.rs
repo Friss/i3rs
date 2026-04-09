@@ -180,6 +180,7 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
                 );
                 evaluate_math_channel(&mut mc, shared);
                 shared.math_channels.push(mc);
+                shared.invalidate_derived_caches();
                 editor.new_name.clear();
                 editor.new_expression.clear();
                 editor.new_unit.clear();
@@ -292,10 +293,12 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
 
     if let Some(idx) = to_reevaluate {
         evaluate_single_math_channel(shared, idx);
+        shared.invalidate_derived_caches();
     }
 
     if let Some(idx) = to_remove {
         shared.math_channels.remove(idx);
+        shared.invalidate_derived_caches();
     }
 
     // Channel aliases section
@@ -473,6 +476,7 @@ pub fn evaluate_all_math_channels(shared: &mut SharedState) {
         let channel_data = build_channel_data_map(shared, &expr, i);
         eval_mc(&mut shared.math_channels[i], &channel_data, &aliases);
     }
+    shared.invalidate_derived_caches();
 }
 
 /// Compute a topological evaluation order for math channels based on their dependencies.
@@ -589,6 +593,7 @@ pub fn load_math_channels(shared: &mut SharedState) {
                             shared.math_channels.push(mc);
                         }
                         evaluate_all_math_channels(shared);
+                        shared.invalidate_derived_caches();
                     }
                     Err(e) => eprintln!("Failed to parse math channels: {}", e),
                 }

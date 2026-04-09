@@ -116,12 +116,7 @@ impl ScatterPanel {
         for pc in self.x_channel.iter().chain(self.y_channel.iter()) {
             shared
                 .plotted_channel_registry
-                .push(build_plotted_channel_info(
-                    pc.channel_id,
-                    pc.color,
-                    pc.data.clone(),
-                    shared,
-                ));
+                .push(build_plotted_channel_info(pc, shared));
         }
 
         let (Some(x_ch), Some(y_ch)) = (&self.x_channel, &self.y_channel) else {

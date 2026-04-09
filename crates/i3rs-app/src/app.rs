@@ -94,12 +94,13 @@ impl App {
                 self.shared.ld_path = Some(path);
                 self.shared.selected_lap = None;
                 self.shared.zoom_range = None;
+                self.shared.invalidate_derived_caches();
 
                 // Clear all panels' channels and caches across all worksheets
                 for ws in &mut self.worksheets {
                     for (_path, tab) in ws.dock_state.iter_all_tabs_mut() {
                         match tab {
-                            PanelTab::Graph(g) => g.plotted_channels.clear(),
+                            PanelTab::Graph(g) => g.reset_for_new_main_session(),
                             PanelTab::TrackMap(t) => t.clear_cache(),
                             PanelTab::Histogram(h) => h.clear_channels(),
                             PanelTab::Scatter(s) => s.clear_channels(),
@@ -300,6 +301,7 @@ impl App {
                                 ));
                         }
                         math_editor::evaluate_all_math_channels(&mut self.shared);
+                        self.shared.invalidate_derived_caches();
 
                         self.shared.sectors = workspace.sectors.clone();
                         self.shared.reference_lap = workspace.reference_lap;
@@ -432,9 +434,11 @@ impl App {
                 // Graph mode
                 let dock = &mut self.worksheets[self.active_worksheet].dock_state;
                 let mut current_mode = None;
+                let mut current_x_axis = None;
                 for (_path, tab) in dock.iter_all_tabs() {
                     if let PanelTab::Graph(g) = tab {
                         current_mode = Some(g.graph_mode);
+                        current_x_axis = Some(g.x_axis_mode);
                         break;
                     }
                 }
@@ -449,6 +453,33 @@ impl App {
                         for (_path, tab) in dock.iter_all_tabs_mut() {
                             if let PanelTab::Graph(g) = tab {
                                 g.graph_mode = mode;
+                            }
+                        }
+                        ui.close();
+                    }
+                }
+
+                if let Some(mut x_axis_mode) = current_x_axis {
+                    ui.separator();
+                    ui.label("Graph X-axis");
+                    let changed_time = ui
+                        .radio_value(
+                            &mut x_axis_mode,
+                            crate::state::GraphXAxis::Time,
+                            "Time",
+                        )
+                        .clicked();
+                    let changed_distance = ui
+                        .radio_value(
+                            &mut x_axis_mode,
+                            crate::state::GraphXAxis::Distance,
+                            "Distance",
+                        )
+                        .clicked();
+                    if changed_time || changed_distance {
+                        for (_path, tab) in dock.iter_all_tabs_mut() {
+                            if let PanelTab::Graph(g) = tab {
+                                g.x_axis_mode = x_axis_mode;
                             }
                         }
                         ui.close();
@@ -583,13 +614,6 @@ impl eframe::App for App {
             });
         }
 
-        // Worksheet tabs (only show if more than one)
-        if self.worksheets.len() > 1 {
-            egui::Panel::top("worksheet_tabs").show_inside(ui, |ui| {
-                self.show_worksheet_tabs(ui);
-            });
-        }
-
         // Channel browser — collapsible left panel
         if self.show_channel_browser {
             egui::Panel::left("channel_browser")
@@ -644,7 +668,9 @@ impl eframe::App for App {
         // Cursor readout — collapsible right panel
         if self.show_cursor_readout {
             egui::Panel::right("cursor_readout")
-                .default_size(200.0)
+                .default_size(220.0)
+                .min_size(72.0)
+                .max_size(320.0)
                 .resizable(true)
                 .show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -673,13 +699,31 @@ impl eframe::App for App {
                 });
         }
 
+        if self.worksheets.len() > 1 {
+            ui.vertical(|ui| {
+                self.show_worksheet_tabs(ui);
+                ui.separator();
+            });
+        }
+
+        let show_inner_tab_bar = self.worksheets[self.active_worksheet]
+            .dock_state
+            .iter_all_tabs()
+            .nth(1)
+            .is_some();
+
         // Dock area fills the rest (graph + report panels)
         let dock = &mut self.worksheets[self.active_worksheet].dock_state;
         let mut viewer = AppTabViewer {
             shared: &mut self.shared,
         };
+        let mut dock_style = egui_dock::Style::from_egui(ui.style().as_ref());
+        if !show_inner_tab_bar {
+            dock_style.tab_bar.height = 0.0;
+        }
         DockArea::new(dock)
-            .show_close_buttons(true)
+            .style(dock_style)
+            .show_close_buttons(show_inner_tab_bar)
             .show_leaf_collapse_buttons(false)
             .draggable_tabs(true)
             .show_inside(ui, &mut viewer);
@@ -767,7 +811,11 @@ mod tests {
             channel_id: ChannelId::Physical(0),
             color: egui::Color32::WHITE,
             data: Arc::new(vec![1.0]),
+            tile_group: 0,
             y_axis: YAxis::Left,
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
             cached_min: 1.0,
             cached_max: 1.0,
             cached_avg: 1.0,

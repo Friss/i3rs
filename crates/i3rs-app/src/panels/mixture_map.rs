@@ -138,12 +138,7 @@ impl MixtureMapPanel {
         {
             shared
                 .plotted_channel_registry
-                .push(build_plotted_channel_info(
-                    pc.channel_id,
-                    pc.color,
-                    pc.data.clone(),
-                    shared,
-                ));
+                .push(build_plotted_channel_info(pc, shared));
         }
 
         let (Some(x_ch), Some(y_ch), Some(v_ch)) =

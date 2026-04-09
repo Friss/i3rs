@@ -16,7 +16,10 @@ pub fn show(ui: &mut egui::Ui, shared: &SharedState) {
         }
     };
 
-    ui.heading(format!("Time: {:.3}s", cursor_time));
+    ui.add(
+        egui::Label::new(egui::RichText::new(format!("Time: {:.3}s", cursor_time)).heading())
+            .truncate(),
+    );
     ui.separator();
 
     if shared.display_channel_registry.is_empty() {
@@ -25,43 +28,65 @@ pub fn show(ui: &mut egui::Ui, shared: &SharedState) {
     }
 
     egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
+        .auto_shrink([true, false])
         .show(ui, |ui| {
-            egui::Grid::new("readout_grid")
-                .num_columns(3)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    for info in &shared.display_channel_registry {
-                        let value = value_at_time(
-                            &info.data,
-                            info.freq,
-                            cursor_time,
-                            info.uses_discrete_values(),
-                        );
+            for info in &shared.display_channel_registry {
+                let discrete = info.uses_discrete_values();
+                let value = value_at_time(&info.data, info.freq, cursor_time, discrete);
+                let display_value = if discrete {
+                    value
+                } else {
+                    info.transform_value(value)
+                };
 
-                        // Color swatch
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, info.color);
-
-                        // Channel name
-                        ui.label(&info.name);
-
-                        // Value + unit (use text labels for state channels)
-                        if let Some(label) = info.format_value(value) {
-                            ui.monospace(label);
-                        } else {
-                            let dec = info.dec_places.max(0) as usize;
-                            if info.unit.is_empty() {
-                                ui.monospace(format!("{:.prec$}", value, prec = dec));
-                            } else {
-                                ui.monospace(format!("{:.prec$} {}", value, info.unit, prec = dec));
-                            }
-                        }
-
-                        ui.end_row();
+                let value_text = if let Some(label) = info.format_value(display_value) {
+                    label
+                } else {
+                    let dec = info.dec_places.max(0) as usize;
+                    if info.unit.is_empty() {
+                        format!("{:.prec$}", display_value, prec = dec)
+                    } else {
+                        format!("{:.prec$} {}", display_value, info.unit, prec = dec)
                     }
+                };
+
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, info.color);
+
+                    let gap_width = ui.spacing().item_spacing.x;
+                    let content_width = (ui.available_width() - gap_width * 2.0).max(0.0);
+                    let value_width = (content_width * 0.34).clamp(24.0, 110.0).min(content_width);
+                    let name_width = (content_width - value_width).max(0.0);
+                    let row_height = ui.spacing().interact_size.y;
+
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(name_width, row_height),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_width(name_width);
+                            ui.add(
+                                egui::Label::new(&info.name)
+                                    .truncate()
+                                    .halign(egui::Align::LEFT),
+                            );
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(value_width, row_height),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.set_width(value_width);
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(value_text).monospace())
+                                    .truncate()
+                                    .halign(egui::Align::RIGHT),
+                            );
+                        },
+                    );
                 });
+            }
         });
 }
 

@@ -7,6 +7,7 @@ use crate::state::{ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
     build_plotted_channel_info, create_plotted_channel, interp_at_time, resolve_channel_meta,
+    resolve_plotted_channel_display_meta,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,15 @@ pub enum GaugeStyle {
     Digital,
     /// Steering wheel angle widget.
     SteeringWheel,
+}
+
+pub(crate) fn default_style_for_name(name: &str) -> GaugeStyle {
+    let name_lower = name.to_lowercase();
+    if name_lower.contains("steer") || name_lower.contains("steering") {
+        GaugeStyle::SteeringWheel
+    } else {
+        GaugeStyle::Analog
+    }
 }
 
 pub struct GaugeChannel {
@@ -71,12 +81,7 @@ impl GaugePanel {
         {
             // Auto-detect steering wheel by channel name
             let (name, _, _, _) = resolve_channel_meta(ch_id, shared);
-            let name_lower = name.to_lowercase();
-            let style = if name_lower.contains("steer") || name_lower.contains("steering") {
-                GaugeStyle::SteeringWheel
-            } else {
-                GaugeStyle::Analog
-            };
+            let style = default_style_for_name(&name);
             self.add_channel(ch_id, shared, style);
         }
 
@@ -100,12 +105,7 @@ impl GaugePanel {
         for gc in &self.gauges {
             shared
                 .plotted_channel_registry
-                .push(build_plotted_channel_info(
-                    gc.channel.channel_id,
-                    gc.channel.color,
-                    gc.channel.data.clone(),
-                    shared,
-                ));
+                .push(build_plotted_channel_info(&gc.channel, shared));
         }
 
         egui::ScrollArea::both()
@@ -123,13 +123,26 @@ impl GaugePanel {
                         let mut context_action = None;
 
                         for (i, gc) in self.gauges.iter().enumerate() {
-                            let (name, unit, freq, dec_places) =
-                                resolve_channel_meta(gc.channel.channel_id, shared);
-                            let value = shared
+                            let (name, unit, freq, dec_places, enum_labels) =
+                                resolve_plotted_channel_display_meta(&gc.channel, shared);
+                            let raw_value = shared
                                 .cursor_time
                                 .and_then(|t| interp_at_time(&gc.channel.data, freq, t));
-                            let min = gc.channel.cached_min;
-                            let max = gc.channel.cached_max;
+                            let discrete = !enum_labels.is_empty();
+                            let value = raw_value.map(|v| {
+                                if discrete {
+                                    v
+                                } else {
+                                    v * gc.channel.display_scale + gc.channel.display_offset
+                                }
+                            });
+                            let mut min =
+                                gc.channel.cached_min * gc.channel.display_scale + gc.channel.display_offset;
+                            let mut max =
+                                gc.channel.cached_max * gc.channel.display_scale + gc.channel.display_offset;
+                            if gc.channel.display_scale < 0.0 {
+                                std::mem::swap(&mut min, &mut max);
+                            }
 
                             let (rect, response) = ui.allocate_exact_size(
                                 egui::vec2(gauge_size, gauge_size),
@@ -203,14 +216,28 @@ impl GaugePanel {
 }
 
 /// Display parameters for drawing a gauge.
-struct GaugeDrawContext<'a> {
-    name: &'a str,
-    unit: &'a str,
-    value: Option<f64>,
-    min: f64,
-    max: f64,
-    dec_places: i16,
-    color: egui::Color32,
+pub(crate) struct GaugeDrawContext<'a> {
+    pub name: &'a str,
+    pub unit: &'a str,
+    pub value: Option<f64>,
+    pub min: f64,
+    pub max: f64,
+    pub dec_places: i16,
+    pub color: egui::Color32,
+}
+
+pub(crate) fn draw_gauge(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    style: GaugeStyle,
+    ctx: &GaugeDrawContext,
+) {
+    match style {
+        GaugeStyle::Analog => draw_analog_gauge(painter, rect, ctx),
+        GaugeStyle::Bar => draw_bar_gauge(painter, rect, ctx),
+        GaugeStyle::Digital => draw_digital_gauge(painter, rect, ctx),
+        GaugeStyle::SteeringWheel => draw_steering_wheel(painter, rect, ctx),
+    }
 }
 
 fn draw_analog_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawContext) {
@@ -447,69 +474,118 @@ fn draw_digital_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDraw
 
 fn draw_steering_wheel(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawContext) {
     let GaugeDrawContext {
-        name, value, color, ..
+        name, value, ..
     } = *ctx;
-    let center = rect.center();
-    let radius = rect.width().min(rect.height()) * 0.35;
+    let title_font_size = if name.len() > 26 { 10.0 } else { 12.0 };
+    let title_y = rect.min.y + 8.0;
+    let value_y = rect.max.y - 10.0;
+    let center = egui::pos2(rect.center().x, rect.center().y + 8.0);
+    let max_radius_y = ((value_y - 18.0) - (title_y + 18.0)).max(40.0) * 0.5;
+    let radius = rect.width().min(max_radius_y * 2.0).min(rect.height()) * 0.33;
+    let wheel_angle = value.map(|v| -(v as f32).to_radians()).unwrap_or(0.0);
+    let line_color = egui::Color32::from_rgb(246, 246, 248);
+    let shadow_color = egui::Color32::from_rgba_premultiplied(0, 0, 0, 120);
+    let wheel_fill = egui::Color32::from_rgba_premultiplied(255, 255, 255, 10);
+    let value_color = egui::Color32::from_rgb(255, 206, 92);
+    let value_shadow = egui::Color32::from_rgba_premultiplied(0, 0, 0, 150);
+    let rim_stroke = 6.0;
+    let spoke_stroke = 5.0;
 
-    // Wheel rim (circle)
-    painter.circle_stroke(
-        center,
-        radius,
-        egui::Stroke::new(6.0, egui::Color32::from_gray(80)),
-    );
-
-    // Steering spokes (3-spoke pattern)
-    let angle_offset = value.map(|v| (v as f32).to_radians()).unwrap_or(0.0);
-    let spoke_angles = [0.0_f32, 2.094, 4.189]; // 0°, 120°, 240°
-    let inner_radius = radius * 0.35;
-
-    for &base_angle in &spoke_angles {
-        let angle = base_angle + angle_offset;
-        let start = center + egui::vec2(angle.cos(), angle.sin()) * inner_radius;
-        let end = center + egui::vec2(angle.cos(), angle.sin()) * radius;
-        painter.line_segment(
-            [start, end],
-            egui::Stroke::new(4.0, egui::Color32::from_gray(80)),
+    let rotate = |point: egui::Vec2| -> egui::Pos2 {
+        let rotated = egui::vec2(
+            point.x * wheel_angle.cos() - point.y * wheel_angle.sin(),
+            point.x * wheel_angle.sin() + point.y * wheel_angle.cos(),
         );
-    }
+        center + rotated
+    };
+    let map_path = |points: &[(f32, f32)], offset: egui::Vec2| -> Vec<egui::Pos2> {
+        points
+            .iter()
+            .map(|&(x, y)| rotate(egui::vec2(x * radius, y * radius) + offset))
+            .collect()
+    };
+    let draw_path = |points: &[(f32, f32)]| {
+        painter.add(egui::Shape::line(
+            map_path(points, egui::vec2(1.0, 1.0)),
+            egui::Stroke::new(spoke_stroke + 1.0, shadow_color),
+        ));
+        painter.add(egui::Shape::line(
+            map_path(points, egui::Vec2::ZERO),
+            egui::Stroke::new(spoke_stroke, line_color),
+        ));
+    };
 
-    // Center hub
-    painter.circle_filled(center, inner_radius, egui::Color32::from_gray(50));
+    painter.circle_filled(center, radius * 0.8, wheel_fill);
+    painter.circle_stroke(
+        center + egui::vec2(1.0, 1.0),
+        radius,
+        egui::Stroke::new(rim_stroke + 1.0, shadow_color),
+    );
+    painter.circle_stroke(center, radius, egui::Stroke::new(rim_stroke, line_color));
+    painter.circle_stroke(
+        center + egui::vec2(1.0, 1.0),
+        radius * 0.83,
+        egui::Stroke::new(rim_stroke + 1.0, shadow_color),
+    );
     painter.circle_stroke(
         center,
-        inner_radius,
-        egui::Stroke::new(2.0, egui::Color32::from_gray(80)),
+        radius * 0.83,
+        egui::Stroke::new(rim_stroke, line_color),
     );
 
-    // Top marker (fixed, shows straight ahead)
-    let marker_pos = center + egui::vec2(0.0, -radius - 10.0);
-    painter.text(
-        marker_pos,
-        egui::Align2::CENTER_BOTTOM,
-        "\u{25BC}", // down triangle
-        egui::FontId::proportional(12.0),
-        color,
-    );
+    let top_spoke = [
+        (-0.78, -0.20),
+        (-0.56, -0.18),
+        (-0.38, -0.17),
+        (-0.21, -0.18),
+        (-0.10, -0.25),
+        (0.0, -0.28),
+        (0.10, -0.25),
+        (0.21, -0.18),
+        (0.38, -0.17),
+        (0.56, -0.18),
+        (0.78, -0.20),
+    ];
+    let left_spoke = [
+        (-0.79, -0.02),
+        (-0.62, 0.03),
+        (-0.46, 0.08),
+        (-0.30, 0.14),
+        (-0.18, 0.22),
+        (-0.10, 0.34),
+        (-0.08, 0.52),
+        (-0.06, 0.79),
+    ];
+    let right_spoke = [
+        (0.79, -0.02),
+        (0.62, 0.03),
+        (0.46, 0.08),
+        (0.30, 0.14),
+        (0.18, 0.22),
+        (0.10, 0.34),
+        (0.08, 0.52),
+        (0.06, 0.79),
+    ];
 
-    // Rotation indicator: highlight the rim at the current angle
-    if let Some(val) = value {
-        let angle_rad = (val as f32).to_radians();
-        // Draw a bright arc segment at the top position after rotation
-        let indicator_pos = center
-            + egui::vec2(
-                (-angle_rad + std::f32::consts::FRAC_PI_2).cos(),
-                (-angle_rad + std::f32::consts::FRAC_PI_2).sin(),
-            ) * radius;
-        painter.circle_filled(indicator_pos, 5.0, color);
-    }
+    draw_path(&top_spoke);
+    draw_path(&left_spoke);
+    draw_path(&right_spoke);
+
+    let hub_radius = radius * 0.16;
+    painter.circle_filled(center, hub_radius * 0.92, egui::Color32::from_rgba_premultiplied(0, 0, 0, 120));
+    painter.circle_stroke(
+        center + egui::vec2(1.0, 1.0),
+        hub_radius,
+        egui::Stroke::new(rim_stroke + 1.0, shadow_color),
+    );
+    painter.circle_stroke(center, hub_radius, egui::Stroke::new(rim_stroke, line_color));
 
     // Name
     painter.text(
-        egui::pos2(rect.center().x, rect.min.y + 6.0),
+        egui::pos2(rect.center().x, title_y),
         egui::Align2::CENTER_TOP,
         name,
-        egui::FontId::proportional(12.0),
+        egui::FontId::proportional(title_font_size),
         egui::Color32::LIGHT_GRAY,
     );
 
@@ -518,10 +594,17 @@ fn draw_steering_wheel(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDra
         .map(|v| format!("{:.1}\u{00B0}", v))
         .unwrap_or_else(|| "---".into());
     painter.text(
-        egui::pos2(rect.center().x, rect.max.y - 10.0),
+        egui::pos2(rect.center().x + 1.0, value_y + 1.0),
+        egui::Align2::CENTER_BOTTOM,
+        &value_text,
+        egui::FontId::monospace(13.5),
+        value_shadow,
+    );
+    painter.text(
+        egui::pos2(rect.center().x, value_y),
         egui::Align2::CENTER_BOTTOM,
         value_text,
-        egui::FontId::monospace(14.0),
-        color,
+        egui::FontId::monospace(13.5),
+        value_color,
     );
 }
