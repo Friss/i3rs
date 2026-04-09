@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
-use i3rs_core::{Lap, LdFile, detect_laps, downsample_minmax, format_state_value, is_state_channel};
+use i3rs_core::{
+    Lap, LdFile, detect_laps, downsample_minmax, format_state_value, is_state_channel,
+};
 
 use crate::state::{
     CHANNEL_COLORS, ChannelId, DistanceAxisCache, GraphMode, GraphXAxis, PlottedChannel,
@@ -17,9 +19,8 @@ use super::gauge::{
     GaugeChannel, GaugeDrawContext, GaugeStyle, default_style_for_name, draw_gauge,
 };
 use super::utils::{
-    ChannelDisplayMeta, build_plotted_channel_info, create_plotted_channel,
-    interp_at_time, resolve_channel_meta,
-    resolve_plotted_channel_display_meta,
+    ChannelDisplayMeta, build_plotted_channel_info, create_plotted_channel, interp_at_time,
+    resolve_channel_meta, resolve_plotted_channel_display_meta,
 };
 
 /// Format a value using file-parsed enum labels, falling back to hardcoded labels.
@@ -384,7 +385,10 @@ impl GraphPanel {
     }
 
     fn retain_valid_overlay_state(&mut self, shared: &SharedState) {
-        if self.reference_lap.is_some_and(|idx| idx >= shared.laps.len()) {
+        if self
+            .reference_lap
+            .is_some_and(|idx| idx >= shared.laps.len())
+        {
             self.reference_lap = None;
         }
 
@@ -414,8 +418,11 @@ impl GraphPanel {
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut new_reference, None, "Full session");
                     for (idx, lap) in shared.laps.iter().enumerate() {
-                        let label =
-                            format!("{} ({})", lap.name, i3rs_core::format_duration(lap.duration()));
+                        let label = format!(
+                            "{} ({})",
+                            lap.name,
+                            i3rs_core::format_duration(lap.duration())
+                        );
                         ui.selectable_value(&mut new_reference, Some(idx), label);
                     }
                 });
@@ -428,10 +435,10 @@ impl GraphPanel {
                 .clicked()
                 && let Some(selected_lap) = shared.selected_lap
                 && self.reference_lap != Some(selected_lap)
-                && !self
-                    .lap_overlays
-                    .iter()
-                    .any(|overlay| matches!(overlay.source, OverlaySource::MainSession) && overlay.lap_idx == selected_lap)
+                && !self.lap_overlays.iter().any(|overlay| {
+                    matches!(overlay.source, OverlaySource::MainSession)
+                        && overlay.lap_idx == selected_lap
+                })
             {
                 self.lap_overlays.push(LapOverlay {
                     source: OverlaySource::MainSession,
@@ -443,7 +450,10 @@ impl GraphPanel {
             }
 
             if ui
-                .add_enabled(self.reference_lap.is_some(), egui::Button::new("Add Overlay File..."))
+                .add_enabled(
+                    self.reference_lap.is_some(),
+                    egui::Button::new("Add Overlay File..."),
+                )
                 .clicked()
             {
                 self.load_external_overlay();
@@ -486,7 +496,10 @@ impl GraphPanel {
             });
 
             if ui
-                .add_enabled(!self.embedded_gauges.is_empty(), egui::Button::new("Clear Gauges"))
+                .add_enabled(
+                    !self.embedded_gauges.is_empty(),
+                    egui::Button::new("Clear Gauges"),
+                )
                 .clicked()
             {
                 self.embedded_gauges.clear();
@@ -546,13 +559,16 @@ impl GraphPanel {
                             .get(overlay.lap_idx)
                             .cloned()
                             .unwrap_or_else(|| "Unknown".into());
-                        egui::ComboBox::from_id_salt(format!("graph_overlay_lap_{}_{}", self.id, idx))
-                            .selected_text(lap_label)
-                            .show_ui(ui, |ui| {
-                                for (lap_idx, label) in lap_options.iter().enumerate() {
-                                    ui.selectable_value(&mut overlay.lap_idx, lap_idx, label);
-                                }
-                            });
+                        egui::ComboBox::from_id_salt(format!(
+                            "graph_overlay_lap_{}_{}",
+                            self.id, idx
+                        ))
+                        .selected_text(lap_label)
+                        .show_ui(ui, |ui| {
+                            for (lap_idx, label) in lap_options.iter().enumerate() {
+                                ui.selectable_value(&mut overlay.lap_idx, lap_idx, label);
+                            }
+                        });
 
                         ui.add(
                             egui::DragValue::new(&mut overlay.manual_offset)
@@ -628,10 +644,10 @@ impl GraphPanel {
                             v * gauge.channel.display_scale + gauge.channel.display_offset
                         }
                     });
-                    let mut min =
-                        gauge.channel.cached_min * gauge.channel.display_scale + gauge.channel.display_offset;
-                    let mut max =
-                        gauge.channel.cached_max * gauge.channel.display_scale + gauge.channel.display_offset;
+                    let mut min = gauge.channel.cached_min * gauge.channel.display_scale
+                        + gauge.channel.display_offset;
+                    let mut max = gauge.channel.cached_max * gauge.channel.display_scale
+                        + gauge.channel.display_offset;
                     if gauge.channel.display_scale < 0.0 {
                         std::mem::swap(&mut min, &mut max);
                     }
@@ -882,8 +898,10 @@ impl GraphPanel {
                             .auto_bounds(egui::Vec2b::new(true, true));
                     }
 
-                    let grouped: Vec<&PlottedChannel> =
-                        group.iter().map(|&channel_idx| &self.plotted_channels[channel_idx]).collect();
+                    let grouped: Vec<&PlottedChannel> = group
+                        .iter()
+                        .map(|&channel_idx| &self.plotted_channels[channel_idx])
+                        .collect();
                     let y_range = Self::compute_y_range(&grouped);
                     let mut tile_cursor = None;
 
@@ -891,7 +909,8 @@ impl GraphPanel {
                         if needs_zoom_reset {
                             plot_ui.set_plot_bounds_x(full_x_range.0..=full_x_range.1);
                         } else if let Some((x_min, x_max)) = zoom_range {
-                            let (axis_min, axis_max) = x_axis.axis_range_for_time_range(x_min, x_max);
+                            let (axis_min, axis_max) =
+                                x_axis.axis_range_for_time_range(x_min, x_max);
                             plot_ui.set_plot_bounds_x(axis_min..=axis_max);
                         }
 
@@ -1008,8 +1027,12 @@ impl GraphPanel {
                 .auto_bounds(egui::Vec2b::new(true, true));
         }
 
-        let prepared_overlays =
-            self.prepare_overlay_series(shared, x_axis, &viewport, shared.data_duration.unwrap_or_default());
+        let prepared_overlays = self.prepare_overlay_series(
+            shared,
+            x_axis,
+            &viewport,
+            shared.data_duration.unwrap_or_default(),
+        );
         let plotted: Vec<&PlottedChannel> = self.plotted_channels.iter().collect();
         let freq_map = build_freq_map(&plotted, shared);
         let y_range = Self::compute_y_range(&plotted);
@@ -1106,13 +1129,14 @@ impl GraphPanel {
         );
 
         if needs_zoom_reset {
-            shared.zoom_range = Some((viewport.reference_lap.start_time, viewport.reference_lap.end_time));
+            shared.zoom_range = Some((
+                viewport.reference_lap.start_time,
+                viewport.reference_lap.end_time,
+            ));
         } else if !zoom_from_timeline {
             let bounds = response.transform.bounds();
-            shared.zoom_range = Some(viewport.time_range_from_plot_bounds(
-                bounds.min()[0],
-                bounds.max()[0],
-            ));
+            shared.zoom_range =
+                Some(viewport.time_range_from_plot_bounds(bounds.min()[0], bounds.max()[0]));
         }
 
         self.handle_context_menu(&response.response, shared);
@@ -1156,16 +1180,22 @@ impl GraphPanel {
         let mut hovered_cursor = None;
         let mut hovered_bounds = None;
         let mut first_bounds = None;
-        let prepared_overlays =
-            self.prepare_overlay_series(shared, x_axis, &viewport, shared.data_duration.unwrap_or_default());
+        let prepared_overlays = self.prepare_overlay_series(
+            shared,
+            x_axis,
+            &viewport,
+            shared.data_duration.unwrap_or_default(),
+        );
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut responses = Vec::new();
                 for (tile_idx, group) in tile_groups.iter().enumerate() {
-                    let grouped: Vec<&PlottedChannel> =
-                        group.iter().map(|&channel_idx| &self.plotted_channels[channel_idx]).collect();
+                    let grouped: Vec<&PlottedChannel> = group
+                        .iter()
+                        .map(|&channel_idx| &self.plotted_channels[channel_idx])
+                        .collect();
 
                     let mut plot = Plot::new(format!("lap_overlay_tile_{}_{}", self.id, tile_idx))
                         .height(tile_height)
@@ -1242,7 +1272,10 @@ impl GraphPanel {
                         }
 
                         if let Some(cursor_time) = cursor_time {
-                            Self::draw_cursor_line(plot_ui, viewport.axis_value_for_time(cursor_time));
+                            Self::draw_cursor_line(
+                                plot_ui,
+                                viewport.axis_value_for_time(cursor_time),
+                            );
                         }
                         if let Some(coord) = plot_ui.pointer_coordinate() {
                             tile_cursor = viewport.time_from_axis_value(coord.x);
@@ -1278,9 +1311,11 @@ impl GraphPanel {
             shared.cursor_time = Some(cursor_time);
         }
         if needs_zoom_reset {
-            shared.zoom_range = Some((viewport.reference_lap.start_time, viewport.reference_lap.end_time));
-        } else if !zoom_from_timeline
-            && let Some((x_min, x_max)) = hovered_bounds.or(first_bounds)
+            shared.zoom_range = Some((
+                viewport.reference_lap.start_time,
+                viewport.reference_lap.end_time,
+            ));
+        } else if !zoom_from_timeline && let Some((x_min, x_max)) = hovered_bounds.or(first_bounds)
         {
             shared.zoom_range = Some(viewport.time_range_from_plot_bounds(x_min, x_max));
         }
@@ -1633,7 +1668,10 @@ impl GraphPanel {
                 let Some(pc) = self.plotted_channels.get(idx) else {
                     continue;
                 };
-                let name = names.get(group.iter().position(|&g| g == idx).unwrap_or(0)).cloned().unwrap_or_default();
+                let name = names
+                    .get(group.iter().position(|&g| g == idx).unwrap_or(0))
+                    .cloned()
+                    .unwrap_or_default();
                 let raw_unit = resolve_channel_meta(pc.channel_id, shared).1;
                 ui.menu_button(name, |ui| {
                     Self::show_channel_menu(ui, pc, &raw_unit, &mut action);
@@ -1690,9 +1728,8 @@ impl GraphPanel {
         if !presets.is_empty() || pc.display_unit.is_some() {
             ui.separator();
             ui.label("Display units:");
-            let raw_selected = pc.display_scale == 1.0
-                && pc.display_offset == 0.0
-                && pc.display_unit.is_none();
+            let raw_selected =
+                pc.display_scale == 1.0 && pc.display_offset == 0.0 && pc.display_unit.is_none();
             if ui
                 .selectable_label(raw_selected, format!("Raw ({})", raw_unit))
                 .clicked()
@@ -1779,11 +1816,7 @@ impl GraphPanel {
                     .iter()
                     .all(|g| g.channel.channel_id != id)
                 {
-                    if let Some(pc) = self
-                        .plotted_channels
-                        .iter()
-                        .find(|pc| pc.channel_id == id)
-                    {
+                    if let Some(pc) = self.plotted_channels.iter().find(|pc| pc.channel_id == id) {
                         let style = default_style_for_name("");
                         self.embedded_gauges.push(GaugeChannel {
                             channel: PlottedChannel {
@@ -1838,10 +1871,7 @@ impl GraphPanel {
 
         (
             ActiveGraphXAxis::Time,
-            Some(
-                "Distance X-axis unavailable for this session; falling back to time."
-                    .into(),
-            ),
+            Some("Distance X-axis unavailable for this session; falling back to time.".into()),
         )
     }
 
@@ -1906,7 +1936,8 @@ impl GraphPanel {
         for channel_id in channel_ids {
             let mut series = Vec::new();
             for (overlay_idx, overlay) in overlay_specs.iter().enumerate() {
-                if let Some(rendered) = self.resolve_overlay_render_data(shared, overlay, channel_id)
+                if let Some(rendered) =
+                    self.resolve_overlay_render_data(shared, overlay, channel_id)
                     && let Some(source_axis) =
                         self.overlay_axis_for_source(overlay, x_axis, main_session_duration)
                     && let Some(raw_len) = lap_axis_length(
@@ -1965,15 +1996,18 @@ impl GraphPanel {
                         axis: ActiveGraphXAxis::Time,
                         session_duration: session.ld_file.duration_secs(),
                     }),
-                    GraphXAxis::Distance => session.distance_axis_cache.as_ref().map(|cache| {
-                        OverlayAxisHandle {
-                            axis: ActiveGraphXAxis::Distance {
-                                data: Arc::clone(&cache.data),
-                                freq: cache.freq,
-                            },
-                            session_duration: session.ld_file.duration_secs(),
-                        }
-                    }),
+                    GraphXAxis::Distance => {
+                        session
+                            .distance_axis_cache
+                            .as_ref()
+                            .map(|cache| OverlayAxisHandle {
+                                axis: ActiveGraphXAxis::Distance {
+                                    data: Arc::clone(&cache.data),
+                                    freq: cache.freq,
+                                },
+                                session_duration: session.ld_file.duration_secs(),
+                            })
+                    }
                 }
             }
         }
@@ -2028,7 +2062,10 @@ impl GraphPanel {
         );
         for (idx, line) in lines.iter().enumerate() {
             painter.text(
-                egui::pos2(rect.left() + 8.0, rect.top() + 4.0 + idx as f32 * line_height),
+                egui::pos2(
+                    rect.left() + 8.0,
+                    rect.top() + 4.0 + idx as f32 * line_height,
+                ),
                 egui::Align2::LEFT_TOP,
                 line,
                 font.clone(),
@@ -2078,10 +2115,8 @@ impl ActiveGraphXAxis {
     fn axis_value_at_time(&self, time: f64) -> f64 {
         match self {
             Self::Time => time,
-            Self::Distance { data, freq } => {
-                super::utils::interp_at_time(data, *freq, time)
-                    .unwrap_or_else(|| data.last().copied().unwrap_or(0.0))
-            }
+            Self::Distance { data, freq } => super::utils::interp_at_time(data, *freq, time)
+                .unwrap_or_else(|| data.last().copied().unwrap_or(0.0)),
         }
     }
 
@@ -2211,7 +2246,10 @@ fn draw_lap_series(
         .map(|point| {
             let transformed_x =
                 (axis.axis_value_at_time(point.time) - origin_axis) * x_scale + x_offset;
-            [transformed_x, ((point.min + point.max) / 2.0) * y_scale + y_offset]
+            [
+                transformed_x,
+                ((point.min + point.max) / 2.0) * y_scale + y_offset,
+            ]
         })
         .filter(|[x, _]| *x >= x_min && *x <= x_max)
         .collect();
@@ -2239,15 +2277,9 @@ fn lap_axis_length(axis: &ActiveGraphXAxis, lap: &Lap, session_duration: f64) ->
 
 fn tint_color(color: egui::Color32, offset: usize) -> egui::Color32 {
     let lighten = (offset as f32 * 0.12).min(0.45);
-    let lerp = |component: u8| -> u8 {
-        (component as f32 + (255.0 - component as f32) * lighten) as u8
-    };
-    egui::Color32::from_rgba_premultiplied(
-        lerp(color.r()),
-        lerp(color.g()),
-        lerp(color.b()),
-        220,
-    )
+    let lerp =
+        |component: u8| -> u8 { (component as f32 + (255.0 - component as f32) * lighten) as u8 };
+    egui::Color32::from_rgba_premultiplied(lerp(color.r()), lerp(color.g()), lerp(color.b()), 220)
 }
 
 fn resolve_overlay_channel_data(
@@ -2348,7 +2380,9 @@ fn find_distance_channel(shared: &SharedState) -> Option<DistanceAxisCache> {
 fn find_distance_channel_in_ld(ld: &LdFile) -> Option<OwnedDistanceAxisCache> {
     let distance_names = ["distance", "lap distance", "distance driven"];
     for channel in &ld.channels {
-        if normalized_name(&channel.name).as_str().eq_any(&distance_names)
+        if normalized_name(&channel.name)
+            .as_str()
+            .eq_any(&distance_names)
             && let Some(data) = ld.read_channel_data(channel)
         {
             return Some(OwnedDistanceAxisCache {

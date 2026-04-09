@@ -109,8 +109,14 @@ const BRAKING_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
         &["G Force Lat"],
         &["Throttle Position", "Throttle Pedal"],
         &["Brake State"],
-        &["CP Lotus Wheel Speed Front Left", "CP Lotus Wheel Speed Front Right"],
-        &["CP Lotus Wheel Speed Rear Left", "CP Lotus Wheel Speed Rear Right"],
+        &[
+            "CP Lotus Wheel Speed Front Left",
+            "CP Lotus Wheel Speed Front Right",
+        ],
+        &[
+            "CP Lotus Wheel Speed Rear Left",
+            "CP Lotus Wheel Speed Rear Right",
+        ],
         &["Front Wheels Diff", "Rear Wheel Diff"],
         &["CP Lotus ESP Steering Angle"],
     ],
@@ -203,7 +209,11 @@ const FUEL_IGN_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
         &["Inlet Manifold Pressure"],
         &["Fuel Pressure"],
         &["Fuel Injector Primary Duty Cycle"],
-        &["Exhaust Lambda Bank 1", "Exhaust Lambda Bank 2", "Exhaust Lambda"],
+        &[
+            "Exhaust Lambda Bank 1",
+            "Exhaust Lambda Bank 2",
+            "Exhaust Lambda",
+        ],
         &["Ignition Timing", "Ignition Timing Compensation"],
         &[
             "Exhaust Camshaft Aim",
@@ -279,8 +289,15 @@ const SPARE_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
             "CP Engine Speed Targeting Throttle Control Forced Forward",
         ],
         &["Torque Limit State", "Engine Speed Limit State"],
-        &["ECU Acceleration X", "ECU Acceleration Y", "CP Lotus ESP Lateral Acceleration"],
-        &["CP Engine Speed Targeting Target", "CP Rev Match Engine Speed Target"],
+        &[
+            "ECU Acceleration X",
+            "ECU Acceleration Y",
+            "CP Lotus ESP Lateral Acceleration",
+        ],
+        &[
+            "CP Engine Speed Targeting Target",
+            "CP Rev Match Engine Speed Target",
+        ],
     ],
     embedded_gauges: &[],
 };
@@ -366,7 +383,8 @@ fn build_graph_panel(
             .tiled_groups
             .iter()
             .position(|group| {
-                group.iter()
+                group
+                    .iter()
                     .any(|candidate| channel_name_matches(channel_name, candidate))
             })
             .unwrap_or(i);
@@ -442,7 +460,8 @@ fn build_histogram_panel(
     }
     for (i, candidates) in channel_names.iter().enumerate() {
         if let Some(idx) = find_first_channel(ld, candidates)
-            && let Some(pc) = make_plotted_channel(ld, idx, CHANNEL_COLORS[i % CHANNEL_COLORS.len()], i)
+            && let Some(pc) =
+                make_plotted_channel(ld, idx, CHANNEL_COLORS[i % CHANNEL_COLORS.len()], i)
         {
             panel.channels.push(pc);
         }
@@ -502,8 +521,11 @@ fn build_mixture_map_worksheet(
         )),
         (Some(left_panel), Some(right_panel)) => {
             let mut dock = DockState::new(vec![PanelTab::MixtureMap(left_panel)]);
-            dock.main_surface_mut()
-                .split_right(NodeIndex::root(), 0.5, vec![PanelTab::MixtureMap(right_panel)]);
+            dock.main_surface_mut().split_right(
+                NodeIndex::root(),
+                0.5,
+                vec![PanelTab::MixtureMap(right_panel)],
+            );
             Some(("Mixture Map".to_string(), dock))
         }
     }
@@ -544,8 +566,11 @@ fn build_oil_pressure_worksheet(
         )),
         (Some(scatter_panel), Some(graph_panel)) => {
             let mut dock = DockState::new(vec![PanelTab::Scatter(scatter_panel)]);
-            dock.main_surface_mut()
-                .split_below(NodeIndex::root(), 0.82, vec![PanelTab::Graph(graph_panel)]);
+            dock.main_surface_mut().split_below(
+                NodeIndex::root(),
+                0.82,
+                vec![PanelTab::Graph(graph_panel)],
+            );
             Some(("Oil Pressure".to_string(), dock))
         }
     }
@@ -588,8 +613,11 @@ fn build_rpm_histo_worksheet(
         )),
         (Some(hist_panel), Some(graph_panel)) => {
             let mut dock = DockState::new(vec![PanelTab::Histogram(hist_panel)]);
-            dock.main_surface_mut()
-                .split_below(NodeIndex::root(), 0.78, vec![PanelTab::Graph(graph_panel)]);
+            dock.main_surface_mut().split_below(
+                NodeIndex::root(),
+                0.78,
+                vec![PanelTab::Graph(graph_panel)],
+            );
             Some(("RPM Histo".to_string(), dock))
         }
     }

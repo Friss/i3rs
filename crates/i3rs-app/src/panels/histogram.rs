@@ -123,12 +123,24 @@ impl HistogramPanel {
             ui.separator();
             ui.checkbox(&mut self.lock_x_range, "Lock X");
             if self.lock_x_range {
-                ui.add(egui::DragValue::new(&mut self.x_min).speed(10.0).prefix("min "));
-                ui.add(egui::DragValue::new(&mut self.x_max).speed(10.0).prefix("max "));
+                ui.add(
+                    egui::DragValue::new(&mut self.x_min)
+                        .speed(10.0)
+                        .prefix("min "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.x_max)
+                        .speed(10.0)
+                        .prefix("max "),
+                );
             }
             ui.checkbox(&mut self.lock_y_range, "Lock Y");
             if self.lock_y_range {
-                ui.add(egui::DragValue::new(&mut self.y_min).speed(1.0).prefix("min "));
+                ui.add(
+                    egui::DragValue::new(&mut self.y_min)
+                        .speed(1.0)
+                        .prefix("min "),
+                );
                 ui.add(
                     egui::DragValue::new(&mut self.y_headroom_pct)
                         .speed(1.0)

@@ -136,10 +136,10 @@ impl GaugePanel {
                                     v * gc.channel.display_scale + gc.channel.display_offset
                                 }
                             });
-                            let mut min =
-                                gc.channel.cached_min * gc.channel.display_scale + gc.channel.display_offset;
-                            let mut max =
-                                gc.channel.cached_max * gc.channel.display_scale + gc.channel.display_offset;
+                            let mut min = gc.channel.cached_min * gc.channel.display_scale
+                                + gc.channel.display_offset;
+                            let mut max = gc.channel.cached_max * gc.channel.display_scale
+                                + gc.channel.display_offset;
                             if gc.channel.display_scale < 0.0 {
                                 std::mem::swap(&mut min, &mut max);
                             }
@@ -473,9 +473,7 @@ fn draw_digital_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDraw
 }
 
 fn draw_steering_wheel(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawContext) {
-    let GaugeDrawContext {
-        name, value, ..
-    } = *ctx;
+    let GaugeDrawContext { name, value, .. } = *ctx;
     let title_font_size = if name.len() > 26 { 10.0 } else { 12.0 };
     let title_y = rect.min.y + 8.0;
     let value_y = rect.max.y - 10.0;
@@ -572,13 +570,21 @@ fn draw_steering_wheel(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDra
     draw_path(&right_spoke);
 
     let hub_radius = radius * 0.16;
-    painter.circle_filled(center, hub_radius * 0.92, egui::Color32::from_rgba_premultiplied(0, 0, 0, 120));
+    painter.circle_filled(
+        center,
+        hub_radius * 0.92,
+        egui::Color32::from_rgba_premultiplied(0, 0, 0, 120),
+    );
     painter.circle_stroke(
         center + egui::vec2(1.0, 1.0),
         hub_radius,
         egui::Stroke::new(rim_stroke + 1.0, shadow_color),
     );
-    painter.circle_stroke(center, hub_radius, egui::Stroke::new(rim_stroke, line_color));
+    painter.circle_stroke(
+        center,
+        hub_radius,
+        egui::Stroke::new(rim_stroke, line_color),
+    );
 
     // Name
     painter.text(

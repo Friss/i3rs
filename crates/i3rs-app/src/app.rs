@@ -463,11 +463,7 @@ impl App {
                     ui.separator();
                     ui.label("Graph X-axis");
                     let changed_time = ui
-                        .radio_value(
-                            &mut x_axis_mode,
-                            crate::state::GraphXAxis::Time,
-                            "Time",
-                        )
+                        .radio_value(&mut x_axis_mode, crate::state::GraphXAxis::Time, "Time")
                         .clicked();
                     let changed_distance = ui
                         .radio_value(

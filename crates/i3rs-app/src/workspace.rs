@@ -233,7 +233,9 @@ pub struct MathChannelConfig {
 
 fn channel_name_and_kind(channel_id: ChannelId, shared: &SharedState) -> Option<(String, bool)> {
     match channel_id {
-        ChannelId::Physical(idx) => Some((shared.ld_file.as_ref()?.channels[idx].name.clone(), false)),
+        ChannelId::Physical(idx) => {
+            Some((shared.ld_file.as_ref()?.channels[idx].name.clone(), false))
+        }
         ChannelId::Math(idx) => Some((shared.math_channels.get(idx)?.name.clone(), true)),
     }
 }
@@ -267,7 +269,10 @@ fn resolve_saved_plotted_channel(
         })
     } else {
         let ld = shared.ld_file.as_ref()?;
-        let channel = ld.channels.iter().find(|channel| channel.name == channel_name)?;
+        let channel = ld
+            .channels
+            .iter()
+            .find(|channel| channel.name == channel_name)?;
         let data = ld.read_channel_data(channel)?;
         let (cached_min, cached_max, cached_avg, _) = compute_channel_stats(&data);
         Some(crate::state::PlottedChannel {
@@ -348,9 +353,7 @@ pub fn save_workspace(
                                     OverlaySource::External(session_idx) => g
                                         .overlay_sessions
                                         .get(session_idx)
-                                        .map(|session| {
-                                            session.path.to_string_lossy().to_string()
-                                        }),
+                                        .map(|session| session.path.to_string_lossy().to_string()),
                                 };
                                 Some(GraphOverlayConfig {
                                     file_path,
@@ -365,14 +368,12 @@ pub fn save_workspace(
                             .iter()
                             .filter_map(|gauge| {
                                 let (channel_name, is_math) = match gauge.channel.channel_id {
-                                    ChannelId::Physical(idx) => (
-                                        shared.ld_file.as_ref()?.channels[idx].name.clone(),
-                                        false,
-                                    ),
-                                    ChannelId::Math(idx) => (
-                                        shared.math_channels.get(idx)?.name.clone(),
-                                        true,
-                                    ),
+                                    ChannelId::Physical(idx) => {
+                                        (shared.ld_file.as_ref()?.channels[idx].name.clone(), false)
+                                    }
+                                    ChannelId::Math(idx) => {
+                                        (shared.math_channels.get(idx)?.name.clone(), true)
+                                    }
                                 };
                                 Some(GraphGaugeConfig {
                                     channel_name,
@@ -435,34 +436,43 @@ pub fn save_workspace(
                         channel_names: h
                             .channels
                             .iter()
-                            .filter_map(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name))
+                            .filter_map(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                            })
                             .collect(),
                         is_math: h
                             .channels
                             .iter()
-                            .filter_map(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(_, is_math)| is_math))
+                            .filter_map(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
                             .collect(),
                     }),
                     PanelTab::Scatter(s) => PanelConfig::Scatter(ScatterPanelConfig {
                         id: s.id,
                         title: s.title.clone(),
-                        x_channel_name: s
-                            .x_channel
-                            .as_ref()
-                            .and_then(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)),
-                        y_channel_name: s
-                            .y_channel
-                            .as_ref()
-                            .and_then(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)),
+                        x_channel_name: s.x_channel.as_ref().and_then(|pc| {
+                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                        }),
+                        y_channel_name: s.y_channel.as_ref().and_then(|pc| {
+                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                        }),
                         x_is_math: s
                             .x_channel
                             .as_ref()
-                            .and_then(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(_, is_math)| is_math))
+                            .and_then(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
                             .unwrap_or(false),
                         y_is_math: s
                             .y_channel
                             .as_ref()
-                            .and_then(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(_, is_math)| is_math))
+                            .and_then(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
                             .unwrap_or(false),
                         point_size: s.point_size,
                     }),
@@ -479,32 +489,38 @@ pub fn save_workspace(
                         id: m.id,
                         title: m.title.clone(),
                         bins: m.bins,
-                        x_channel_name: m
-                            .x_channel
-                            .as_ref()
-                            .and_then(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)),
-                        y_channel_name: m
-                            .y_channel
-                            .as_ref()
-                            .and_then(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)),
-                        value_channel_name: m
-                            .value_channel
-                            .as_ref()
-                            .and_then(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)),
+                        x_channel_name: m.x_channel.as_ref().and_then(|pc| {
+                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                        }),
+                        y_channel_name: m.y_channel.as_ref().and_then(|pc| {
+                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                        }),
+                        value_channel_name: m.value_channel.as_ref().and_then(|pc| {
+                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                        }),
                         x_is_math: m
                             .x_channel
                             .as_ref()
-                            .and_then(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(_, is_math)| is_math))
+                            .and_then(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
                             .unwrap_or(false),
                         y_is_math: m
                             .y_channel
                             .as_ref()
-                            .and_then(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(_, is_math)| is_math))
+                            .and_then(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
                             .unwrap_or(false),
                         value_is_math: m
                             .value_channel
                             .as_ref()
-                            .and_then(|pc| channel_name_and_kind(pc.channel_id, shared).map(|(_, is_math)| is_math))
+                            .and_then(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
                             .unwrap_or(false),
                     }),
                 };
@@ -595,8 +611,7 @@ pub fn load_workspace(
                                 display_transform.map(|cfg| cfg.scale).unwrap_or(1.0);
                             let display_offset =
                                 display_transform.map(|cfg| cfg.offset).unwrap_or(0.0);
-                            let display_unit =
-                                display_transform.and_then(|cfg| cfg.unit.clone());
+                            let display_unit = display_transform.and_then(|cfg| cfg.unit.clone());
 
                             if is_math {
                                 // Find math channel by name
@@ -650,15 +665,12 @@ pub fn load_workspace(
                                     .position(|mc| mc.name == gauge.channel_name)
                                     .map(ChannelId::Math)
                             } else {
-                                shared
-                                    .ld_file
-                                    .as_ref()
-                                    .and_then(|ld| {
-                                        ld.channels
-                                            .iter()
-                                            .find(|channel| channel.name == gauge.channel_name)
-                                            .map(|channel| ChannelId::Physical(channel.index))
-                                    })
+                                shared.ld_file.as_ref().and_then(|ld| {
+                                    ld.channels
+                                        .iter()
+                                        .find(|channel| channel.name == gauge.channel_name)
+                                        .map(|channel| ChannelId::Physical(channel.index))
+                                })
                             };
                             if let Some(channel_id) = channel_id {
                                 graph.add_embedded_gauge_with_style(
