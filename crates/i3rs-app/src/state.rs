@@ -27,7 +27,11 @@ pub struct PlottedChannel {
     pub channel_id: ChannelId,
     pub color: egui::Color32,
     pub data: Arc<Vec<f64>>,
+    pub tile_group: usize,
     pub y_axis: YAxis,
+    pub display_scale: f64,
+    pub display_offset: f64,
+    pub display_unit: Option<String>,
     /// Cached min value (computed once on load).
     pub cached_min: f64,
     /// Cached max value (computed once on load).
@@ -44,6 +48,8 @@ pub struct PlottedChannelInfo {
     pub dec_places: i16,
     pub color: egui::Color32,
     pub data: Arc<Vec<f64>>,
+    pub display_scale: f64,
+    pub display_offset: f64,
     /// Enum/state labels parsed from the .ld file (value → label).
     pub enum_labels: Arc<HashMap<i64, String>>,
 }
@@ -63,6 +69,10 @@ impl PlottedChannelInfo {
             }
         }
         format_state_value(&self.name, value)
+    }
+
+    pub fn transform_value(&self, value: f64) -> f64 {
+        value * self.display_scale + self.display_offset
     }
 }
 
@@ -145,6 +155,19 @@ pub enum GraphMode {
     Tiled,
 }
 
+/// Which domain graph panels use for their X-axis.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GraphXAxis {
+    Time,
+    Distance,
+}
+
+#[derive(Clone)]
+pub struct DistanceAxisCache {
+    pub data: Arc<Vec<f64>>,
+    pub freq: u16,
+}
+
 pub const CHANNEL_COLORS: &[egui::Color32] = &[
     egui::Color32::from_rgb(255, 100, 100), // red
     egui::Color32::from_rgb(100, 180, 255), // blue
@@ -169,8 +192,8 @@ pub struct CachedChannelStats {
 
 /// Cache for report panel statistics, invalidated when channels or laps change.
 pub struct ReportCache {
-    /// Fingerprint: sorted list of (channel_name, data_ptr, data_len) to detect changes.
-    fingerprint: Vec<(String, usize, usize)>,
+    /// Fingerprint: (channel_name, data_ptr, data_len, unit, scale_bits, offset_bits).
+    fingerprint: Vec<(String, usize, usize, String, u64, u64)>,
     lap_count: usize,
     pub stats: Vec<CachedChannelStats>,
 }
@@ -191,8 +214,15 @@ impl ReportCache {
         }
         for (i, info) in registry.iter().enumerate() {
             let ptr = Arc::as_ptr(&info.data) as usize;
-            let (ref name, cached_ptr, cached_len) = self.fingerprint[i];
-            if name != &info.name || cached_ptr != ptr || cached_len != info.data.len() {
+            let (ref name, cached_ptr, cached_len, ref unit, scale_bits, offset_bits) =
+                self.fingerprint[i];
+            if name != &info.name
+                || cached_ptr != ptr
+                || cached_len != info.data.len()
+                || unit != &info.unit
+                || scale_bits != info.display_scale.to_bits()
+                || offset_bits != info.display_offset.to_bits()
+            {
                 return false;
             }
         }
@@ -208,6 +238,9 @@ impl ReportCache {
                     info.name.clone(),
                     Arc::as_ptr(&info.data) as usize,
                     info.data.len(),
+                    info.unit.clone(),
+                    info.display_scale.to_bits(),
+                    info.display_offset.to_bits(),
                 )
             })
             .collect();
@@ -215,7 +248,14 @@ impl ReportCache {
         self.stats.clear();
 
         for info in registry {
-            let session = compute_channel_stats(&info.data);
+            let mut session = compute_channel_stats(&info.data);
+            session.0 = info.transform_value(session.0);
+            session.1 = info.transform_value(session.1);
+            if info.display_scale < 0.0 {
+                std::mem::swap(&mut session.0, &mut session.1);
+            }
+            session.2 = info.transform_value(session.2);
+            session.3 *= info.display_scale.abs();
             let freq = info.freq;
             let mut per_lap = Vec::with_capacity(laps.len());
 
@@ -225,7 +265,14 @@ impl ReportCache {
                 let start = start_sample.min(info.data.len());
                 let end = end_sample.min(info.data.len());
                 if start < end {
-                    let stats = compute_channel_stats(&info.data[start..end]);
+                    let mut stats = compute_channel_stats(&info.data[start..end]);
+                    stats.0 = info.transform_value(stats.0);
+                    stats.1 = info.transform_value(stats.1);
+                    if info.display_scale < 0.0 {
+                        std::mem::swap(&mut stats.0, &mut stats.1);
+                    }
+                    stats.2 = info.transform_value(stats.2);
+                    stats.3 *= info.display_scale.abs();
                     per_lap.push((lap.name.clone(), stats.0, stats.1, stats.2, stats.3));
                 }
             }
@@ -286,6 +333,9 @@ pub struct SharedState {
 
     // Next panel ID counter
     pub next_panel_id: u64,
+
+    // Derived channel caches
+    pub distance_axis_cache: Option<DistanceAxisCache>,
 }
 
 impl SharedState {
@@ -313,6 +363,11 @@ impl SharedState {
             sectors: Vec::new(),
             reference_lap: None,
             next_panel_id: 1,
+            distance_axis_cache: None,
         }
+    }
+
+    pub fn invalidate_derived_caches(&mut self) {
+        self.distance_axis_cache = None;
     }
 }

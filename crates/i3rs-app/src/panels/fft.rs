@@ -109,12 +109,7 @@ impl FftPanel {
         for pc in &self.channels {
             shared
                 .plotted_channel_registry
-                .push(build_plotted_channel_info(
-                    pc.channel_id,
-                    pc.color,
-                    pc.data.clone(),
-                    shared,
-                ));
+                .push(build_plotted_channel_info(pc, shared));
         }
 
         // Toolbar

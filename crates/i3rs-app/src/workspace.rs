@@ -7,13 +7,15 @@ use i3rs_core::Sector;
 
 use crate::panels::PanelTab;
 use crate::panels::fft::FftPanel;
-use crate::panels::gauge::GaugePanel;
-use crate::panels::graph::GraphPanel;
+use crate::panels::gauge::{GaugePanel, GaugeStyle};
+use crate::panels::graph::{GraphPanel, OverlaySource};
 use crate::panels::histogram::HistogramPanel;
 use crate::panels::mixture_map::MixtureMapPanel;
 use crate::panels::scatter::ScatterPanel;
 use crate::panels::track_map::TrackMapPanel;
-use crate::state::{CHANNEL_COLORS, ChannelId, GraphMode, SharedState, compute_channel_stats};
+use crate::state::{
+    CHANNEL_COLORS, ChannelId, GraphMode, GraphXAxis, SharedState, compute_channel_stats,
+};
 
 // ---------------------------------------------------------------------------
 // Serializable workspace types
@@ -66,10 +68,66 @@ pub struct GraphPanelConfig {
     pub title: String,
     pub channel_names: Vec<String>,
     pub colors: Vec<[u8; 3]>,
+    #[serde(default)]
+    pub tile_groups: Vec<usize>,
     pub graph_mode: String, // "Tiled" or "Overlay"
+    #[serde(default = "default_graph_x_axis_mode")]
+    pub x_axis_mode: String, // "Time" or "Distance"
+    #[serde(default)]
+    pub reference_lap: Option<usize>,
+    #[serde(default)]
+    pub overlays: Vec<GraphOverlayConfig>,
+    #[serde(default)]
+    pub embedded_gauges: Vec<GraphGaugeConfig>,
     /// Whether each channel is a math channel (true) or physical (false).
     #[serde(default)]
     pub is_math: Vec<bool>,
+    #[serde(default)]
+    pub display_transforms: Vec<GraphDisplayTransformConfig>,
+}
+
+fn default_graph_x_axis_mode() -> String {
+    "Time".into()
+}
+
+fn gauge_style_to_string(style: GaugeStyle) -> &'static str {
+    match style {
+        GaugeStyle::Analog => "Analog",
+        GaugeStyle::Bar => "Bar",
+        GaugeStyle::Digital => "Digital",
+        GaugeStyle::SteeringWheel => "SteeringWheel",
+    }
+}
+
+fn gauge_style_from_string(style: &str) -> GaugeStyle {
+    match style {
+        "Bar" => GaugeStyle::Bar,
+        "Digital" => GaugeStyle::Digital,
+        "SteeringWheel" => GaugeStyle::SteeringWheel,
+        _ => GaugeStyle::Analog,
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GraphOverlayConfig {
+    pub file_path: Option<String>,
+    pub lap_index: usize,
+    pub manual_offset: f64,
+    pub stretch_to_reference: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GraphGaugeConfig {
+    pub channel_name: String,
+    pub is_math: bool,
+    pub style: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct GraphDisplayTransformConfig {
+    pub scale: f64,
+    pub offset: f64,
+    pub unit: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -91,12 +149,46 @@ pub struct HistogramPanelConfig {
     pub title: String,
     pub bin_count: usize,
     pub per_lap: bool,
+    #[serde(default)]
+    pub lock_x_range: bool,
+    #[serde(default)]
+    pub x_min: f64,
+    #[serde(default)]
+    pub x_max: f64,
+    #[serde(default)]
+    pub lock_y_range: bool,
+    #[serde(default)]
+    pub y_min: f64,
+    #[serde(default = "default_histogram_y_headroom_pct")]
+    pub y_headroom_pct: f64,
+    #[serde(default)]
+    pub channel_names: Vec<String>,
+    #[serde(default)]
+    pub is_math: Vec<bool>,
+}
+
+fn default_histogram_y_headroom_pct() -> f64 {
+    10.0
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct ScatterPanelConfig {
     pub id: u64,
     pub title: String,
+    #[serde(default)]
+    pub x_channel_name: Option<String>,
+    #[serde(default)]
+    pub y_channel_name: Option<String>,
+    #[serde(default)]
+    pub x_is_math: bool,
+    #[serde(default)]
+    pub y_is_math: bool,
+    #[serde(default = "default_scatter_point_size")]
+    pub point_size: f32,
+}
+
+fn default_scatter_point_size() -> f32 {
+    1.5
 }
 
 #[derive(Serialize, Deserialize)]
@@ -117,6 +209,18 @@ pub struct MixtureMapPanelConfig {
     pub id: u64,
     pub title: String,
     pub bins: usize,
+    #[serde(default)]
+    pub x_channel_name: Option<String>,
+    #[serde(default)]
+    pub y_channel_name: Option<String>,
+    #[serde(default)]
+    pub value_channel_name: Option<String>,
+    #[serde(default)]
+    pub x_is_math: bool,
+    #[serde(default)]
+    pub y_is_math: bool,
+    #[serde(default)]
+    pub value_is_math: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -125,6 +229,66 @@ pub struct MathChannelConfig {
     pub expression: String,
     pub unit: String,
     pub dec_places: i16,
+}
+
+fn channel_name_and_kind(channel_id: ChannelId, shared: &SharedState) -> Option<(String, bool)> {
+    match channel_id {
+        ChannelId::Physical(idx) => {
+            Some((shared.ld_file.as_ref()?.channels[idx].name.clone(), false))
+        }
+        ChannelId::Math(idx) => Some((shared.math_channels.get(idx)?.name.clone(), true)),
+    }
+}
+
+fn resolve_saved_plotted_channel(
+    shared: &SharedState,
+    channel_name: &str,
+    is_math: bool,
+    color: eframe::egui::Color32,
+    tile_group: usize,
+) -> Option<crate::state::PlottedChannel> {
+    if is_math {
+        let idx = shared
+            .math_channels
+            .iter()
+            .position(|mc| mc.name == channel_name)?;
+        let data = shared.math_channels.get(idx)?.data.clone()?;
+        let (cached_min, cached_max, cached_avg, _) = compute_channel_stats(&data);
+        Some(crate::state::PlottedChannel {
+            channel_id: ChannelId::Math(idx),
+            color,
+            data,
+            tile_group,
+            y_axis: crate::state::YAxis::Left,
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
+            cached_min,
+            cached_max,
+            cached_avg,
+        })
+    } else {
+        let ld = shared.ld_file.as_ref()?;
+        let channel = ld
+            .channels
+            .iter()
+            .find(|channel| channel.name == channel_name)?;
+        let data = ld.read_channel_data(channel)?;
+        let (cached_min, cached_max, cached_avg, _) = compute_channel_stats(&data);
+        Some(crate::state::PlottedChannel {
+            channel_id: ChannelId::Physical(channel.index),
+            color,
+            data: std::sync::Arc::new(data),
+            tile_group,
+            y_axis: crate::state::YAxis::Left,
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
+            cached_min,
+            cached_max,
+            cached_avg,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,16 +333,74 @@ pub fn save_workspace(
                                 [c.r(), c.g(), c.b()]
                             })
                             .collect();
+                        let tile_groups: Vec<usize> =
+                            g.plotted_channels.iter().map(|pc| pc.tile_group).collect();
+                        let display_transforms: Vec<GraphDisplayTransformConfig> = g
+                            .plotted_channels
+                            .iter()
+                            .map(|pc| GraphDisplayTransformConfig {
+                                scale: pc.display_scale,
+                                offset: pc.display_offset,
+                                unit: pc.display_unit.clone(),
+                            })
+                            .collect();
+                        let overlays: Vec<GraphOverlayConfig> = g
+                            .lap_overlays
+                            .iter()
+                            .map(|overlay| {
+                                let file_path = match overlay.source {
+                                    OverlaySource::MainSession => None,
+                                    OverlaySource::External(session_idx) => g
+                                        .overlay_sessions
+                                        .get(session_idx)
+                                        .map(|session| session.path.to_string_lossy().to_string()),
+                                };
+                                GraphOverlayConfig {
+                                    file_path,
+                                    lap_index: overlay.lap_idx,
+                                    manual_offset: overlay.manual_offset,
+                                    stretch_to_reference: overlay.stretch_to_reference,
+                                }
+                            })
+                            .collect();
+                        let embedded_gauges: Vec<GraphGaugeConfig> = g
+                            .embedded_gauges
+                            .iter()
+                            .filter_map(|gauge| {
+                                let (channel_name, is_math) = match gauge.channel.channel_id {
+                                    ChannelId::Physical(idx) => {
+                                        (shared.ld_file.as_ref()?.channels[idx].name.clone(), false)
+                                    }
+                                    ChannelId::Math(idx) => {
+                                        (shared.math_channels.get(idx)?.name.clone(), true)
+                                    }
+                                };
+                                Some(GraphGaugeConfig {
+                                    channel_name,
+                                    is_math,
+                                    style: gauge_style_to_string(gauge.style).into(),
+                                })
+                            })
+                            .collect();
                         PanelConfig::Graph(GraphPanelConfig {
                             id: g.id,
                             title: g.title.clone(),
                             channel_names,
                             colors,
+                            tile_groups,
                             graph_mode: match g.graph_mode {
                                 GraphMode::Tiled => "Tiled".into(),
                                 GraphMode::Overlay => "Overlay".into(),
                             },
+                            x_axis_mode: match g.x_axis_mode {
+                                GraphXAxis::Time => "Time".into(),
+                                GraphXAxis::Distance => "Distance".into(),
+                            },
+                            reference_lap: g.reference_lap,
+                            overlays,
+                            embedded_gauges,
                             is_math,
+                            display_transforms,
                         })
                     }
                     PanelTab::TrackMap(t) => {
@@ -205,10 +427,54 @@ pub fn save_workspace(
                         title: h.title.clone(),
                         bin_count: h.bin_count,
                         per_lap: h.per_lap,
+                        lock_x_range: h.lock_x_range,
+                        x_min: h.x_min,
+                        x_max: h.x_max,
+                        lock_y_range: h.lock_y_range,
+                        y_min: h.y_min,
+                        y_headroom_pct: h.y_headroom_pct,
+                        channel_names: h
+                            .channels
+                            .iter()
+                            .filter_map(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                            })
+                            .collect(),
+                        is_math: h
+                            .channels
+                            .iter()
+                            .filter_map(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
+                            .collect(),
                     }),
                     PanelTab::Scatter(s) => PanelConfig::Scatter(ScatterPanelConfig {
                         id: s.id,
                         title: s.title.clone(),
+                        x_channel_name: s.x_channel.as_ref().and_then(|pc| {
+                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                        }),
+                        y_channel_name: s.y_channel.as_ref().and_then(|pc| {
+                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                        }),
+                        x_is_math: s
+                            .x_channel
+                            .as_ref()
+                            .and_then(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
+                            .unwrap_or(false),
+                        y_is_math: s
+                            .y_channel
+                            .as_ref()
+                            .and_then(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
+                            .unwrap_or(false),
+                        point_size: s.point_size,
                     }),
                     PanelTab::Fft(f) => PanelConfig::Fft(FftPanelConfig {
                         id: f.id,
@@ -223,6 +489,39 @@ pub fn save_workspace(
                         id: m.id,
                         title: m.title.clone(),
                         bins: m.bins,
+                        x_channel_name: m.x_channel.as_ref().and_then(|pc| {
+                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                        }),
+                        y_channel_name: m.y_channel.as_ref().and_then(|pc| {
+                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                        }),
+                        value_channel_name: m.value_channel.as_ref().and_then(|pc| {
+                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                        }),
+                        x_is_math: m
+                            .x_channel
+                            .as_ref()
+                            .and_then(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
+                            .unwrap_or(false),
+                        y_is_math: m
+                            .y_channel
+                            .as_ref()
+                            .and_then(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
+                            .unwrap_or(false),
+                        value_is_math: m
+                            .value_channel
+                            .as_ref()
+                            .and_then(|pc| {
+                                channel_name_and_kind(pc.channel_id, shared)
+                                    .map(|(_, is_math)| is_math)
+                            })
+                            .unwrap_or(false),
                     }),
                 };
                 panels.push(config);
@@ -292,6 +591,11 @@ pub fn load_workspace(
                             "Overlay" => GraphMode::Overlay,
                             _ => GraphMode::Tiled,
                         };
+                        graph.x_axis_mode = match gc.x_axis_mode.as_str() {
+                            "Distance" => GraphXAxis::Distance,
+                            _ => GraphXAxis::Time,
+                        };
+                        graph.reference_lap = gc.reference_lap;
 
                         // Resolve channels by name
                         for (i, name) in gc.channel_names.iter().enumerate() {
@@ -301,6 +605,13 @@ pub fn load_workspace(
                                 .get(i)
                                 .map(|c| eframe::egui::Color32::from_rgb(c[0], c[1], c[2]))
                                 .unwrap_or(CHANNEL_COLORS[i % CHANNEL_COLORS.len()]);
+                            let tile_group = gc.tile_groups.get(i).copied().unwrap_or(i);
+                            let display_transform = gc.display_transforms.get(i);
+                            let display_scale =
+                                display_transform.map(|cfg| cfg.scale).unwrap_or(1.0);
+                            let display_offset =
+                                display_transform.map(|cfg| cfg.offset).unwrap_or(0.0);
+                            let display_unit = display_transform.and_then(|cfg| cfg.unit.clone());
 
                             if is_math {
                                 // Find math channel by name
@@ -314,7 +625,11 @@ pub fn load_workspace(
                                         channel_id: ChannelId::Math(mc_idx),
                                         color,
                                         data: data.clone(),
+                                        tile_group,
                                         y_axis: crate::state::YAxis::Left,
+                                        display_scale,
+                                        display_offset,
+                                        display_unit: display_unit.clone(),
                                         cached_min,
                                         cached_max,
                                         cached_avg,
@@ -330,10 +645,57 @@ pub fn load_workspace(
                                     channel_id: ChannelId::Physical(ch.index),
                                     color,
                                     data: std::sync::Arc::new(data),
+                                    tile_group,
                                     y_axis: crate::state::YAxis::Left,
+                                    display_scale,
+                                    display_offset,
+                                    display_unit: display_unit.clone(),
                                     cached_min,
                                     cached_max,
                                     cached_avg,
+                                });
+                            }
+                        }
+
+                        for gauge in &gc.embedded_gauges {
+                            let channel_id = if gauge.is_math {
+                                shared
+                                    .math_channels
+                                    .iter()
+                                    .position(|mc| mc.name == gauge.channel_name)
+                                    .map(ChannelId::Math)
+                            } else {
+                                shared.ld_file.as_ref().and_then(|ld| {
+                                    ld.channels
+                                        .iter()
+                                        .find(|channel| channel.name == gauge.channel_name)
+                                        .map(|channel| ChannelId::Physical(channel.index))
+                                })
+                            };
+                            if let Some(channel_id) = channel_id {
+                                graph.add_embedded_gauge_with_style(
+                                    channel_id,
+                                    shared,
+                                    gauge_style_from_string(&gauge.style),
+                                );
+                            }
+                        }
+
+                        for overlay in &gc.overlays {
+                            let source = if let Some(path) = &overlay.file_path {
+                                let path = std::path::PathBuf::from(path);
+                                graph
+                                    .load_external_overlay_path(path)
+                                    .map(OverlaySource::External)
+                            } else {
+                                Some(OverlaySource::MainSession)
+                            };
+                            if let Some(source) = source {
+                                graph.lap_overlays.push(crate::panels::graph::LapOverlay {
+                                    source,
+                                    lap_idx: overlay.lap_index,
+                                    manual_offset: overlay.manual_offset,
+                                    stretch_to_reference: overlay.stretch_to_reference,
                                 });
                             }
                         }
@@ -373,13 +735,50 @@ pub fn load_workspace(
                         let mut histogram = HistogramPanel::new(hc.id, &hc.title);
                         histogram.bin_count = hc.bin_count;
                         histogram.per_lap = hc.per_lap;
+                        histogram.lock_x_range = hc.lock_x_range;
+                        histogram.x_min = hc.x_min;
+                        histogram.x_max = hc.x_max;
+                        histogram.lock_y_range = hc.lock_y_range;
+                        histogram.y_min = hc.y_min;
+                        histogram.y_headroom_pct = hc.y_headroom_pct;
+                        for (i, channel_name) in hc.channel_names.iter().enumerate() {
+                            let is_math = hc.is_math.get(i).copied().unwrap_or(false);
+                            if let Some(pc) = resolve_saved_plotted_channel(
+                                shared,
+                                channel_name,
+                                is_math,
+                                CHANNEL_COLORS[i % CHANNEL_COLORS.len()],
+                                i,
+                            ) {
+                                histogram.channels.push(pc);
+                            }
+                        }
                         if hc.id >= shared.next_panel_id {
                             shared.next_panel_id = hc.id + 1;
                         }
                         PanelTab::Histogram(histogram)
                     }
                     PanelConfig::Scatter(sc) => {
-                        let scatter = ScatterPanel::new(sc.id, &sc.title);
+                        let mut scatter = ScatterPanel::new(sc.id, &sc.title);
+                        scatter.point_size = sc.point_size;
+                        if let Some(channel_name) = &sc.x_channel_name {
+                            scatter.x_channel = resolve_saved_plotted_channel(
+                                shared,
+                                channel_name,
+                                sc.x_is_math,
+                                CHANNEL_COLORS[0],
+                                0,
+                            );
+                        }
+                        if let Some(channel_name) = &sc.y_channel_name {
+                            scatter.y_channel = resolve_saved_plotted_channel(
+                                shared,
+                                channel_name,
+                                sc.y_is_math,
+                                CHANNEL_COLORS[4],
+                                1,
+                            );
+                        }
                         if sc.id >= shared.next_panel_id {
                             shared.next_panel_id = sc.id + 1;
                         }
@@ -403,6 +802,33 @@ pub fn load_workspace(
                     PanelConfig::MixtureMap(mc) => {
                         let mut mixture_map = MixtureMapPanel::new(mc.id, &mc.title);
                         mixture_map.bins = mc.bins;
+                        if let Some(channel_name) = &mc.x_channel_name {
+                            mixture_map.x_channel = resolve_saved_plotted_channel(
+                                shared,
+                                channel_name,
+                                mc.x_is_math,
+                                CHANNEL_COLORS[0],
+                                0,
+                            );
+                        }
+                        if let Some(channel_name) = &mc.y_channel_name {
+                            mixture_map.y_channel = resolve_saved_plotted_channel(
+                                shared,
+                                channel_name,
+                                mc.y_is_math,
+                                CHANNEL_COLORS[1],
+                                1,
+                            );
+                        }
+                        if let Some(channel_name) = &mc.value_channel_name {
+                            mixture_map.value_channel = resolve_saved_plotted_channel(
+                                shared,
+                                channel_name,
+                                mc.value_is_math,
+                                CHANNEL_COLORS[2],
+                                2,
+                            );
+                        }
                         if mc.id >= shared.next_panel_id {
                             shared.next_panel_id = mc.id + 1;
                         }

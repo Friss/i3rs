@@ -59,6 +59,18 @@ pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> Chan
     }
 }
 
+pub fn resolve_plotted_channel_display_meta(
+    channel: &PlottedChannel,
+    shared: &SharedState,
+) -> ChannelDisplayMeta {
+    let (name, mut unit, freq, dec_places, enum_labels) =
+        resolve_channel_display_meta(channel.channel_id, shared);
+    if let Some(display_unit) = &channel.display_unit {
+        unit = display_unit.clone();
+    }
+    (name, unit, freq, dec_places, enum_labels)
+}
+
 /// Resolve channel metadata (name, unit, freq, dec_places) from a ChannelId.
 pub fn resolve_channel_meta(id: ChannelId, shared: &SharedState) -> (String, String, u16, i16) {
     let (name, unit, freq, dec_places, _) = resolve_channel_display_meta(id, shared);
@@ -126,7 +138,11 @@ pub fn create_plotted_channel(
         channel_id,
         color: CHANNEL_COLORS[color_idx % CHANNEL_COLORS.len()],
         data: Arc::new(data),
+        tile_group: color_idx,
         y_axis: YAxis::Left,
+        display_scale: 1.0,
+        display_offset: 0.0,
+        display_unit: None,
         cached_min: min,
         cached_max: max,
         cached_avg: avg,
@@ -135,20 +151,20 @@ pub fn create_plotted_channel(
 
 /// Build readout metadata for a plotted channel.
 pub fn build_plotted_channel_info(
-    channel_id: ChannelId,
-    color: eframe::egui::Color32,
-    data: Arc<Vec<f64>>,
+    channel: &PlottedChannel,
     shared: &SharedState,
 ) -> PlottedChannelInfo {
     let (name, unit, freq, dec_places, enum_labels) =
-        resolve_channel_display_meta(channel_id, shared);
+        resolve_plotted_channel_display_meta(channel, shared);
     PlottedChannelInfo {
         name,
         unit,
         freq,
         dec_places,
-        color,
-        data,
+        color: channel.color,
+        data: channel.data.clone(),
+        display_scale: channel.display_scale,
+        display_offset: channel.display_offset,
         enum_labels,
     }
 }

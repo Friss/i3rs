@@ -33,6 +33,12 @@ pub struct HistogramPanel {
     pub bin_count: usize,
     /// Whether to show per-lap breakdown (stacked bars).
     pub per_lap: bool,
+    pub lock_x_range: bool,
+    pub x_min: f64,
+    pub x_max: f64,
+    pub lock_y_range: bool,
+    pub y_min: f64,
+    pub y_headroom_pct: f64,
     cache: Option<HistogramCache>,
 }
 
@@ -44,6 +50,12 @@ impl HistogramPanel {
             channels: Vec::new(),
             bin_count: 50,
             per_lap: false,
+            lock_x_range: false,
+            x_min: 0.0,
+            x_max: 1.0,
+            lock_y_range: false,
+            y_min: 0.0,
+            y_headroom_pct: 10.0,
             cache: None,
         }
     }
@@ -96,12 +108,7 @@ impl HistogramPanel {
         for pc in &self.channels {
             shared
                 .plotted_channel_registry
-                .push(build_plotted_channel_info(
-                    pc.channel_id,
-                    pc.color,
-                    pc.data.clone(),
-                    shared,
-                ));
+                .push(build_plotted_channel_info(pc, shared));
         }
 
         // Toolbar
@@ -113,6 +120,34 @@ impl HistogramPanel {
                     .speed(1),
             );
             ui.checkbox(&mut self.per_lap, "Per-lap breakdown");
+            ui.separator();
+            ui.checkbox(&mut self.lock_x_range, "Lock X");
+            if self.lock_x_range {
+                ui.add(
+                    egui::DragValue::new(&mut self.x_min)
+                        .speed(10.0)
+                        .prefix("min "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.x_max)
+                        .speed(10.0)
+                        .prefix("max "),
+                );
+            }
+            ui.checkbox(&mut self.lock_y_range, "Lock Y");
+            if self.lock_y_range {
+                ui.add(
+                    egui::DragValue::new(&mut self.y_min)
+                        .speed(1.0)
+                        .prefix("min "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.y_headroom_pct)
+                        .speed(1.0)
+                        .range(0.0..=1000.0)
+                        .suffix("%"),
+                );
+            }
 
             // Remove channel buttons
             let mut to_remove = None;
@@ -211,7 +246,31 @@ impl HistogramPanel {
 
         let cached = self.cache.as_ref().unwrap();
 
+        let locked_x_range = if self.lock_x_range && self.x_max > self.x_min {
+            Some((self.x_min, self.x_max))
+        } else {
+            None
+        };
+        let locked_y_range = if self.lock_y_range {
+            let max_count = cached
+                .charts
+                .iter()
+                .flat_map(|(bins, _, _)| bins.counts.iter().copied())
+                .max()
+                .unwrap_or(0) as f64;
+            let headroom = max_count * (self.y_headroom_pct / 100.0);
+            Some((self.y_min, (max_count + headroom).max(self.y_min + 1.0)))
+        } else {
+            None
+        };
+
         plot.show(ui, |plot_ui| {
+            if let Some((x_min, x_max)) = locked_x_range {
+                plot_ui.set_plot_bounds_x(x_min..=x_max);
+            }
+            if let Some((y_min, y_max)) = locked_y_range {
+                plot_ui.set_plot_bounds_y(y_min..=y_max);
+            }
             for (bins, color, name) in &cached.charts {
                 let bars = bins_to_bar_chart(bins, *color, name);
                 plot_ui.bar_chart(bars);
@@ -271,7 +330,10 @@ fn bins_to_bar_chart(bins: &HistogramBins, color: egui::Color32, name: &str) -> 
         .enumerate()
         .map(|(i, &count)| {
             let center = bins.min + (i as f64 + 0.5) * bins.bin_width;
-            Bar::new(center, count as f64).width(bins.bin_width * 0.9)
+            Bar::new(center, count as f64)
+                .width(bins.bin_width * 0.9)
+                .fill(color)
+                .stroke(egui::Stroke::NONE)
         })
         .collect();
 

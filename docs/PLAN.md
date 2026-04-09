@@ -181,14 +181,17 @@ crates/
 - [x] Steering wheel angle widget/gauge
 - [x] All components synchronized with cursor/zoom
 
-### Milestone 7: Overlays
+### Milestone 7: Graph Upgrades and Overlays ✅
 
-**Goal**: Compare laps across sessions.
+**Goal**: Compare laps across sessions, see more data at once.
 
-- [ ] Overlay system: load multiple laps (same session or different .ld files) on the same graph
-- [ ] Overlay time alignment (graphical offset adjustment)
-- [ ] Lap stretching (warp time axis of one lap to align with another)
-- [ ] Graph X axis by distance driven vs time
+- [x] Allow various widgets to show on same panel (graphs, gauges, etc.)
+- [x] Multiple channels in the same graph
+- [x] Add semi-transparent backgrounds for labels on graphs
+- [x] Overlay system: load multiple laps (same session or different .ld files) on the same graph
+- [x] Overlay time alignment (graphical offset adjustment)
+- [x] Lap stretching (warp time axis of one lap to align with another)
+- [x] Graph X axis by distance driven vs time
 
 ### Milestone 8: Polish + Packaging
 
