@@ -1815,26 +1815,25 @@ impl GraphPanel {
                     .embedded_gauges
                     .iter()
                     .all(|g| g.channel.channel_id != id)
+                    && let Some(pc) = self.plotted_channels.iter().find(|pc| pc.channel_id == id)
                 {
-                    if let Some(pc) = self.plotted_channels.iter().find(|pc| pc.channel_id == id) {
-                        let style = default_style_for_name("");
-                        self.embedded_gauges.push(GaugeChannel {
-                            channel: PlottedChannel {
-                                channel_id: pc.channel_id,
-                                color: pc.color,
-                                data: pc.data.clone(),
-                                tile_group: pc.tile_group,
-                                y_axis: pc.y_axis,
-                                display_scale: pc.display_scale,
-                                display_offset: pc.display_offset,
-                                display_unit: pc.display_unit.clone(),
-                                cached_min: pc.cached_min,
-                                cached_max: pc.cached_max,
-                                cached_avg: pc.cached_avg,
-                            },
-                            style,
-                        });
-                    }
+                    let style = default_style_for_name("");
+                    self.embedded_gauges.push(GaugeChannel {
+                        channel: PlottedChannel {
+                            channel_id: pc.channel_id,
+                            color: pc.color,
+                            data: pc.data.clone(),
+                            tile_group: pc.tile_group,
+                            y_axis: pc.y_axis,
+                            display_scale: pc.display_scale,
+                            display_offset: pc.display_offset,
+                            display_unit: pc.display_unit.clone(),
+                            cached_min: pc.cached_min,
+                            cached_max: pc.cached_max,
+                            cached_avg: pc.cached_avg,
+                        },
+                        style,
+                    });
                 }
             }
         }
@@ -1953,6 +1952,12 @@ impl GraphPanel {
                     };
                     let lap = rendered.lap;
                     let origin_axis = lap_axis_origin(&source_axis.axis, &lap);
+                    let axis_offset = overlay_axis_offset(
+                        &source_axis.axis,
+                        &lap,
+                        source_axis.session_duration,
+                        overlay.manual_offset,
+                    );
                     let base_color = self
                         .plotted_channels
                         .iter()
@@ -1966,7 +1971,7 @@ impl GraphPanel {
                         origin_axis,
                         axis: source_axis.axis,
                         scale,
-                        offset: overlay.manual_offset,
+                        offset: axis_offset,
                         color: tint_color(base_color, overlay_idx + 1),
                         width: 1.35,
                     });
@@ -2211,6 +2216,7 @@ impl OverlayViewport {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_lap_series(
     plot_ui: &mut egui_plot::PlotUi,
     data: &[f64],
@@ -2273,6 +2279,21 @@ fn lap_axis_length(axis: &ActiveGraphXAxis, lap: &Lap, session_duration: f64) ->
     let start = axis.axis_value_at_time(lap.start_time);
     let end = axis.axis_value_at_time(lap.end_time.min(session_duration));
     Some((end - start).abs())
+}
+
+fn overlay_axis_offset(
+    axis: &ActiveGraphXAxis,
+    lap: &Lap,
+    session_duration: f64,
+    manual_offset: f64,
+) -> f64 {
+    match axis {
+        ActiveGraphXAxis::Time => manual_offset,
+        ActiveGraphXAxis::Distance { .. } => {
+            let shifted_time = (lap.start_time + manual_offset).clamp(0.0, session_duration);
+            axis.axis_value_at_time(shifted_time) - axis.axis_value_at_time(lap.start_time)
+        }
+    }
 }
 
 fn tint_color(color: egui::Color32, offset: usize) -> egui::Color32 {
@@ -2354,6 +2375,7 @@ fn find_distance_channel(shared: &SharedState) -> Option<DistanceAxisCache> {
         if normalized_name(&mc.name).as_str().eq_any(&distance_names)
             && let Some(data) = &mc.data
             && mc.freq > 0
+            && is_monotonic_non_decreasing(data)
         {
             return Some(DistanceAxisCache {
                 data: Arc::clone(data),
@@ -2366,6 +2388,7 @@ fn find_distance_channel(shared: &SharedState) -> Option<DistanceAxisCache> {
     for ch in &ld.channels {
         if normalized_name(&ch.name).as_str().eq_any(&distance_names)
             && let Some(data) = ld.read_channel_data(ch)
+            && is_monotonic_non_decreasing(&data)
         {
             return Some(DistanceAxisCache {
                 data: Arc::new(data),
@@ -2384,6 +2407,7 @@ fn find_distance_channel_in_ld(ld: &LdFile) -> Option<OwnedDistanceAxisCache> {
             .as_str()
             .eq_any(&distance_names)
             && let Some(data) = ld.read_channel_data(channel)
+            && is_monotonic_non_decreasing(&data)
         {
             return Some(OwnedDistanceAxisCache {
                 data,
@@ -2489,7 +2513,7 @@ fn normalized_name(name: &str) -> String {
 }
 
 fn time_from_monotonic_axis(data: &[f64], freq: u16, axis_value: f64) -> Option<f64> {
-    if freq == 0 || data.is_empty() {
+    if freq == 0 || data.is_empty() || !is_monotonic_non_decreasing(data) {
         return None;
     }
 
@@ -2517,19 +2541,34 @@ fn time_from_monotonic_axis(data: &[f64], freq: u16, axis_value: f64) -> Option<
     }
 }
 
+fn is_monotonic_non_decreasing(data: &[f64]) -> bool {
+    const EPSILON: f64 = 1e-6;
+
+    data.windows(2).all(|pair| {
+        let prev = pair[0];
+        let next = pair[1];
+        prev.is_finite() && next.is_finite() && next + EPSILON >= prev
+    })
+}
+
 trait NormalizedNameExt {
     fn eq_any(&self, values: &[&str]) -> bool;
 }
 
 impl NormalizedNameExt for str {
     fn eq_any(&self, values: &[&str]) -> bool {
-        values.iter().any(|candidate| self == *candidate)
+        values.contains(&self)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{integrate_speed_series, time_from_monotonic_axis};
+    use super::{
+        ActiveGraphXAxis, integrate_speed_series, is_monotonic_non_decreasing, overlay_axis_offset,
+        time_from_monotonic_axis,
+    };
+    use i3rs_core::Lap;
+    use std::sync::Arc;
 
     #[test]
     fn integrates_kmh_speed_into_distance() {
@@ -2543,5 +2582,29 @@ mod tests {
         let distance = vec![0.0, 10.0, 20.0, 30.0];
         let time = time_from_monotonic_axis(&distance, 2, 15.0).unwrap();
         assert!((time - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rejects_non_monotonic_distance_axis() {
+        let distance = vec![0.0, 10.0, 5.0, 15.0];
+        assert!(!is_monotonic_non_decreasing(&distance));
+        assert!(time_from_monotonic_axis(&distance, 1, 7.0).is_none());
+    }
+
+    #[test]
+    fn converts_overlay_offset_into_distance_units() {
+        let lap = Lap {
+            number: 1,
+            name: "Lap 1".into(),
+            start_time: 5.0,
+            end_time: 8.0,
+        };
+        let axis = ActiveGraphXAxis::Distance {
+            data: Arc::new(vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]),
+            freq: 1,
+        };
+
+        assert!((overlay_axis_offset(&axis, &lap, 8.0, 1.0) - 10.0).abs() < 1e-6);
+        assert!((overlay_axis_offset(&axis, &lap, 8.0, -1.0) + 10.0).abs() < 1e-6);
     }
 }

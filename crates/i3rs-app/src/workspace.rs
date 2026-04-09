@@ -347,7 +347,7 @@ pub fn save_workspace(
                         let overlays: Vec<GraphOverlayConfig> = g
                             .lap_overlays
                             .iter()
-                            .filter_map(|overlay| {
+                            .map(|overlay| {
                                 let file_path = match overlay.source {
                                     OverlaySource::MainSession => None,
                                     OverlaySource::External(session_idx) => g
@@ -355,12 +355,12 @@ pub fn save_workspace(
                                         .get(session_idx)
                                         .map(|session| session.path.to_string_lossy().to_string()),
                                 };
-                                Some(GraphOverlayConfig {
+                                GraphOverlayConfig {
                                     file_path,
                                     lap_index: overlay.lap_idx,
                                     manual_offset: overlay.manual_offset,
                                     stretch_to_reference: overlay.stretch_to_reference,
-                                })
+                                }
                             })
                             .collect();
                         let embedded_gauges: Vec<GraphGaugeConfig> = g

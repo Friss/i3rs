@@ -436,6 +436,7 @@ fn build_scatter_panel(
     (panel.x_channel.is_some() && panel.y_channel.is_some()).then_some(panel)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_histogram_panel(
     ld: &LdFile,
     shared: &mut SharedState,
