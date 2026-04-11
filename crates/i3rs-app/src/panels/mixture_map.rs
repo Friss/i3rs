@@ -152,8 +152,7 @@ impl MixtureMapPanel {
 
         let (x_name, x_unit, x_freq, x_dec_places) = resolve_channel_meta(x_ch.channel_id, shared);
         let (y_name, y_unit, y_freq, y_dec_places) = resolve_channel_meta(y_ch.channel_id, shared);
-        let (v_name, v_unit, v_freq, v_dec_places) =
-            resolve_channel_meta(v_ch.channel_id, shared);
+        let (v_name, v_unit, v_freq, v_dec_places) = resolve_channel_meta(v_ch.channel_id, shared);
 
         let target_freq = x_freq.min(y_freq).min(v_freq);
         if target_freq == 0 {

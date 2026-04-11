@@ -247,7 +247,9 @@ impl ScatterPanel {
                 clicked_cursor_time = Some(point.time);
             }
 
-            if self.lock_bounds && let Some(allowed_bounds) = allowed_bounds {
+            if self.lock_bounds
+                && let Some(allowed_bounds) = allowed_bounds
+            {
                 let clamped = clamp_plot_bounds(plot_ui.plot_bounds(), allowed_bounds);
                 plot_ui.set_plot_bounds(clamped);
             }
@@ -278,7 +280,10 @@ fn padded_bounds(points: &[PlotPoint], padding_frac: f64) -> Option<((f64, f64),
 
     let x_pad = axis_padding(x_min, x_max, padding_frac);
     let y_pad = axis_padding(y_min, y_max, padding_frac);
-    Some(((x_min - x_pad, x_max + x_pad), (y_min - y_pad, y_max + y_pad)))
+    Some((
+        (x_min - x_pad, x_max + x_pad),
+        (y_min - y_pad, y_max + y_pad),
+    ))
 }
 
 fn axis_padding(min: f64, max: f64, padding_frac: f64) -> f64 {
