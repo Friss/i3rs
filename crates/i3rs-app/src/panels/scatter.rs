@@ -14,6 +14,7 @@ use super::utils::{
 struct ScatterCache {
     fingerprint: (usize, usize, usize, usize, Option<(u64, u64)>),
     points: Vec<ScatterPoint>,
+    plot_points: Vec<PlotPoint>,
 }
 
 #[derive(Clone, Copy)]
@@ -185,15 +186,17 @@ impl ScatterPanel {
         {
             let points =
                 build_scatter_points(&x_ch.data, x_freq, &y_ch.data, y_freq, target_freq, t0, t1);
+            let plot_points = points.iter().map(|p| PlotPoint::new(p.x, p.y)).collect();
             self.cache = Some(ScatterCache {
                 fingerprint,
                 points,
+                plot_points,
             });
         }
         let points = &self.cache.as_ref().unwrap().points;
-        let plot_points: Vec<[f64; 2]> = points.iter().map(|p| [p.x, p.y]).collect();
+        let plot_points = &self.cache.as_ref().unwrap().plot_points;
 
-        let allowed_bounds = padded_bounds(&plot_points, self.bounds_padding_frac).map(
+        let allowed_bounds = padded_bounds(plot_points, self.bounds_padding_frac).map(
             |((x_min, x_max), (y_min, y_max))| {
                 PlotBounds::from_min_max([x_min, y_min], [x_max, y_max])
             },
@@ -217,7 +220,7 @@ impl ScatterPanel {
 
         plot.show(ui, |plot_ui| {
             plot_ui.points(
-                Points::new(&series_name, PlotPoints::new(plot_points.clone()))
+                Points::new(&series_name, PlotPoints::Owned(plot_points.clone()))
                     .shape(MarkerShape::Circle)
                     .filled(false)
                     .radius(point_size)
@@ -256,20 +259,17 @@ impl ScatterPanel {
     }
 }
 
-fn padded_bounds(
-    points: &[[f64; 2]],
-    padding_frac: f64,
-) -> Option<((f64, f64), (f64, f64))> {
+fn padded_bounds(points: &[PlotPoint], padding_frac: f64) -> Option<((f64, f64), (f64, f64))> {
     let mut x_min = f64::INFINITY;
     let mut x_max = f64::NEG_INFINITY;
     let mut y_min = f64::INFINITY;
     let mut y_max = f64::NEG_INFINITY;
 
-    for [x, y] in points {
-        x_min = x_min.min(*x);
-        x_max = x_max.max(*x);
-        y_min = y_min.min(*y);
-        y_max = y_max.max(*y);
+    for point in points {
+        x_min = x_min.min(point.x);
+        x_max = x_max.max(point.x);
+        y_min = y_min.min(point.y);
+        y_max = y_max.max(point.y);
     }
 
     if !x_min.is_finite() || !x_max.is_finite() || !y_min.is_finite() || !y_max.is_finite() {

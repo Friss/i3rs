@@ -347,13 +347,21 @@ fn find_first_channel(ld: &LdFile, names: &[&str]) -> Option<usize> {
 }
 
 fn find_channel_by_all_tokens(ld: &LdFile, tokens: &[&str]) -> Option<usize> {
+    let normalized_tokens: Vec<String> = tokens
+        .iter()
+        .map(|token| normalize_channel_name(token))
+        .filter(|token| !token.is_empty())
+        .collect();
+    if normalized_tokens.is_empty() {
+        return None;
+    }
+
     ld.channels.iter().position(|ch| {
         let normalized = normalize_channel_name(&ch.name);
         !normalized.is_empty()
-            && tokens.iter().all(|token| {
-                let token = normalize_channel_name(token);
-                !token.is_empty() && normalized.contains(&token)
-            })
+            && normalized_tokens
+                .iter()
+                .all(|token| normalized.contains(token))
     })
 }
 
@@ -605,12 +613,27 @@ fn build_oil_pressure_worksheet(
         _ => None,
     };
 
-    scatter.map(|panel| {
-        (
+    let graph = y_idx.and_then(|idx| {
+        let mut panel = GraphPanel::new(next_panel_id(shared), "Engine Oil Pressure");
+        if let Some(pc) = make_plotted_channel(ld, idx, CHANNEL_COLORS[0], 0) {
+            panel.plotted_channels.push(pc);
+            Some(panel)
+        } else {
+            None
+        }
+    });
+
+    match (scatter, graph) {
+        (Some(panel), _) => Some((
             "Oil Pressure".to_string(),
             DockState::new(vec![PanelTab::Scatter(panel)]),
-        )
-    })
+        )),
+        (None, Some(panel)) => Some((
+            "Oil Pressure".to_string(),
+            DockState::new(vec![PanelTab::Graph(panel)]),
+        )),
+        (None, None) => None,
+    }
 }
 
 fn build_rpm_histo_worksheet(
