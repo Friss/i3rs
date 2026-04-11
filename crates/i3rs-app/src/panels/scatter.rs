@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use eframe::egui;
-use egui_plot::{Legend, Plot, PlotPoints, Points};
+use egui_plot::{Legend, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, Points};
 
 use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState};
 
@@ -13,7 +13,14 @@ use super::utils::{
 
 struct ScatterCache {
     fingerprint: (usize, usize, usize, usize, Option<(u64, u64)>),
-    points: Vec<[f64; 2]>,
+    points: Vec<ScatterPoint>,
+}
+
+#[derive(Clone, Copy)]
+struct ScatterPoint {
+    x: f64,
+    y: f64,
+    time: f64,
 }
 
 pub struct ScatterPanel {
@@ -25,6 +32,10 @@ pub struct ScatterPanel {
     pub y_channel: Option<PlottedChannel>,
     /// Point size.
     pub point_size: f32,
+    /// Optional fractional padding applied to the data bounds on each axis.
+    pub bounds_padding_frac: f64,
+    /// When true, the plot stays fixed to its computed bounds.
+    pub lock_bounds: bool,
     cache: Option<ScatterCache>,
 }
 
@@ -36,6 +47,8 @@ impl ScatterPanel {
             x_channel: None,
             y_channel: None,
             point_size: 1.5,
+            bounds_padding_frac: 0.0,
+            lock_bounds: false,
             cache: None,
         }
     }
@@ -143,8 +156,7 @@ impl ScatterPanel {
         let plot = Plot::new(format!("scatter_{}", self.id))
             .legend(Legend::default())
             .x_axis_label(x_label)
-            .y_axis_label(y_label)
-            .data_aspect(1.0);
+            .y_axis_label(y_label);
 
         let point_size = self.point_size;
 
@@ -179,6 +191,19 @@ impl ScatterPanel {
             });
         }
         let points = &self.cache.as_ref().unwrap().points;
+        let plot_points: Vec<[f64; 2]> = points.iter().map(|p| [p.x, p.y]).collect();
+
+        let allowed_bounds = padded_bounds(&plot_points, self.bounds_padding_frac).map(
+            |((x_min, x_max), (y_min, y_max))| {
+                PlotBounds::from_min_max([x_min, y_min], [x_max, y_max])
+            },
+        );
+        let plot = if let Some(bounds) = allowed_bounds {
+            plot.default_x_bounds(bounds.min()[0], bounds.max()[0])
+                .default_y_bounds(bounds.min()[1], bounds.max()[1])
+        } else {
+            plot
+        };
 
         // Cursor highlight point
         let cursor_point = shared.cursor_time.and_then(|t| {
@@ -186,25 +211,155 @@ impl ScatterPanel {
             let y_val = interp_at_time(&y_ch.data, y_freq, t)?;
             Some([x_val, y_val])
         });
+        let mut clicked_cursor_time = None;
 
         let series_name = format!("{} vs {}", y_name, x_name);
 
         plot.show(ui, |plot_ui| {
             plot_ui.points(
-                Points::new(&series_name, PlotPoints::new(points.clone()))
+                Points::new(&series_name, PlotPoints::new(plot_points.clone()))
+                    .shape(MarkerShape::Circle)
+                    .filled(false)
                     .radius(point_size)
                     .color(color),
             );
 
             if let Some(cp) = cursor_point {
                 plot_ui.points(
-                    Points::new("Cursor", PlotPoints::new(vec![cp]))
+                    Points::new("", PlotPoints::new(vec![cp]))
                         .radius(point_size * 4.0)
                         .color(egui::Color32::WHITE),
                 );
             }
+
+            if plot_ui.response().clicked()
+                && let Some(pointer_pos) = plot_ui.response().interact_pointer_pos()
+                && let Some(point) = nearest_scatter_point(
+                    points,
+                    pointer_pos,
+                    plot_ui,
+                    point_size.max(1.0) * 2.5 + 4.0,
+                )
+            {
+                clicked_cursor_time = Some(point.time);
+            }
+
+            if self.lock_bounds && let Some(allowed_bounds) = allowed_bounds {
+                let clamped = clamp_plot_bounds(plot_ui.plot_bounds(), allowed_bounds);
+                plot_ui.set_plot_bounds(clamped);
+            }
         });
+
+        if let Some(cursor_time) = clicked_cursor_time {
+            shared.cursor_time = Some(cursor_time);
+        }
     }
+}
+
+fn padded_bounds(
+    points: &[[f64; 2]],
+    padding_frac: f64,
+) -> Option<((f64, f64), (f64, f64))> {
+    let mut x_min = f64::INFINITY;
+    let mut x_max = f64::NEG_INFINITY;
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+
+    for [x, y] in points {
+        x_min = x_min.min(*x);
+        x_max = x_max.max(*x);
+        y_min = y_min.min(*y);
+        y_max = y_max.max(*y);
+    }
+
+    if !x_min.is_finite() || !x_max.is_finite() || !y_min.is_finite() || !y_max.is_finite() {
+        return None;
+    }
+
+    let x_pad = axis_padding(x_min, x_max, padding_frac);
+    let y_pad = axis_padding(y_min, y_max, padding_frac);
+    Some(((x_min - x_pad, x_max + x_pad), (y_min - y_pad, y_max + y_pad)))
+}
+
+fn axis_padding(min: f64, max: f64, padding_frac: f64) -> f64 {
+    let span = (max - min).abs();
+    if span > f64::EPSILON {
+        span * padding_frac.max(0.0)
+    } else {
+        let anchor = max.abs().max(1.0);
+        anchor * padding_frac.max(0.0)
+    }
+}
+
+fn clamp_plot_bounds(current: PlotBounds, allowed: PlotBounds) -> PlotBounds {
+    PlotBounds::from_min_max(
+        [
+            clamp_axis_bounds(
+                current.min()[0],
+                current.max()[0],
+                allowed.min()[0],
+                allowed.max()[0],
+            )
+            .0,
+            clamp_axis_bounds(
+                current.min()[1],
+                current.max()[1],
+                allowed.min()[1],
+                allowed.max()[1],
+            )
+            .0,
+        ],
+        [
+            clamp_axis_bounds(
+                current.min()[0],
+                current.max()[0],
+                allowed.min()[0],
+                allowed.max()[0],
+            )
+            .1,
+            clamp_axis_bounds(
+                current.min()[1],
+                current.max()[1],
+                allowed.min()[1],
+                allowed.max()[1],
+            )
+            .1,
+        ],
+    )
+}
+
+fn clamp_axis_bounds(
+    current_min: f64,
+    current_max: f64,
+    allowed_min: f64,
+    allowed_max: f64,
+) -> (f64, f64) {
+    let allowed_span = allowed_max - allowed_min;
+    let current_span = current_max - current_min;
+
+    if !allowed_span.is_finite() || allowed_span <= 0.0 {
+        return (current_min, current_max);
+    }
+
+    if !current_span.is_finite() || current_span >= allowed_span {
+        return (allowed_min, allowed_max);
+    }
+
+    let mut min = current_min;
+    let mut max = current_max;
+
+    if min < allowed_min {
+        let delta = allowed_min - min;
+        min += delta;
+        max += delta;
+    }
+    if max > allowed_max {
+        let delta = max - allowed_max;
+        min -= delta;
+        max -= delta;
+    }
+
+    (min, max)
 }
 
 /// Build scatter plot points by resampling both channels to a common frequency.
@@ -216,7 +371,7 @@ fn build_scatter_points(
     target_freq: u16,
     t0: f64,
     t1: f64,
-) -> Vec<[f64; 2]> {
+) -> Vec<ScatterPoint> {
     if target_freq == 0 {
         return Vec::new();
     }
@@ -241,9 +396,28 @@ fn build_scatter_points(
         ) && x.is_finite()
             && y.is_finite()
         {
-            points.push([x, y]);
+            points.push(ScatterPoint { x, y, time: t });
         }
         i += step;
     }
     points
+}
+
+fn nearest_scatter_point(
+    points: &[ScatterPoint],
+    pointer_pos: egui::Pos2,
+    plot_ui: &egui_plot::PlotUi<'_>,
+    max_dist_px: f32,
+) -> Option<ScatterPoint> {
+    let max_dist_sq = max_dist_px * max_dist_px;
+    points
+        .iter()
+        .copied()
+        .filter_map(|point| {
+            let screen_pos = plot_ui.screen_from_plot(PlotPoint::new(point.x, point.y));
+            let dist_sq = screen_pos.distance_sq(pointer_pos);
+            (dist_sq <= max_dist_sq).then_some((point, dist_sq))
+        })
+        .min_by(|(_, da), (_, db)| da.partial_cmp(db).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(point, _)| point)
 }

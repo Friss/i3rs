@@ -312,6 +312,21 @@ fn channel_name_matches(actual: &str, candidate: &str) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(actual))
 }
 
+fn normalize_channel_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Find a channel index by name (case-insensitive, partial match with prefix).
 fn find_channel(ld: &LdFile, name: &str) -> Option<usize> {
     if let Some(idx) = ld
@@ -329,6 +344,23 @@ fn find_channel(ld: &LdFile, name: &str) -> Option<usize> {
 
 fn find_first_channel(ld: &LdFile, names: &[&str]) -> Option<usize> {
     names.iter().find_map(|name| find_channel(ld, name))
+}
+
+fn find_channel_by_all_tokens(ld: &LdFile, tokens: &[&str]) -> Option<usize> {
+    ld.channels.iter().position(|ch| {
+        let normalized = normalize_channel_name(&ch.name);
+        !normalized.is_empty()
+            && tokens.iter().all(|token| {
+                let token = normalize_channel_name(token);
+                !token.is_empty() && normalized.contains(&token)
+            })
+    })
+}
+
+fn find_first_channel_by_token_sets(ld: &LdFile, token_sets: &[&[&str]]) -> Option<usize> {
+    token_sets
+        .iter()
+        .find_map(|tokens| find_channel_by_all_tokens(ld, tokens))
 }
 
 fn next_panel_id(shared: &mut SharedState) -> u64 {
@@ -417,23 +449,6 @@ fn build_graph_worksheet(
         template.name.to_string(),
         DockState::new(vec![PanelTab::Graph(graph)]),
     ))
-}
-
-fn build_scatter_panel(
-    ld: &LdFile,
-    shared: &mut SharedState,
-    title: &str,
-    x_names: &[&str],
-    y_names: &[&str],
-    point_size: f32,
-) -> Option<ScatterPanel> {
-    let x_idx = find_first_channel(ld, x_names)?;
-    let y_idx = find_first_channel(ld, y_names)?;
-    let mut panel = ScatterPanel::new(next_panel_id(shared), title);
-    panel.point_size = point_size;
-    panel.x_channel = make_plotted_channel(ld, x_idx, CHANNEL_COLORS[0], 0);
-    panel.y_channel = make_plotted_channel(ld, y_idx, CHANNEL_COLORS[4], 1);
-    (panel.x_channel.is_some() && panel.y_channel.is_some()).then_some(panel)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -536,45 +551,66 @@ fn build_oil_pressure_worksheet(
     ld: &LdFile,
     shared: &mut SharedState,
 ) -> Option<(String, DockState<PanelTab>)> {
-    let scatter = build_scatter_panel(
+    let x_idx = find_first_channel(
         ld,
-        shared,
-        "Engine Oil Pressure",
-        &["CP Lotus ESP Lateral Acceleration", "G Force Lat"],
-        &["Engine Oil Pressure"],
-        1.75,
-    );
-    let graph = build_graph_panel(
+        &[
+            "CP Lotus ESP Lateral Acceleration",
+            "G Force Lat",
+            "Lateral Acceleration",
+            "Lat Accel",
+            "ECU Acceleration Y",
+        ],
+    )
+    .or_else(|| {
+        find_first_channel_by_token_sets(
+            ld,
+            &[
+                &["lateral", "accel"],
+                &["lat", "accel"],
+                &["g", "force", "lat"],
+                &["acceleration", "y"],
+            ],
+        )
+    });
+    let y_idx = find_first_channel(
         ld,
-        shared,
-        &GraphWorksheetTemplate {
-            name: "Engine Oil Pressure",
-            channels: &["Engine Oil Pressure"],
-            tiled_groups: &[],
-            embedded_gauges: &[],
-        },
-    );
+        &[
+            "Engine Oil Pressure",
+            "Oil Pressure",
+            "Eng Oil Pres",
+            "Oil Pres",
+        ],
+    )
+    .or_else(|| {
+        find_first_channel_by_token_sets(
+            ld,
+            &[
+                &["engine", "oil", "pres"],
+                &["oil", "pressure"],
+                &["oil", "pres"],
+            ],
+        )
+    });
 
-    match (scatter, graph) {
-        (None, None) => None,
-        (Some(scatter_panel), None) => Some((
-            "Oil Pressure".to_string(),
-            DockState::new(vec![PanelTab::Scatter(scatter_panel)]),
-        )),
-        (None, Some(graph_panel)) => Some((
-            "Oil Pressure".to_string(),
-            DockState::new(vec![PanelTab::Graph(graph_panel)]),
-        )),
-        (Some(scatter_panel), Some(graph_panel)) => {
-            let mut dock = DockState::new(vec![PanelTab::Scatter(scatter_panel)]);
-            dock.main_surface_mut().split_below(
-                NodeIndex::root(),
-                0.82,
-                vec![PanelTab::Graph(graph_panel)],
-            );
-            Some(("Oil Pressure".to_string(), dock))
+    let scatter = match (x_idx, y_idx) {
+        (Some(x_idx), Some(y_idx)) => {
+            let mut panel = ScatterPanel::new(next_panel_id(shared), "Engine Oil Pressure");
+            panel.point_size = 1.75;
+            panel.bounds_padding_frac = 0.10;
+            panel.lock_bounds = true;
+            panel.x_channel = make_plotted_channel(ld, x_idx, CHANNEL_COLORS[0], 0);
+            panel.y_channel = make_plotted_channel(ld, y_idx, CHANNEL_COLORS[4], 1);
+            (panel.x_channel.is_some() && panel.y_channel.is_some()).then_some(panel)
         }
-    }
+        _ => None,
+    };
+
+    scatter.map(|panel| {
+        (
+            "Oil Pressure".to_string(),
+            DockState::new(vec![PanelTab::Scatter(panel)]),
+        )
+    })
 }
 
 fn build_rpm_histo_worksheet(
