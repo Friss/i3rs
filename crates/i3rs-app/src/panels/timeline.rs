@@ -1,12 +1,11 @@
 //! Timeline overview: a thin strip showing the full session with a draggable zoom window.
 
 use eframe::egui;
-use i3rs_core::downsample_minmax;
 
-use crate::state::SharedState;
+use crate::state::{CHANNEL_COLORS, SharedState};
 
-const TIMELINE_HEIGHT: f32 = 50.0;
-const HANDLE_WIDTH: f32 = 6.0;
+const TIMELINE_HEIGHT: f32 = 25.0;
+const HANDLE_WIDTH: f32 = 10.0;
 
 /// Which part of the zoom window is being dragged.
 #[derive(Clone, Copy, PartialEq)]
@@ -55,20 +54,7 @@ impl TimelinePanel {
         // Background
         painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 30, 35));
 
-        // Draw miniature waveform if we have a plotted channel
-        self.draw_waveform(&painter, rect, shared, duration);
-
-        // Draw lap markers
-        for lap in &shared.laps {
-            let x = rect.left() + (lap.start_time / duration) as f32 * rect.width();
-            painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_premultiplied(200, 200, 200, 40),
-                ),
-            );
-        }
+        self.draw_lap_blocks(&painter, rect, shared, duration);
 
         // Zoom window rectangle
         let zoom_left = rect.left() + (zoom.0 / duration) as f32 * rect.width();
@@ -90,6 +76,18 @@ impl TimelinePanel {
             egui::StrokeKind::Outside,
         );
 
+        let left_handle = egui::Rect::from_center_size(
+            egui::pos2(zoom_left, rect.center().y),
+            egui::vec2(HANDLE_WIDTH, rect.height()),
+        );
+        let right_handle = egui::Rect::from_center_size(
+            egui::pos2(zoom_right, rect.center().y),
+            egui::vec2(HANDLE_WIDTH, rect.height()),
+        );
+        let handle_color = egui::Color32::from_rgba_premultiplied(120, 190, 255, 110);
+        painter.rect_filled(left_handle, 0.0, handle_color);
+        painter.rect_filled(right_handle, 0.0, handle_color);
+
         // Draw cursor position
         if let Some(t) = shared.cursor_time {
             let cx = rect.left() + (t / duration) as f32 * rect.width();
@@ -102,8 +100,12 @@ impl TimelinePanel {
         // Handle drag interactions
         self.handle_drag(&response, rect, zoom_rect, shared, duration);
 
-        // Set cursor icon based on hover position
+        // Hovering the timeline should move the shared cursor, like the main graphs.
         if let Some(pos) = response.hover_pos() {
+            let hover_time =
+                (((pos.x - rect.left()) / rect.width()) as f64 * duration).clamp(0.0, duration);
+            shared.cursor_time = Some(hover_time);
+
             let target = self.hit_test(pos, zoom_rect);
             match target {
                 Some(DragTarget::LeftEdge) | Some(DragTarget::RightEdge) => {
@@ -119,79 +121,73 @@ impl TimelinePanel {
         true
     }
 
-    fn draw_waveform(
+    fn draw_lap_blocks(
         &self,
         painter: &egui::Painter,
         rect: egui::Rect,
         shared: &SharedState,
         duration: f64,
     ) {
-        // Find first available channel data from any graph panel's plotted channels.
-        // We access through shared state — for now, use the first channel we can find.
-        let ld = match &shared.ld_file {
-            Some(ld) => ld,
-            None => return,
-        };
-
-        // Try to find a good representative channel (prefer something with "Speed" or "RPM")
-        let representative_ch = ld
-            .channels
-            .iter()
-            .find(|ch| {
-                let name_lower = ch.name.to_lowercase();
-                name_lower.contains("speed") || name_lower.contains("rpm")
-            })
-            .or_else(|| ld.channels.first());
-
-        let ch = match representative_ch {
-            Some(ch) => ch,
-            None => return,
-        };
-
-        let data = match ld.read_channel_data(ch) {
-            Some(d) => d,
-            None => return,
-        };
-
-        if data.is_empty() {
-            return;
-        }
-
-        let target_width = rect.width() as usize;
-        let downsampled = downsample_minmax(&data, ch.freq, 0, target_width);
-
-        if downsampled.is_empty() {
-            return;
-        }
-
-        // Find value range for normalization
-        let mut v_min = f64::MAX;
-        let mut v_max = f64::MIN;
-        for p in &downsampled {
-            v_min = v_min.min(p.min);
-            v_max = v_max.max(p.max);
-        }
-        if (v_max - v_min).abs() < 1e-10 {
-            return;
-        }
-
-        let color = egui::Color32::from_rgba_premultiplied(100, 180, 255, 80);
-        let margin = 4.0;
-        let draw_height = rect.height() - margin * 2.0;
-
-        for p in &downsampled {
-            let x = rect.left() + (p.time / duration) as f32 * rect.width();
-            let y_top = rect.top()
-                + margin
-                + (1.0 - ((p.max - v_min) / (v_max - v_min)) as f32) * draw_height;
-            let y_bot = rect.top()
-                + margin
-                + (1.0 - ((p.min - v_min) / (v_max - v_min)) as f32) * draw_height;
-            painter.line_segment(
-                [egui::pos2(x, y_top), egui::pos2(x, y_bot.max(y_top + 0.5))],
-                egui::Stroke::new(1.0, color),
+        if shared.laps.is_empty() {
+            painter.rect_filled(
+                rect.shrink2(egui::vec2(1.0, 2.0)),
+                0.0,
+                egui::Color32::from_rgb(52, 84, 128),
             );
+            return;
         }
+
+        let inner_rect = rect.shrink2(egui::vec2(1.0, 2.0));
+        for (i, lap) in shared.laps.iter().enumerate() {
+            let left = inner_rect.left() + (lap.start_time / duration) as f32 * inner_rect.width();
+            let right = inner_rect.left() + (lap.end_time / duration) as f32 * inner_rect.width();
+            let lap_rect =
+                egui::Rect::from_x_y_ranges(left..=right.max(left + 1.0), inner_rect.y_range());
+            let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()].gamma_multiply(0.75);
+            painter.rect_filled(lap_rect, 0.0, color);
+
+            if let Some(label) = self.label_for_lap(lap.name.as_str(), lap_rect.width()) {
+                let label_painter = painter.with_clip_rect(lap_rect.shrink2(egui::vec2(2.0, 0.0)));
+                label_painter.text(
+                    lap_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    label,
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_rgba_premultiplied(255, 255, 255, 215),
+                );
+            }
+
+            if i > 0 {
+                painter.line_segment(
+                    [
+                        egui::pos2(left, inner_rect.top()),
+                        egui::pos2(left, inner_rect.bottom()),
+                    ],
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 60),
+                    ),
+                );
+            }
+        }
+    }
+
+    fn label_for_lap(&self, name: &str, width: f32) -> Option<String> {
+        if width < 18.0 {
+            return None;
+        }
+
+        if width < 34.0 {
+            return Some(match name {
+                "Out Lap" => "OUT".to_owned(),
+                "In Lap" => "IN".to_owned(),
+                _ => name
+                    .strip_prefix("Lap ")
+                    .map_or_else(|| name.to_owned(), str::to_owned),
+            });
+        }
+
+        Some(name.to_owned())
     }
 
     fn hit_test(&self, pos: egui::Pos2, zoom_rect: egui::Rect) -> Option<DragTarget> {

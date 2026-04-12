@@ -185,6 +185,10 @@ pub struct ScatterPanelConfig {
     pub y_is_math: bool,
     #[serde(default = "default_scatter_point_size")]
     pub point_size: f32,
+    #[serde(default)]
+    pub bounds_padding_frac: f64,
+    #[serde(default)]
+    pub lock_bounds: bool,
 }
 
 fn default_scatter_point_size() -> f32 {
@@ -475,6 +479,8 @@ pub fn save_workspace(
                             })
                             .unwrap_or(false),
                         point_size: s.point_size,
+                        bounds_padding_frac: s.bounds_padding_frac,
+                        lock_bounds: s.lock_bounds,
                     }),
                     PanelTab::Fft(f) => PanelConfig::Fft(FftPanelConfig {
                         id: f.id,
@@ -761,6 +767,8 @@ pub fn load_workspace(
                     PanelConfig::Scatter(sc) => {
                         let mut scatter = ScatterPanel::new(sc.id, &sc.title);
                         scatter.point_size = sc.point_size;
+                        scatter.bounds_padding_frac = sc.bounds_padding_frac;
+                        scatter.lock_bounds = sc.lock_bounds;
                         if let Some(channel_name) = &sc.x_channel_name {
                             scatter.x_channel = resolve_saved_plotted_channel(
                                 shared,

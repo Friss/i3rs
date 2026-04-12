@@ -150,11 +150,10 @@ impl MixtureMapPanel {
             return;
         };
 
-        let (x_name, x_unit, x_freq, _) = resolve_channel_meta(x_ch.channel_id, shared);
-        let (y_name, y_unit, y_freq, _) = resolve_channel_meta(y_ch.channel_id, shared);
-        let (v_name, _, v_freq, _) = resolve_channel_meta(v_ch.channel_id, shared);
+        let (x_name, x_unit, x_freq, x_dec_places) = resolve_channel_meta(x_ch.channel_id, shared);
+        let (y_name, y_unit, y_freq, y_dec_places) = resolve_channel_meta(y_ch.channel_id, shared);
+        let (v_name, v_unit, v_freq, v_dec_places) = resolve_channel_meta(v_ch.channel_id, shared);
 
-        // Compute the heatmap
         let target_freq = x_freq.min(y_freq).min(v_freq);
         if target_freq == 0 {
             ui.label("Channel frequency is 0");
@@ -179,6 +178,7 @@ impl MixtureMapPanel {
             .as_ref()
             .is_none_or(|c| c.fingerprint != fingerprint)
         {
+            let y_axis = axis_config(&y_name, &y_unit, y_dec_places);
             let heatmap = compute_heatmap(
                 &x_ch.data,
                 x_freq,
@@ -190,6 +190,7 @@ impl MixtureMapPanel {
                 t0,
                 t1,
                 self.bins,
+                y_axis.fixed_range,
             );
             self.cache = Some(HeatmapCache {
                 fingerprint,
@@ -198,7 +199,9 @@ impl MixtureMapPanel {
         }
         let heatmap = &self.cache.as_ref().unwrap().heatmap;
 
-        // Draw the heatmap
+        let x_axis = axis_config(&x_name, &x_unit, x_dec_places);
+        let y_axis = axis_config(&y_name, &y_unit, y_dec_places);
+
         let available = ui.available_rect_before_wrap();
         let margin = 50.0;
         let plot_rect = egui::Rect::from_min_max(
@@ -210,13 +213,14 @@ impl MixtureMapPanel {
             return;
         }
 
-        let (_response, painter) = ui.allocate_painter(
+        let (response, painter) = ui.allocate_painter(
             egui::vec2(available.width(), available.height()),
-            egui::Sense::hover(),
+            egui::Sense::click(),
         );
 
         let cell_w = plot_rect.width() / self.bins as f32;
         let cell_h = plot_rect.height() / self.bins as f32;
+        let legend_steps = legend_step_count(&v_unit, heatmap.value_range);
 
         for yi in 0..self.bins {
             for xi in 0..self.bins {
@@ -231,7 +235,8 @@ impl MixtureMapPanel {
                     0.5
                 };
 
-                let color = heat_color(frac);
+                let color = heat_color(step_fraction(frac, legend_steps))
+                    .gamma_multiply(occupancy_alpha(cell.count, heatmap.max_count));
                 let cell_rect = egui::Rect::from_min_size(
                     egui::pos2(
                         plot_rect.min.x + xi as f32 * cell_w,
@@ -243,7 +248,6 @@ impl MixtureMapPanel {
             }
         }
 
-        // Outline
         painter.rect_stroke(
             plot_rect,
             0.0,
@@ -251,35 +255,32 @@ impl MixtureMapPanel {
             egui::StrokeKind::Outside,
         );
 
-        // X axis labels
-        for i in 0..=4 {
-            let frac = i as f64 / 4.0;
+        for i in 0..x_axis.tick_count {
+            let frac = axis_fraction(i, x_axis.tick_count);
             let val = heatmap.x_min + frac * (heatmap.x_max - heatmap.x_min);
             let x = plot_rect.min.x + frac as f32 * plot_rect.width();
             painter.text(
                 egui::pos2(x, plot_rect.max.y + 4.0),
                 egui::Align2::CENTER_TOP,
-                format!("{:.0}", val),
+                format_axis_value(val, x_axis.dec_places),
                 egui::FontId::proportional(10.0),
                 egui::Color32::GRAY,
             );
         }
 
-        // Y axis labels
-        for i in 0..=4 {
-            let frac = i as f64 / 4.0;
+        for i in 0..y_axis.tick_count {
+            let frac = axis_fraction(i, y_axis.tick_count);
             let val = heatmap.y_min + frac * (heatmap.y_max - heatmap.y_min);
             let y = plot_rect.max.y - frac as f32 * plot_rect.height();
             painter.text(
                 egui::pos2(plot_rect.min.x - 4.0, y),
                 egui::Align2::RIGHT_CENTER,
-                format!("{:.0}", val),
+                format_axis_value(val, y_axis.dec_places),
                 egui::FontId::proportional(10.0),
                 egui::Color32::GRAY,
             );
         }
 
-        // Axis labels
         let x_label = if x_unit.is_empty() {
             x_name
         } else {
@@ -298,9 +299,7 @@ impl MixtureMapPanel {
         } else {
             format!("{} ({})", y_name, y_unit)
         };
-        // Vertical Y label
         let y_label_pos = egui::pos2(available.min.x + 8.0, plot_rect.center().y);
-        // Draw chars vertically
         let char_height = 13.0;
         let total_h = y_label.len() as f32 * char_height;
         let start_y = y_label_pos.y - total_h / 2.0;
@@ -314,60 +313,59 @@ impl MixtureMapPanel {
             );
         }
 
-        // Color scale legend
         let legend_x = plot_rect.max.x + 5.0;
-        let legend_h = plot_rect.height().min(150.0);
+        let legend_h = plot_rect.height().min(165.0);
         let legend_top = plot_rect.center().y - legend_h / 2.0;
-        let legend_w = 10.0;
-        for i in 0..20 {
-            let frac = i as f32 / 19.0;
-            let color = heat_color(1.0 - frac); // top = high
-            let y = legend_top + frac * legend_h;
+        let legend_w = 12.0;
+        for i in 0..legend_steps {
+            let frac = 1.0 - i as f32 / (legend_steps.saturating_sub(1).max(1)) as f32;
+            let color = heat_color(frac);
+            let y = legend_top + i as f32 * legend_h / legend_steps as f32;
             let r = egui::Rect::from_min_size(
                 egui::pos2(legend_x, y),
-                egui::vec2(legend_w, legend_h / 20.0 + 1.0),
+                egui::vec2(legend_w, legend_h / legend_steps as f32 + 1.0),
             );
             painter.rect_filled(r, 0.0, color);
+            let value = heatmap.value_min + heatmap.value_range * frac as f64;
+            painter.text(
+                egui::pos2(legend_x + legend_w + 4.0, y + 1.0),
+                egui::Align2::LEFT_TOP,
+                format_axis_value(value, v_dec_places),
+                egui::FontId::proportional(9.0),
+                egui::Color32::GRAY,
+            );
         }
-        painter.text(
-            egui::pos2(legend_x + legend_w + 2.0, legend_top),
-            egui::Align2::LEFT_TOP,
-            format!("{:.1}", heatmap.value_min + heatmap.value_range),
-            egui::FontId::proportional(9.0),
-            egui::Color32::GRAY,
-        );
-        painter.text(
-            egui::pos2(legend_x + legend_w + 2.0, legend_top + legend_h),
-            egui::Align2::LEFT_BOTTOM,
-            format!("{:.1}", heatmap.value_min),
-            egui::FontId::proportional(9.0),
-            egui::Color32::GRAY,
-        );
         painter.text(
             egui::pos2(legend_x + legend_w / 2.0, legend_top - 4.0),
             egui::Align2::CENTER_BOTTOM,
-            &v_name,
+            legend_title(&v_name, &v_unit),
             egui::FontId::proportional(10.0),
             egui::Color32::LIGHT_GRAY,
         );
 
-        // Cursor highlight
+        if response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+            && plot_rect.contains(pos)
+        {
+            let xi = (((pos.x - plot_rect.left()) / plot_rect.width()) * self.bins as f32)
+                .floor()
+                .clamp(0.0, self.bins.saturating_sub(1) as f32) as usize;
+            let yi = (((plot_rect.bottom() - pos.y) / plot_rect.height()) * self.bins as f32)
+                .floor()
+                .clamp(0.0, self.bins.saturating_sub(1) as f32) as usize;
+            if let Some(time) = heatmap.cells[yi * self.bins + xi].representative_time {
+                shared.cursor_time = Some(time);
+            }
+        }
+
         if let Some(cursor_time) = shared.cursor_time
             && let (Some(x_val), Some(y_val)) = (
                 interp_at_time(&x_ch.data, x_freq, cursor_time),
                 interp_at_time(&y_ch.data, y_freq, cursor_time),
             )
         {
-            let x_frac = if heatmap.x_max > heatmap.x_min {
-                ((x_val - heatmap.x_min) / (heatmap.x_max - heatmap.x_min)).clamp(0.0, 1.0)
-            } else {
-                0.5
-            };
-            let y_frac = if heatmap.y_max > heatmap.y_min {
-                ((y_val - heatmap.y_min) / (heatmap.y_max - heatmap.y_min)).clamp(0.0, 1.0)
-            } else {
-                0.5
-            };
+            let x_frac = normalized_fraction(x_val, heatmap.x_min, heatmap.x_max);
+            let y_frac = normalized_fraction(y_val, heatmap.y_min, heatmap.y_max);
             let cx = plot_rect.min.x + x_frac as f32 * plot_rect.width();
             let cy = plot_rect.max.y - y_frac as f32 * plot_rect.height();
             painter.circle_stroke(
@@ -382,6 +380,8 @@ impl MixtureMapPanel {
 struct HeatmapCell {
     sum: f64,
     count: u32,
+    representative_time: Option<f64>,
+    representative_dist2: f64,
 }
 
 struct Heatmap {
@@ -392,6 +392,13 @@ struct Heatmap {
     y_max: f64,
     value_min: f64,
     value_range: f64,
+    max_count: u32,
+}
+
+struct AxisConfig {
+    fixed_range: Option<(f64, f64)>,
+    tick_count: usize,
+    dec_places: i16,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -406,11 +413,20 @@ fn compute_heatmap(
     t0: f64,
     t1: f64,
     bins: usize,
+    y_fixed_range: Option<(f64, f64)>,
 ) -> Heatmap {
+    let mut cells: Vec<HeatmapCell> = (0..bins * bins)
+        .map(|_| HeatmapCell {
+            sum: 0.0,
+            count: 0,
+            representative_time: None,
+            representative_dist2: f64::INFINITY,
+        })
+        .collect();
+
     let start = (t0 * target_freq as f64).floor() as usize;
     let end = (t1 * target_freq as f64).ceil() as usize;
 
-    // First pass: collect all valid (x, y, v) triples and find ranges
     let mut triples = Vec::new();
     let mut x_min = f64::MAX;
     let mut x_max = f64::MIN;
@@ -431,6 +447,12 @@ fn compute_heatmap(
             && y.is_finite()
             && v.is_finite()
         {
+            if let Some((fixed_y_min, fixed_y_max)) = y_fixed_range
+                && (y < fixed_y_min || y > fixed_y_max)
+            {
+                i += step;
+                continue;
+            }
             if x < x_min {
                 x_min = x;
             }
@@ -449,26 +471,48 @@ fn compute_heatmap(
             if v > v_max {
                 v_max = v;
             }
-            triples.push((x, y, v));
+            triples.push((x, y, v, t));
         }
         i += step;
     }
 
-    let mut cells: Vec<HeatmapCell> = (0..bins * bins)
-        .map(|_| HeatmapCell { sum: 0.0, count: 0 })
-        .collect();
+    if triples.is_empty() {
+        let (fixed_y_min, fixed_y_max) = y_fixed_range.unwrap_or((0.0, 1.0));
+        return Heatmap {
+            cells,
+            x_min: 0.0,
+            x_max: 1.0,
+            y_min: fixed_y_min,
+            y_max: fixed_y_max,
+            value_min: 0.0,
+            value_range: 1.0,
+            max_count: 0,
+        };
+    }
 
-    let x_range = x_max - x_min;
-    let y_range = y_max - y_min;
+    if let Some((fixed_y_min, fixed_y_max)) = y_fixed_range {
+        y_min = fixed_y_min;
+        y_max = fixed_y_max;
+    }
+
+    let x_range = (x_max - x_min).max(f64::EPSILON);
+    let y_range = (y_max - y_min).max(f64::EPSILON);
     let v_range = v_max - v_min;
+    let mut max_count = 0;
 
-    if x_range > 0.0 && y_range > 0.0 {
-        for (x, y, v) in &triples {
-            let xi = (((x - x_min) / x_range * bins as f64) as usize).min(bins - 1);
-            let yi = (((y - y_min) / y_range * bins as f64) as usize).min(bins - 1);
-            let cell = &mut cells[yi * bins + xi];
-            cell.sum += v;
-            cell.count += 1;
+    for (x, y, v, t) in &triples {
+        let xi = (((x - x_min) / x_range * bins as f64) as usize).min(bins - 1);
+        let yi = (((y - y_min) / y_range * bins as f64).clamp(0.0, bins as f64 - 1.0)) as usize;
+        let cell = &mut cells[yi * bins + xi];
+        cell.sum += v;
+        cell.count += 1;
+        max_count = max_count.max(cell.count);
+        let cx = x_min + (xi as f64 + 0.5) / bins as f64 * x_range;
+        let cy = y_min + (yi as f64 + 0.5) / bins as f64 * y_range;
+        let dist2 = (x - cx).powi(2) + (y - cy).powi(2);
+        if dist2 < cell.representative_dist2 {
+            cell.representative_dist2 = dist2;
+            cell.representative_time = Some(*t);
         }
     }
 
@@ -480,7 +524,77 @@ fn compute_heatmap(
         y_max,
         value_min: v_min,
         value_range: v_range,
+        max_count,
     }
+}
+
+fn axis_config(name: &str, unit: &str, dec_places: i16) -> AxisConfig {
+    let lower_name = name.to_ascii_lowercase();
+    let lower_unit = unit.to_ascii_lowercase();
+    if lower_name.contains("lambda") || lower_unit == "la" {
+        return AxisConfig {
+            fixed_range: Some((0.7, 1.2)),
+            tick_count: 6,
+            dec_places: dec_places.max(2),
+        };
+    }
+
+    AxisConfig {
+        fixed_range: None,
+        tick_count: 5,
+        dec_places,
+    }
+}
+
+fn axis_fraction(index: usize, tick_count: usize) -> f64 {
+    if tick_count <= 1 {
+        0.0
+    } else {
+        index as f64 / (tick_count - 1) as f64
+    }
+}
+
+fn format_axis_value(value: f64, dec_places: i16) -> String {
+    let precision = dec_places.clamp(0, 4) as usize;
+    format!("{value:.precision$}")
+}
+
+fn legend_title(name: &str, unit: &str) -> String {
+    if unit.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} ({unit})")
+    }
+}
+
+fn legend_step_count(unit: &str, value_range: f64) -> usize {
+    if unit == "%" && value_range >= 20.0 {
+        11
+    } else {
+        9
+    }
+}
+
+fn step_fraction(frac: f32, steps: usize) -> f32 {
+    let steps = steps.max(2);
+    let scaled = (frac.clamp(0.0, 1.0) * (steps - 1) as f32).round();
+    scaled / (steps - 1) as f32
+}
+
+fn normalized_fraction(value: f64, min: f64, max: f64) -> f64 {
+    if max > min {
+        ((value - min) / (max - min)).clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
+}
+
+fn occupancy_alpha(count: u32, max_count: u32) -> f32 {
+    if count == 0 || max_count == 0 {
+        return 0.0;
+    }
+    let density = (count as f32 / max_count as f32).sqrt();
+    0.2 + 0.8 * density
 }
 
 /// Map a 0.0–1.0 fraction to a blue→cyan→green→yellow→red heat color.
