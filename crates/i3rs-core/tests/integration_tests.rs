@@ -20,6 +20,14 @@ fn open_ld_file() {
 }
 
 #[test]
+fn open_ld_file_from_bytes() {
+    let bytes = std::fs::read(TEST_LD).expect("failed to read .ld test data");
+    let ld = LdFile::from_bytes(bytes).expect("failed to parse .ld bytes");
+    assert_eq!(ld.file_size(), 4_998_791);
+    assert_eq!(ld.channels.len(), 199);
+}
+
+#[test]
 fn session_metadata() {
     let ld = LdFile::open(TEST_LD).unwrap();
     let s = &ld.session;
@@ -83,6 +91,23 @@ fn read_channel_data_returns_correct_sample_count() {
             ch.name
         );
     }
+}
+
+#[test]
+fn from_bytes_matches_open_for_channel_data() {
+    let bytes = std::fs::read(TEST_LD).expect("failed to read .ld test data");
+    let from_path = LdFile::open(TEST_LD).unwrap();
+    let from_bytes = LdFile::from_bytes(bytes).unwrap();
+    let ch_idx = 0;
+
+    let path_data = from_path
+        .read_channel_data(&from_path.channels[ch_idx])
+        .unwrap();
+    let bytes_data = from_bytes
+        .read_channel_data(&from_bytes.channels[ch_idx])
+        .unwrap();
+
+    assert_eq!(path_data, bytes_data);
 }
 
 #[test]

@@ -2,7 +2,9 @@
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState};
-use i3rs_core::{ExportChannel, LdFile, detect_laps, export_csv, find_ldx_for_ld};
+use i3rs_core::{ExportChannel, LdFile, LdxFile, detect_laps, export_csv, find_ldx_for_ld};
+#[cfg(target_arch = "wasm32")]
+use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -48,6 +50,13 @@ struct SessionSummary {
     duration_secs: f64,
     channel_count: usize,
     lap_count: usize,
+}
+
+#[derive(serde::Serialize)]
+pub struct LoadedSessionSummary {
+    pub file_name: String,
+    pub channel_count: usize,
+    pub lap_count: usize,
 }
 
 fn is_startup_default_layout(worksheets: &[Worksheet]) -> bool {
@@ -115,10 +124,17 @@ pub struct App {
     show_session_details: bool,
     compare_session_path: Option<PathBuf>,
     session_summary_cache: HashMap<PathBuf, SessionSummary>,
+    load_error: Option<String>,
+    #[cfg(target_arch = "wasm32")]
+    web_load_tx: std::sync::mpsc::Sender<crate::platform::WebLoadEvent>,
+    #[cfg(target_arch = "wasm32")]
+    web_load_rx: std::sync::mpsc::Receiver<crate::platform::WebLoadEvent>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let (web_load_tx, web_load_rx) = crate::platform::web_load_channel();
         let preferences = crate::preferences::load_preferences();
         let mut shared = SharedState::new();
         shared.channel_preferences = preferences.channel_preferences.clone();
@@ -146,6 +162,11 @@ impl App {
             show_session_details: false,
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
+            load_error: None,
+            #[cfg(target_arch = "wasm32")]
+            web_load_tx,
+            #[cfg(target_arch = "wasm32")]
+            web_load_rx,
         }
     }
 
@@ -156,70 +177,137 @@ impl App {
     }
 
     pub fn open_file(&mut self, path: PathBuf) {
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ldx = find_ldx_for_ld(&path);
         match LdFile::open(&path) {
-            Ok(ld) => {
-                self.shared.file_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+            Ok(ld) => self.load_session(ld, file_name, Some(path), ldx),
+            Err(e) => self.load_error = Some(format!("Failed to open file: {e}")),
+        }
+    }
 
-                self.shared.ldx = find_ldx_for_ld(&path);
+    pub fn open_bytes(
+        &mut self,
+        file_name: String,
+        bytes: Vec<u8>,
+        ldx: Option<LdxFile>,
+    ) -> Result<(), String> {
+        let ld = LdFile::from_bytes(bytes)?;
+        self.load_session(ld, file_name, None, ldx);
+        Ok(())
+    }
 
-                let ld = Arc::new(ld);
-                self.shared.laps = detect_laps(&ld);
-                self.shared.data_duration = Some(ld.duration_secs());
-                self.shared.ld_file = Some(ld);
-                self.shared.ld_path = Some(path);
-                self.shared.selected_lap = None;
-                self.shared.zoom_range = None;
-                self.shared.invalidate_derived_caches();
+    fn load_session(
+        &mut self,
+        ld: LdFile,
+        file_name: String,
+        ld_path: Option<PathBuf>,
+        ldx: Option<LdxFile>,
+    ) {
+        self.load_error = None;
+        self.shared.file_name = file_name;
+        self.shared.ldx = ldx;
 
-                // Clear all panels' channels and caches across all worksheets
-                for ws in &mut self.worksheets {
-                    for (_path, tab) in ws.dock_state.iter_all_tabs_mut() {
-                        match tab {
-                            PanelTab::Graph(g) => g.reset_for_new_main_session(),
-                            PanelTab::TrackMap(t) => t.clear_cache(),
-                            PanelTab::Histogram(h) => h.clear_channels(),
-                            PanelTab::Scatter(s) => s.clear_channels(),
-                            PanelTab::Fft(f) => f.clear_channels(),
-                            PanelTab::Gauge(g) => g.clear_channels(),
-                            PanelTab::MixtureMap(m) => m.clear_channels(),
-                            _ => {}
-                        }
-                    }
-                }
-                for tm in &mut self.popped_out_track_maps {
-                    tm.clear_cache();
-                }
+        let ld = Arc::new(ld);
+        self.shared.laps = detect_laps(&ld);
+        self.shared.data_duration = Some(ld.duration_secs());
+        self.shared.ld_file = Some(ld);
+        self.shared.ld_path = ld_path;
+        self.shared.selected_lap = None;
+        self.shared.zoom_range = None;
+        self.shared.invalidate_derived_caches();
 
-                // Re-evaluate math channels with new file data
-                math_editor::evaluate_all_math_channels(&mut self.shared);
-
-                // Auto-populate default worksheets if current layout is empty
-                let is_empty_default = is_startup_default_layout(&self.worksheets);
-
-                if is_empty_default {
-                    let ld_ref = self.shared.ld_file.clone().unwrap();
-                    let defaults = crate::default_layouts::create_default_worksheets(
-                        &ld_ref,
-                        &mut self.shared,
-                    );
-                    if !defaults.is_empty() {
-                        self.worksheets = defaults
-                            .into_iter()
-                            .map(|(name, dock_state)| Worksheet { name, dock_state })
-                            .collect();
-                        self.active_worksheet = 0;
-                    }
-                }
-
-                if let Some(path) = self.shared.ld_path.clone() {
-                    self.register_project_session(&path);
+        // Clear all panels' channels and caches across all worksheets
+        for ws in &mut self.worksheets {
+            for (_path, tab) in ws.dock_state.iter_all_tabs_mut() {
+                match tab {
+                    PanelTab::Graph(g) => g.reset_for_new_main_session(),
+                    PanelTab::TrackMap(t) => t.clear_cache(),
+                    PanelTab::Histogram(h) => h.clear_channels(),
+                    PanelTab::Scatter(s) => s.clear_channels(),
+                    PanelTab::Fft(f) => f.clear_channels(),
+                    PanelTab::Gauge(g) => g.clear_channels(),
+                    PanelTab::MixtureMap(m) => m.clear_channels(),
+                    _ => {}
                 }
             }
-            Err(e) => {
-                eprintln!("Failed to open file: {}", e);
+        }
+        for tm in &mut self.popped_out_track_maps {
+            tm.clear_cache();
+        }
+
+        // Re-evaluate math channels with new file data
+        math_editor::evaluate_all_math_channels(&mut self.shared);
+
+        // Auto-populate default worksheets if current layout is empty
+        let is_empty_default = is_startup_default_layout(&self.worksheets);
+
+        if is_empty_default {
+            let ld_ref = self.shared.ld_file.clone().unwrap();
+            let defaults =
+                crate::default_layouts::create_default_worksheets(&ld_ref, &mut self.shared);
+            if !defaults.is_empty() {
+                self.worksheets = defaults
+                    .into_iter()
+                    .map(|(name, dock_state)| Worksheet { name, dock_state })
+                    .collect();
+                self.active_worksheet = 0;
+            }
+        }
+
+        if let Some(path) = self.shared.ld_path.clone() {
+            self.register_project_session(&path);
+        }
+    }
+
+    fn start_open_session(&mut self, ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::platform::begin_pick_session(self.web_load_tx.clone(), ctx.clone());
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(path) = crate::platform::begin_pick_session(ctx) {
+                self.open_file(path);
+            }
+        }
+    }
+
+    fn process_platform_events(&mut self, _ctx: &egui::Context) {
+        #[cfg(target_arch = "wasm32")]
+        while let Ok(event) = self.web_load_rx.try_recv() {
+            match event {
+                crate::platform::WebLoadEvent::SessionData {
+                    file_name,
+                    ld_bytes,
+                    ldx_xml,
+                } => {
+                    let mut ignored_ldx_error = None;
+                    let ldx = match ldx_xml {
+                        Some(xml) => match LdxFile::parse(&xml) {
+                            Ok(ldx) => Some(ldx),
+                            Err(err) => {
+                                ignored_ldx_error = Some(format!(
+                                    "Optional .ldx file could not be parsed and was ignored: {err}"
+                                ));
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+
+                    if let Err(err) = self.open_bytes(file_name, ld_bytes, ldx) {
+                        self.load_error = Some(format!("Failed to open file: {err}"));
+                    } else if let Some(err) = ignored_ldx_error {
+                        self.load_error = Some(err);
+                    }
+                }
+                crate::platform::WebLoadEvent::Error(err) => {
+                    self.load_error = Some(err);
+                }
             }
         }
     }
@@ -356,6 +444,16 @@ impl App {
             theme: self.theme_choice,
             channel_preferences: self.shared.channel_preferences.clone(),
         };
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Err(e) = crate::preferences::save_preferences(&preferences) {
+                eprintln!("Failed to save preferences: {}", e);
+            }
+            return;
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
         std::thread::spawn(move || {
             if let Err(e) = crate::preferences::save_preferences(&preferences) {
                 eprintln!("Failed to save preferences: {}", e);
@@ -386,11 +484,7 @@ impl App {
             })
             .unwrap_or_else(|| "race-weekend.i3rsproj".into());
 
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("i3rs Project", &["i3rsproj", "json"])
-            .set_file_name(&suggested_name)
-            .save_file()
-        {
+        if let Some(path) = crate::platform::save_project_file(&suggested_name) {
             self.save_project_to_path(path, workspace);
         }
     }
@@ -427,10 +521,7 @@ impl App {
     }
 
     fn load_project(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("i3rs Project", &["i3rsproj", "json"])
-            .pick_file()
-        {
+        if let Some(path) = crate::platform::pick_project_file() {
             self.load_project_from_path(path);
         }
     }
@@ -551,6 +642,15 @@ impl App {
             duration_secs: ld.duration_secs(),
             channel_count: ld.channels.len(),
             lap_count: self.shared.laps.len(),
+        })
+    }
+
+    pub fn loaded_session_summary(&self) -> Option<LoadedSessionSummary> {
+        let summary = self.current_session_summary()?;
+        Some(LoadedSessionSummary {
+            file_name: summary.file_name,
+            channel_count: summary.channel_count,
+            lap_count: summary.lap_count,
         })
     }
 
@@ -890,12 +990,8 @@ impl App {
         let add_scatter = KeyboardShortcut::new(command_shift, Key::X);
         let add_fft = KeyboardShortcut::new(command_shift, Key::F);
 
-        if ctx.input_mut(|i| i.consume_shortcut(&open_file))
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("MoTeC Log", &["ld"])
-                .pick_file()
-        {
-            self.open_file(path);
+        if ctx.input_mut(|i| i.consume_shortcut(&open_file)) {
+            self.start_open_session(ctx);
         }
         if ctx.input_mut(|i| i.consume_shortcut(&save_project)) {
             self.save_project();
@@ -1024,10 +1120,7 @@ impl App {
         let workspace = self.build_workspace_snapshot();
 
         if let Ok(json) = serde_json::to_string_pretty(&workspace)
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("Workspace", &["json"])
-                .set_file_name("workspace.json")
-                .save_file()
+            && let Some(path) = crate::platform::save_workspace_file()
             && let Err(e) = std::fs::write(&path, json)
         {
             eprintln!("Failed to save workspace: {}", e);
@@ -1035,10 +1128,7 @@ impl App {
     }
 
     fn load_workspace(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Workspace", &["json"])
-            .pick_file()
-        {
+        if let Some(path) = crate::platform::pick_workspace_file() {
             match std::fs::read_to_string(&path) {
                 Ok(json) => match serde_json::from_str::<crate::workspace::WorkspaceFile>(&json) {
                     Ok(workspace) => {
@@ -1100,11 +1190,7 @@ impl App {
             return;
         }
 
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("CSV", &["csv"])
-            .set_file_name("export.csv")
-            .save_file()
-        {
+        if let Some(path) = crate::platform::save_csv_file() {
             let channels: Vec<ExportChannel<'_>> = registry
                 .iter()
                 .map(|info| ExportChannel {
@@ -1125,12 +1211,7 @@ impl App {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Open .ld file...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("MoTeC Log", &["ld"])
-                        .pick_file()
-                    {
-                        self.open_file(path);
-                    }
+                    self.start_open_session(ctx);
                     ui.close();
                 }
                 ui.separator();
@@ -1407,6 +1488,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.process_platform_events(ui.ctx());
         self.handle_shortcuts(ui.ctx());
 
         // Handle file drops
@@ -1443,6 +1525,33 @@ impl eframe::App for App {
         egui::Panel::top("menu_bar").show_inside(ui, |ui| {
             self.show_menu_bar(ui, &ctx);
         });
+
+        let mut dismiss_load_error = false;
+        if let Some(err) = &self.load_error {
+            egui::Panel::top("load_error").show_inside(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+                    if ui.small_button("Dismiss").clicked() {
+                        dismiss_load_error = true;
+                    }
+                });
+            });
+        }
+        if dismiss_load_error {
+            self.load_error = None;
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        if self.shared.ld_file.is_none() {
+            egui::Panel::top("web_open_hint").show_inside(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Web mode:");
+                    ui.label("Use");
+                    ui.monospace("File > Open .ld file...");
+                    ui.label("to choose an .ld file, then optionally a matching .ldx sidecar.");
+                });
+            });
+        }
 
         // Session info bar
         if self.shared.ld_file.is_some() {
@@ -1570,8 +1679,10 @@ impl eframe::App for App {
             .draggable_tabs(true)
             .show_inside(ui, &mut viewer);
 
+        #[cfg(not(target_arch = "wasm32"))]
         // Pop-out: move track map panels that requested pop-out from dock to separate windows
         let dock = &mut self.worksheets[self.active_worksheet].dock_state;
+        #[cfg(not(target_arch = "wasm32"))]
         while let Some(path) =
             dock.find_tab_from(|t| matches!(t, PanelTab::TrackMap(tm) if tm.pop_out_requested))
         {
@@ -1584,9 +1695,12 @@ impl eframe::App for App {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         // Render popped-out track maps in separate OS windows
         let shared = &mut self.shared;
+        #[cfg(not(target_arch = "wasm32"))]
         let popped_out = &mut self.popped_out_track_maps;
+        #[cfg(not(target_arch = "wasm32"))]
         for tm in popped_out.iter_mut() {
             let viewport_id = egui::ViewportId::from_hash_of(format!("track_map_{}", tm.id));
             ui.ctx().show_viewport_immediate(
@@ -1600,17 +1714,20 @@ impl eframe::App for App {
             );
         }
 
-        // Dock-back: return panels that requested docking to the main dock
-        let dock = &mut self.worksheets[self.active_worksheet].dock_state;
-        let (to_dock, to_keep): (Vec<_>, Vec<_>) = self
-            .popped_out_track_maps
-            .drain(..)
-            .partition(|tm| tm.dock_requested);
-        self.popped_out_track_maps = to_keep;
-        for mut tm in to_dock {
-            tm.dock_requested = false;
-            tm.is_popped_out = false;
-            dock.push_to_focused_leaf(PanelTab::TrackMap(tm));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Dock-back: return panels that requested docking to the main dock
+            let dock = &mut self.worksheets[self.active_worksheet].dock_state;
+            let (to_dock, to_keep): (Vec<_>, Vec<_>) = self
+                .popped_out_track_maps
+                .drain(..)
+                .partition(|tm| tm.dock_requested);
+            self.popped_out_track_maps = to_keep;
+            for mut tm in to_dock {
+                tm.dock_requested = false;
+                tm.is_popped_out = false;
+                dock.push_to_focused_leaf(PanelTab::TrackMap(tm));
+            }
         }
 
         self.show_channel_preferences_window(ui.ctx());
@@ -1618,6 +1735,11 @@ impl eframe::App for App {
 
         // Clear per-frame flags
         self.shared.zoom_from_timeline = false;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        Some(self)
     }
 }
 

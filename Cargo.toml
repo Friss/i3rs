@@ -3,7 +3,7 @@ members = ["crates/i3rs-core", "crates/i3rs-app", "crates/i3rs-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Friss"]
 license = "MIT"
@@ -11,7 +11,7 @@ homepage = "https://github.com/Friss/i3rs"
 repository = "https://github.com/Friss/i3rs"
 
 [workspace.dependencies]
-i3rs-core = { path = "crates/i3rs-core", version = "0.1.0" }
+i3rs-core = { path = "crates/i3rs-core", version = "0.1.1" }
 half = "2.7.1"
 memmap2 = "0.9.10"
 eframe = "0.34.1"

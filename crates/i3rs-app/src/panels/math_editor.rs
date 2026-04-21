@@ -563,10 +563,7 @@ pub fn save_math_channels(shared: &SharedState) {
         .collect();
 
     if let Ok(json) = serde_json::to_string_pretty(&configs)
-        && let Some(path) = rfd::FileDialog::new()
-            .add_filter("Math Channels", &["json"])
-            .set_file_name("math_channels.json")
-            .save_file()
+        && let Some(path) = crate::platform::save_math_channels_file()
         && let Err(e) = std::fs::write(&path, json)
     {
         eprintln!("Failed to save math channels: {}", e);
@@ -575,10 +572,7 @@ pub fn save_math_channels(shared: &SharedState) {
 
 /// Load math channels from a JSON file and evaluate them.
 pub fn load_math_channels(shared: &mut SharedState) {
-    if let Some(path) = rfd::FileDialog::new()
-        .add_filter("Math Channels", &["json"])
-        .pick_file()
-    {
+    if let Some(path) = crate::platform::pick_math_channels_file() {
         match std::fs::read_to_string(&path) {
             Ok(json) => {
                 match serde_json::from_str::<Vec<crate::workspace::MathChannelConfig>>(&json) {

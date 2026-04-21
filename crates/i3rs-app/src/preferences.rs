@@ -1,6 +1,7 @@
 //! Application-level preferences persisted outside workspace/project files.
 
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -34,32 +35,62 @@ impl Default for AppPreferences {
 }
 
 pub fn load_preferences() -> AppPreferences {
-    let Some(path) = preferences_path() else {
-        return AppPreferences::default();
-    };
+    #[cfg(target_arch = "wasm32")]
+    {
+        let Some(storage) = local_storage() else {
+            return AppPreferences::default();
+        };
+        let Ok(Some(json)) = storage.get_item("i3rs.preferences") else {
+            return AppPreferences::default();
+        };
+        return serde_json::from_str(&json).unwrap_or_default();
+    }
 
-    let Ok(json) = std::fs::read_to_string(path) else {
-        return AppPreferences::default();
-    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Some(path) = preferences_path() else {
+            return AppPreferences::default();
+        };
 
-    serde_json::from_str(&json).unwrap_or_default()
+        let Ok(json) = std::fs::read_to_string(path) else {
+            return AppPreferences::default();
+        };
+
+        serde_json::from_str(&json).unwrap_or_default()
+    }
 }
 
 pub fn save_preferences(preferences: &AppPreferences) -> Result<(), String> {
-    let Some(path) = preferences_path() else {
-        return Err("Could not determine preferences path".into());
-    };
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create preferences directory: {}", e))?;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let Some(storage) = local_storage() else {
+            return Err("Could not access browser local storage".into());
+        };
+        let json = serde_json::to_string(preferences)
+            .map_err(|e| format!("Failed to serialize preferences: {}", e))?;
+        storage
+            .set_item("i3rs.preferences", &json)
+            .map_err(|e| format!("Failed to write preferences: {:?}", e))
     }
 
-    let json = serde_json::to_string_pretty(preferences)
-        .map_err(|e| format!("Failed to serialize preferences: {}", e))?;
-    std::fs::write(path, json).map_err(|e| format!("Failed to write preferences: {}", e))
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Some(path) = preferences_path() else {
+            return Err("Could not determine preferences path".into());
+        };
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create preferences directory: {}", e))?;
+        }
+
+        let json = serde_json::to_string_pretty(preferences)
+            .map_err(|e| format!("Failed to serialize preferences: {}", e))?;
+        std::fs::write(path, json).map_err(|e| format!("Failed to write preferences: {}", e))
+    }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn preferences_path() -> Option<PathBuf> {
     let base = if cfg!(target_os = "macos") {
         home_dir()?.join("Library/Application Support")
@@ -74,6 +105,12 @@ fn preferences_path() -> Option<PathBuf> {
     Some(base.join("i3rs").join("preferences.json"))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn local_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.local_storage().ok().flatten()
 }

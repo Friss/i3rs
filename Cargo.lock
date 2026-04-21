@@ -1448,28 +1448,33 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "i3rs-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "egui",
  "egui_dock",
  "egui_plot",
  "i3rs-core",
+ "js-sys",
+ "log",
  "rfd",
  "serde",
  "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
 name = "i3rs-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "i3rs-core",
 ]
 
 [[package]]
 name = "i3rs-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "half",
  "memmap2",
