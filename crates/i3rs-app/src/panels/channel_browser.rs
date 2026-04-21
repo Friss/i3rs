@@ -39,8 +39,7 @@ pub fn show_standalone(ui: &mut egui::Ui, shared: &mut SharedState) {
                 // Physical channels
                 if let Some(ld) = shared.ld_file.clone() {
                     let mut sorted_channels: Vec<_> = ld.channels.iter().collect();
-                    sorted_channels
-                        .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    sorted_channels.sort_by_key(|a| a.name.to_lowercase());
 
                     for ch in &sorted_channels {
                         if !filter_lower.is_empty()

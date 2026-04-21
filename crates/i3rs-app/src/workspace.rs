@@ -13,6 +13,7 @@ use crate::panels::histogram::HistogramPanel;
 use crate::panels::mixture_map::MixtureMapPanel;
 use crate::panels::scatter::ScatterPanel;
 use crate::panels::track_map::TrackMapPanel;
+use crate::panels::utils::apply_channel_preferences;
 use crate::state::{
     CHANNEL_COLORS, ChannelId, GraphMode, GraphXAxis, SharedState, compute_channel_stats,
 };
@@ -258,7 +259,7 @@ fn resolve_saved_plotted_channel(
             .position(|mc| mc.name == channel_name)?;
         let data = shared.math_channels.get(idx)?.data.clone()?;
         let (cached_min, cached_max, cached_avg, _) = compute_channel_stats(&data);
-        Some(crate::state::PlottedChannel {
+        let mut plotted = crate::state::PlottedChannel {
             channel_id: ChannelId::Math(idx),
             color,
             data,
@@ -270,7 +271,9 @@ fn resolve_saved_plotted_channel(
             cached_min,
             cached_max,
             cached_avg,
-        })
+        };
+        apply_channel_preferences(&mut plotted, shared);
+        Some(plotted)
     } else {
         let ld = shared.ld_file.as_ref()?;
         let channel = ld
@@ -279,7 +282,7 @@ fn resolve_saved_plotted_channel(
             .find(|channel| channel.name == channel_name)?;
         let data = ld.read_channel_data(channel)?;
         let (cached_min, cached_max, cached_avg, _) = compute_channel_stats(&data);
-        Some(crate::state::PlottedChannel {
+        let mut plotted = crate::state::PlottedChannel {
             channel_id: ChannelId::Physical(channel.index),
             color,
             data: std::sync::Arc::new(data),
@@ -291,7 +294,9 @@ fn resolve_saved_plotted_channel(
             cached_min,
             cached_max,
             cached_avg,
-        })
+        };
+        apply_channel_preferences(&mut plotted, shared);
+        Some(plotted)
     }
 }
 

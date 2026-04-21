@@ -2,7 +2,14 @@
 name = "i3rs-core"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 description = "MoTeC i2 .ld log file parser and data access library"
+readme = "../../README.md"
+keywords = ["motorsport", "telemetry", "motec", "parser", "racing"]
+categories = ["parser-implementations", "science"]
 
 [dependencies]
 half = { workspace = true }

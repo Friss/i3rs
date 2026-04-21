@@ -2,7 +2,14 @@
 name = "i3rs-cli"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 description = "MoTeC .ld log file CLI parser"
+readme = "../../README.md"
+keywords = ["motorsport", "telemetry", "motec", "cli", "racing"]
+categories = ["command-line-utilities", "science"]
 
 [dependencies]
 i3rs-core = { workspace = true }

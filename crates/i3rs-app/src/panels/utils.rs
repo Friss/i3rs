@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::state::{
     CHANNEL_COLORS, ChannelId, PlottedChannel, PlottedChannelInfo, SharedState, YAxis,
-    compute_channel_stats,
+    channel_preference_key, compute_channel_stats,
 };
 
 pub type ChannelDisplayMeta = (String, String, u16, i16, Arc<HashMap<i64, String>>);
@@ -134,7 +134,7 @@ pub fn create_plotted_channel(
 ) -> Option<PlottedChannel> {
     let data = load_channel_data(channel_id, shared)?;
     let (min, max, avg, _) = compute_channel_stats(&data);
-    Some(PlottedChannel {
+    let mut plotted = PlottedChannel {
         channel_id,
         color: CHANNEL_COLORS[color_idx % CHANNEL_COLORS.len()],
         data: Arc::new(data),
@@ -146,7 +146,9 @@ pub fn create_plotted_channel(
         cached_min: min,
         cached_max: max,
         cached_avg: avg,
-    })
+    };
+    apply_channel_preferences(&mut plotted, shared);
+    Some(plotted)
 }
 
 /// Build readout metadata for a plotted channel.
@@ -167,4 +169,19 @@ pub fn build_plotted_channel_info(
         display_offset: channel.display_offset,
         enum_labels,
     }
+}
+
+pub fn apply_channel_preferences(channel: &mut PlottedChannel, shared: &SharedState) {
+    let (name, _, _, _, _) = resolve_channel_display_meta(channel.channel_id, shared);
+    let key = channel_preference_key(&name);
+    let Some(pref) = shared.channel_preferences.get(&key) else {
+        return;
+    };
+
+    if let Some(color) = pref.color {
+        channel.color = egui::Color32::from_rgb(color[0], color[1], color[2]);
+    }
+    channel.display_scale = pref.display_scale;
+    channel.display_offset = pref.display_offset;
+    channel.display_unit = pref.display_unit.clone();
 }

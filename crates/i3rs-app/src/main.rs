@@ -3,6 +3,8 @@
 mod app;
 mod default_layouts;
 mod panels;
+mod preferences;
+mod project;
 mod state;
 mod workspace;
 
