@@ -8,8 +8,10 @@ use egui_plot::{Bar, BarChart, Legend, Plot};
 use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
-    build_plotted_channel_info, create_plotted_channel, get_visible_slice, interp_at_time,
-    resolve_channel_meta,
+    DisplayTransformFingerprint, build_plotted_channel_info, create_plotted_channel,
+    display_transform_fingerprint, get_visible_slice, interp_at_time,
+    resolve_plotted_channel_display_meta, segmented_channel_button,
+    show_plotted_channel_display_menu, transform_channel_value,
 };
 
 /// Cached histogram bin counts for a single channel.
@@ -19,9 +21,23 @@ struct HistogramBins {
     counts: Vec<u64>,
 }
 
+#[derive(PartialEq, Eq)]
+struct HistogramChannelFingerprint {
+    data_ptr: usize,
+    display_transform: DisplayTransformFingerprint,
+}
+
+#[derive(PartialEq, Eq)]
+struct HistogramFingerprint {
+    channels: Vec<HistogramChannelFingerprint>,
+    zoom_key: Option<(u64, u64)>,
+    bin_count: usize,
+    per_lap: bool,
+    lap_count: usize,
+}
+
 struct HistogramCache {
-    /// (data_ptr, data_len, zoom_key, bin_count, per_lap, num_laps)
-    fingerprint: (Vec<usize>, Option<(u64, u64)>, usize, bool, usize),
+    fingerprint: HistogramFingerprint,
     /// One entry per chart: (bins, color, label)
     charts: Vec<(HistogramBins, egui::Color32, String)>,
 }
@@ -151,14 +167,22 @@ impl HistogramPanel {
 
             // Remove channel buttons
             let mut to_remove = None;
-            for pc in &self.channels {
-                let (name, _, _, _) = resolve_channel_meta(pc.channel_id, shared);
-                let btn = egui::Button::new(&name).fill(pc.color.linear_multiply(0.3));
-                let resp = ui.add(btn);
-                if resp.secondary_clicked() {
+            for pc in &mut self.channels {
+                let (name, _, _, _, _) = resolve_plotted_channel_display_meta(pc, shared);
+                let (resp, clear_clicked) = segmented_channel_button(
+                    ui,
+                    &name,
+                    Some(pc.color.linear_multiply(0.3)),
+                    "Remove channel",
+                );
+                resp.context_menu(|ui| {
+                    if show_plotted_channel_display_menu(ui, pc, shared) {
+                        to_remove = Some(pc.channel_id);
+                    }
+                });
+                if clear_clicked {
                     to_remove = Some(pc.channel_id);
                 }
-                resp.on_hover_text("Right-click to remove");
             }
             if let Some(id) = to_remove {
                 self.remove_channel(id);
@@ -174,34 +198,39 @@ impl HistogramPanel {
             .y_axis_label("Count");
 
         // Show cursor line if we have a cursor time
-        let cursor_values: Vec<(String, f64, egui::Color32)> =
-            if let Some(cursor_time) = shared.cursor_time {
-                self.channels
-                    .iter()
-                    .filter_map(|pc| {
-                        let (name, _, freq, _) = resolve_channel_meta(pc.channel_id, shared);
-                        let val = interp_at_time(&pc.data, freq, cursor_time)?;
-                        Some((name, val, pc.color))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let cursor_values: Vec<(String, f64, egui::Color32)> = if let Some(cursor_time) =
+            shared.cursor_time
+        {
+            self.channels
+                .iter()
+                .filter_map(|pc| {
+                    let (name, _, freq, _, _) = resolve_plotted_channel_display_meta(pc, shared);
+                    let val =
+                        transform_channel_value(pc, interp_at_time(&pc.data, freq, cursor_time)?);
+                    Some((name, val, pc.color))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Cache histogram computation
         let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
-        let data_ptrs: Vec<usize> = self
+        let channel_fingerprints: Vec<HistogramChannelFingerprint> = self
             .channels
             .iter()
-            .map(|pc| Arc::as_ptr(&pc.data) as usize)
+            .map(|pc| HistogramChannelFingerprint {
+                data_ptr: Arc::as_ptr(&pc.data) as usize,
+                display_transform: display_transform_fingerprint(pc),
+            })
             .collect();
-        let fingerprint = (
-            data_ptrs,
+        let fingerprint = HistogramFingerprint {
+            channels: channel_fingerprints,
             zoom_key,
-            self.bin_count,
-            self.per_lap,
-            shared.laps.len(),
-        );
+            bin_count: self.bin_count,
+            per_lap: self.per_lap,
+            lap_count: shared.laps.len(),
+        };
 
         if self
             .cache
@@ -210,12 +239,16 @@ impl HistogramPanel {
         {
             let mut charts = Vec::new();
             for (ch_idx, pc) in self.channels.iter().enumerate() {
-                let (name, _, freq, _) = resolve_channel_meta(pc.channel_id, shared);
+                let (name, unit, freq, _, _) = resolve_plotted_channel_display_meta(pc, shared);
+                let series_label = histogram_series_label(&name, &unit);
 
                 if !self.per_lap || shared.laps.is_empty() {
-                    let data_slice = get_visible_slice(&pc.data, freq, shared);
+                    let mut data_slice = get_visible_slice(&pc.data, freq, shared);
+                    for value in &mut data_slice {
+                        *value = transform_channel_value(pc, *value);
+                    }
                     let bins = compute_histogram_bins(&data_slice, self.bin_count);
-                    charts.push((bins, pc.color, name));
+                    charts.push((bins, pc.color, series_label.clone()));
                 } else {
                     for (lap_idx, lap) in shared.laps.iter().enumerate() {
                         let start = (lap.start_time * freq as f64).floor() as usize;
@@ -229,10 +262,11 @@ impl HistogramPanel {
                             .iter()
                             .copied()
                             .filter(|v| v.is_finite())
+                            .map(|value| transform_channel_value(pc, value))
                             .collect();
 
                         let lap_color = CHANNEL_COLORS[(ch_idx + lap_idx) % CHANNEL_COLORS.len()];
-                        let label = format!("{} — {}", name, lap.name);
+                        let label = format!("{} — {}", series_label, lap.name);
                         let bins = compute_histogram_bins(&lap_data, self.bin_count);
                         charts.push((bins, lap_color, label));
                     }
@@ -320,6 +354,14 @@ fn compute_histogram_bins(data: &[f64], bin_count: usize) -> HistogramBins {
         min,
         bin_width,
         counts,
+    }
+}
+
+fn histogram_series_label(name: &str, unit: &str) -> String {
+    if unit.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} ({unit})")
     }
 }
 

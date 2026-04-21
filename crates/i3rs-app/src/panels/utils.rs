@@ -3,15 +3,32 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use eframe::egui;
+
 use crate::state::{
-    CHANNEL_COLORS, ChannelId, PlottedChannel, PlottedChannelInfo, SharedState, YAxis,
-    channel_preference_key, compute_channel_stats,
+    CHANNEL_COLORS, ChannelId, ChannelPreference, PlottedChannel, PlottedChannelInfo, SharedState,
+    YAxis, channel_preference_key, compute_channel_stats,
 };
 
 pub type ChannelDisplayMeta = (String, String, u16, i16, Arc<HashMap<i64, String>>);
 
 static EMPTY_ENUM_LABELS: LazyLock<Arc<HashMap<i64, String>>> =
     LazyLock::new(|| Arc::new(HashMap::new()));
+
+#[derive(Clone, Copy)]
+pub struct DisplayUnitPreset {
+    pub label: &'static str,
+    pub scale: f64,
+    pub offset: f64,
+    pub unit: &'static str,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct DisplayTransformFingerprint {
+    pub scale_bits: u64,
+    pub offset_bits: u64,
+    pub unit: Option<String>,
+}
 
 /// Resolve channel metadata (name, unit, freq, dec_places, enum_labels) from a ChannelId.
 pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> ChannelDisplayMeta {
@@ -75,6 +92,64 @@ pub fn resolve_plotted_channel_display_meta(
 pub fn resolve_channel_meta(id: ChannelId, shared: &SharedState) -> (String, String, u16, i16) {
     let (name, unit, freq, dec_places, _) = resolve_channel_display_meta(id, shared);
     (name, unit, freq, dec_places)
+}
+
+fn normalized_unit(unit: &str) -> String {
+    unit.to_ascii_lowercase().replace(' ', "")
+}
+
+pub fn display_presets_for_unit(unit: &str) -> Vec<DisplayUnitPreset> {
+    match normalized_unit(unit).as_str() {
+        "km/h" | "kph" => vec![DisplayUnitPreset {
+            label: "Show as mph",
+            scale: 0.621_371_192,
+            offset: 0.0,
+            unit: "mph",
+        }],
+        "mph" => vec![DisplayUnitPreset {
+            label: "Show as km/h",
+            scale: 1.609_344,
+            offset: 0.0,
+            unit: "km/h",
+        }],
+        "kpa" => vec![DisplayUnitPreset {
+            label: "Show as psi",
+            scale: 0.145_037_738,
+            offset: 0.0,
+            unit: "psi",
+        }],
+        "psi" => vec![DisplayUnitPreset {
+            label: "Show as kPa",
+            scale: 6.894_757_293,
+            offset: 0.0,
+            unit: "kPa",
+        }],
+        "°c" | "degc" | "c" => vec![DisplayUnitPreset {
+            label: "Show as °F",
+            scale: 1.8,
+            offset: 32.0,
+            unit: "°F",
+        }],
+        "°f" | "degf" | "f" => vec![DisplayUnitPreset {
+            label: "Show as °C",
+            scale: 5.0 / 9.0,
+            offset: -32.0 * 5.0 / 9.0,
+            unit: "°C",
+        }],
+        _ => Vec::new(),
+    }
+}
+
+pub fn transform_channel_value(channel: &PlottedChannel, value: f64) -> f64 {
+    value * channel.display_scale + channel.display_offset
+}
+
+pub fn display_transform_fingerprint(channel: &PlottedChannel) -> DisplayTransformFingerprint {
+    DisplayTransformFingerprint {
+        scale_bits: channel.display_scale.to_bits(),
+        offset_bits: channel.display_offset.to_bits(),
+        unit: channel.display_unit.clone(),
+    }
 }
 
 /// Interpolate a channel value at a given time using linear interpolation.
@@ -184,4 +259,170 @@ pub fn apply_channel_preferences(channel: &mut PlottedChannel, shared: &SharedSt
     channel.display_scale = pref.display_scale;
     channel.display_offset = pref.display_offset;
     channel.display_unit = pref.display_unit.clone();
+}
+
+fn merged_display_preference(
+    existing: Option<&ChannelPreference>,
+    channel: &PlottedChannel,
+) -> ChannelPreference {
+    ChannelPreference {
+        color: existing.and_then(|pref| pref.color),
+        display_scale: channel.display_scale,
+        display_offset: channel.display_offset,
+        display_unit: channel.display_unit.clone(),
+    }
+}
+
+pub fn show_plotted_channel_display_menu(
+    ui: &mut egui::Ui,
+    channel: &mut PlottedChannel,
+    shared: &mut SharedState,
+) -> bool {
+    let (name, raw_unit, _, _, _) = resolve_channel_display_meta(channel.channel_id, shared);
+    let mut remove_channel = false;
+
+    if ui.button("Remove").clicked() {
+        remove_channel = true;
+        ui.close();
+    }
+
+    let presets = display_presets_for_unit(&raw_unit);
+    if !presets.is_empty() || channel.display_unit.is_some() {
+        ui.separator();
+        ui.label("Display units:");
+        let raw_selected = channel.display_scale == 1.0
+            && channel.display_offset == 0.0
+            && channel.display_unit.is_none();
+        if ui
+            .selectable_label(raw_selected, format!("Raw ({})", raw_unit))
+            .clicked()
+        {
+            channel.display_scale = 1.0;
+            channel.display_offset = 0.0;
+            channel.display_unit = None;
+            ui.close();
+        }
+        for preset in presets {
+            let is_selected = (channel.display_scale - preset.scale).abs() < 1e-9
+                && (channel.display_offset - preset.offset).abs() < 1e-9
+                && channel.display_unit.as_deref() == Some(preset.unit);
+            if ui.selectable_label(is_selected, preset.label).clicked() {
+                channel.display_scale = preset.scale;
+                channel.display_offset = preset.offset;
+                channel.display_unit = Some(preset.unit.to_string());
+                ui.close();
+            }
+        }
+    }
+
+    let pref_key = channel_preference_key(&name);
+    let has_global_pref = shared.channel_preferences.contains_key(&pref_key);
+    ui.separator();
+    if ui
+        .button("Save current display as global default")
+        .clicked()
+    {
+        shared.channel_preferences.insert(
+            pref_key.clone(),
+            merged_display_preference(shared.channel_preferences.get(&pref_key), channel),
+        );
+        shared.channel_preferences_dirty = true;
+        ui.close();
+    }
+    if ui
+        .add_enabled(has_global_pref, egui::Button::new("Apply global default"))
+        .clicked()
+    {
+        apply_channel_preferences(channel, shared);
+        ui.close();
+    }
+    if ui
+        .add_enabled(has_global_pref, egui::Button::new("Clear global default"))
+        .clicked()
+    {
+        shared.channel_preferences.remove(&pref_key);
+        shared.channel_preferences_dirty = true;
+        ui.close();
+    }
+
+    remove_channel
+}
+
+pub fn segmented_channel_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    fill: Option<egui::Color32>,
+    clear_tooltip: &str,
+) -> (egui::Response, bool) {
+    let output = ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+
+        let mut main_button = egui::Button::new(label);
+        if let Some(fill) = fill {
+            main_button = main_button.fill(fill);
+        }
+        let main_response = ui.add(main_button);
+
+        let button_size = egui::vec2(main_response.rect.height(), main_response.rect.height());
+        let mut clear_button = egui::Button::new(egui::RichText::new("X").small());
+        if let Some(fill) = fill {
+            clear_button = clear_button.fill(fill);
+        }
+        let clear_response = ui
+            .add_sized([button_size.x, button_size.y], clear_button)
+            .on_hover_text(clear_tooltip);
+
+        (main_response, clear_response)
+    });
+
+    let (main_response, clear_response) = output.inner;
+    let divider_stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    ui.painter().line_segment(
+        [
+            egui::pos2(clear_response.rect.left(), clear_response.rect.top() + 2.0),
+            egui::pos2(
+                clear_response.rect.left(),
+                clear_response.rect.bottom() - 2.0,
+            ),
+        ],
+        divider_stroke,
+    );
+
+    (main_response, clear_response.clicked())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ChannelId;
+
+    #[test]
+    fn merged_display_preference_preserves_existing_color() {
+        let existing = ChannelPreference {
+            color: Some([1, 2, 3]),
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
+        };
+        let channel = PlottedChannel {
+            channel_id: ChannelId::Physical(0),
+            color: egui::Color32::WHITE,
+            data: Arc::new(vec![1.0]),
+            tile_group: 0,
+            y_axis: YAxis::Left,
+            display_scale: 2.0,
+            display_offset: 5.0,
+            display_unit: Some("psi".into()),
+            cached_min: 1.0,
+            cached_max: 1.0,
+            cached_avg: 1.0,
+        };
+
+        let merged = merged_display_preference(Some(&existing), &channel);
+
+        assert_eq!(merged.color, Some([1, 2, 3]));
+        assert_eq!(merged.display_scale, 2.0);
+        assert_eq!(merged.display_offset, 5.0);
+        assert_eq!(merged.display_unit.as_deref(), Some("psi"));
+    }
 }
