@@ -1455,9 +1455,14 @@ dependencies = [
  "egui_dock",
  "egui_plot",
  "i3rs-core",
+ "js-sys",
+ "log",
  "rfd",
  "serde",
  "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

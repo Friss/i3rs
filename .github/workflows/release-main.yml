@@ -130,7 +130,7 @@ jobs:
           cargo publish -p i3rs-cli
 
   package:
-    name: Package (${{ matrix.os }})
+    name: Package (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     needs: verify
     if: ${{ needs.verify.outputs.should_release == 'true' }}
@@ -138,42 +138,65 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - name: ubuntu-latest
+            os: ubuntu-latest
+            web: false
             format: appimage
             artifact_name: i3rs-linux
             artifact_path: dist/packager/*.AppImage
-          - os: macos-latest
+          - name: macos-latest
+            os: macos-latest
+            web: false
             format: "app"
             artifact_name: i3rs-macos
             artifact_path: dist/packager/*-macos-app.zip
-          - os: windows-latest
+          - name: windows-latest
+            os: windows-latest
+            web: false
             format: wix
             artifact_name: i3rs-windows
             artifact_path: dist/packager/*.msi
+          - name: web
+            os: ubuntu-latest
+            web: true
+            artifact_name: i3rs-web
+            artifact_path: release-artifacts/i3rs-web.tar.gz
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           lfs: true
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: ${{ !matrix.web }}
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: ${{ matrix.web }}
+        with:
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
       - name: Install cargo-packager
+        if: ${{ !matrix.web }}
         run: cargo install cargo-packager --locked
 
       - name: Install WiX
-        if: runner.os == 'Windows'
+        if: ${{ !matrix.web && runner.os == 'Windows' }}
         shell: powershell
         run: choco install wixtoolset --no-progress -y
 
+      - name: Install Trunk
+        if: ${{ matrix.web }}
+        run: cargo install trunk --locked
+
       - name: Package application
+        if: ${{ !matrix.web }}
         working-directory: crates/i3rs-app
         shell: bash
         run: cargo packager --release --formats ${{ matrix.format }}
 
       - name: Zip macOS app bundle
-        if: runner.os == 'macOS'
+        if: ${{ !matrix.web && runner.os == 'macOS' }}
         shell: bash
         run: |
           APP_PATH=$(find dist/packager -maxdepth 1 -type d -name '*.app' -print -quit)
@@ -186,6 +209,18 @@ jobs:
           ZIP_PATH="dist/packager/${APP_NAME}-macos-app.zip"
           rm -f "$ZIP_PATH"
           ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
+
+      - name: Build web bundle
+        if: ${{ matrix.web }}
+        working-directory: crates/i3rs-app
+        run: ~/.cargo/bin/trunk build --release
+
+      - name: Archive web bundle
+        if: ${{ matrix.web }}
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          tar -C crates/i3rs-app/dist -czf release-artifacts/i3rs-web.tar.gz .
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

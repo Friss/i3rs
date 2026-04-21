@@ -1,13 +1,6 @@
-//! MoTeC telemetry data analysis application.
+//! Native executable entry point for the i3rs app.
 
-mod app;
-mod default_layouts;
-mod panels;
-mod preferences;
-mod project;
-mod state;
-mod workspace;
-
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     let file_path = std::env::args().nth(1).map(std::path::PathBuf::from);
 
@@ -22,7 +15,7 @@ fn main() -> eframe::Result {
         "i3rs-app",
         native_options,
         Box::new(move |cc| {
-            let mut app = app::App::new(cc);
+            let mut app = i3rs_app::App::new(cc);
             if let Some(path) = file_path {
                 app.open_file(path);
             }
@@ -30,3 +23,6 @@ fn main() -> eframe::Result {
         }),
     )
 }
+
+#[cfg(target_arch = "wasm32")]
+fn main() {}

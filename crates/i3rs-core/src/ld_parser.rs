@@ -202,12 +202,26 @@ impl ChannelMeta {
 /// Header and channel metadata are parsed on open. Channel sample data
 /// is decoded on-demand from the memory map.
 pub struct LdFile {
-    mmap: Mmap,
+    backing: LdBacking,
     pub session: Session,
     pub event: Event,
     pub channels: Vec<ChannelMeta>,
     #[allow(dead_code)]
     chan_meta_ptr: u32,
+}
+
+enum LdBacking {
+    Mmap(Mmap),
+    Bytes(Box<[u8]>),
+}
+
+impl LdBacking {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Mmap(mmap) => mmap,
+            Self::Bytes(bytes) => bytes,
+        }
+    }
 }
 
 impl LdFile {
@@ -219,27 +233,41 @@ impl LdFile {
         let mmap =
             unsafe { Mmap::map(&file) }.map_err(|e| format!("Failed to mmap file: {}", e))?;
 
-        if mmap.len() < HEAD_SIZE {
+        Self::parse_backing(LdBacking::Mmap(mmap))
+    }
+
+    /// Parse a .ld file from in-memory bytes.
+    ///
+    /// This is primarily intended for web uploads and remote object fetches
+    /// where a filesystem path is unavailable.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        Self::parse_backing(LdBacking::Bytes(bytes.into_boxed_slice()))
+    }
+
+    fn parse_backing(backing: LdBacking) -> Result<Self, String> {
+        let data = backing.as_slice();
+
+        if data.len() < HEAD_SIZE {
             return Err(format!(
                 "File too small ({} bytes, need >= {})",
-                mmap.len(),
+                data.len(),
                 HEAD_SIZE
             ));
         }
-        if mmap[0] != MAGIC_BYTE {
-            return Err(format!("Bad magic byte: {:#x} (expected 0x40)", mmap[0]));
+        if data[0] != MAGIC_BYTE {
+            return Err(format!("Bad magic byte: {:#x} (expected 0x40)", data[0]));
         }
 
-        let session = parse_session(&mmap);
-        let chan_meta_ptr = read_u32(&mmap, 0x08);
-        let chan_data_ptr = read_u32(&mmap, 0x0C);
-        let event_ptr = read_u32(&mmap, 0x24);
-        let event = parse_event(&mmap, event_ptr);
-        let enum_tables = parse_enum_tables(&mmap, chan_data_ptr as usize);
-        let channels = parse_channel_metadata(&mmap, chan_meta_ptr, &enum_tables);
+        let session = parse_session(data);
+        let chan_meta_ptr = read_u32(data, 0x08);
+        let chan_data_ptr = read_u32(data, 0x0C);
+        let event_ptr = read_u32(data, 0x24);
+        let event = parse_event(data, event_ptr);
+        let enum_tables = parse_enum_tables(data, chan_data_ptr as usize);
+        let channels = parse_channel_metadata(data, chan_meta_ptr, &enum_tables);
 
         Ok(LdFile {
-            mmap,
+            backing,
             session,
             event,
             channels,
@@ -249,7 +277,7 @@ impl LdFile {
 
     /// File size in bytes.
     pub fn file_size(&self) -> usize {
-        self.mmap.len()
+        self.data().len()
     }
 
     /// Estimated session duration in seconds (from the longest channel).
@@ -266,9 +294,10 @@ impl LdFile {
         let bps = channel.data_type.bytes_per_sample()?;
         let offset = channel.data_ptr as usize;
         let count = channel.n_data as usize;
+        let data = self.data();
 
-        let available = if offset < self.mmap.len() {
-            (self.mmap.len() - offset) / bps
+        let available = if offset < data.len() {
+            (data.len() - offset) / bps
         } else {
             0
         };
@@ -299,9 +328,10 @@ impl LdFile {
 
         let offset = channel.data_ptr as usize + start * bps;
         let n = end - start;
+        let data = self.data();
 
-        let available = if offset < self.mmap.len() {
-            (self.mmap.len() - offset) / bps
+        let available = if offset < data.len() {
+            (data.len() - offset) / bps
         } else {
             0
         };
@@ -329,7 +359,7 @@ impl LdFile {
     }
 
     fn read_raw_samples(&self, offset: usize, count: usize, dtype: DataType) -> Vec<f64> {
-        let data = &self.mmap;
+        let data = self.data();
         let mut vals = Vec::with_capacity(count);
         let bps = dtype.bytes_per_sample().unwrap();
 
@@ -364,6 +394,10 @@ impl LdFile {
                 .map(|v| (v / scale_f * dec_factor + shift_f) * mul_f)
                 .collect()
         }
+    }
+
+    fn data(&self) -> &[u8] {
+        self.backing.as_slice()
     }
 }
 

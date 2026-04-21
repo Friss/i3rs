@@ -9,6 +9,9 @@ repository.workspace = true
 description = "MoTeC telemetry data analysis application"
 publish = false
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 i3rs-core = { workspace = true }
 eframe = { workspace = true }
@@ -18,3 +21,10 @@ egui-dock = { workspace = true }
 rfd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+log = "0.4.29"
+js-sys = "0.3.94"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.117"
+wasm-bindgen-futures = "0.4.67"
+web-sys = { version = "0.3.94", features = ["Document", "Element", "HtmlCanvasElement", "Storage", "Window"] }

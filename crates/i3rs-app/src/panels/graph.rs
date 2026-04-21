@@ -704,9 +704,7 @@ impl GraphPanel {
     }
 
     fn load_external_overlay(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("MoTeC Log", &["ld"])
-            .pick_file()
+        if let Some(path) = crate::platform::pick_overlay_file()
             && let Some(session_idx) = self.load_external_overlay_path(path)
         {
             let default_lap_idx = self

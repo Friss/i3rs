@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>i3rs Web</title>
+    <link data-trunk rel="rust" href="Cargo.toml" data-target-name="i3rs_app" />
+    <link data-trunk rel="copy-file" href="../../test_data/VIR_LAP.ld" />
+    <link data-trunk rel="copy-file" href="../../test_data/VIR_LAP.ldx" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #0f1115;
+        color: #e8ebf0;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      body {
+        display: grid;
+        grid-template-rows: auto 1fr;
+      }
+
+      .app-shell {
+        padding: 0.75rem 1rem;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0));
+      }
+
+      .app-shell h1 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 650;
+        letter-spacing: 0.02em;
+      }
+
+      .app-shell p {
+        margin: 0.3rem 0 0;
+        font-size: 0.9rem;
+        opacity: 0.75;
+      }
+
+      .load-controls {
+        margin-top: 0.75rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        align-items: end;
+      }
+
+      .load-controls label {
+        display: grid;
+        gap: 0.25rem;
+        font-size: 0.8rem;
+        opacity: 0.9;
+      }
+
+      .load-controls button {
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        background: rgba(255, 255, 255, 0.06);
+        color: inherit;
+        border-radius: 0.4rem;
+        padding: 0.55rem 0.85rem;
+        cursor: pointer;
+      }
+
+      .load-controls button:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+
+      .load-status {
+        margin-top: 0.75rem;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.55rem;
+        min-height: 2rem;
+        padding: 0.45rem 0.7rem;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.05);
+        font-size: 0.82rem;
+      }
+
+      .load-status::before {
+        content: "";
+        width: 0.65rem;
+        height: 0.65rem;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.35);
+        flex: 0 0 auto;
+      }
+
+      .load-status[data-state="loading"]::before {
+        background: #ffd166;
+        box-shadow: 0 0 0 0 rgba(255, 209, 102, 0.55);
+        animation: pulse 1.2s infinite;
+      }
+
+      .load-status[data-state="success"]::before {
+        background: #4ade80;
+      }
+
+      .load-status[data-state="error"]::before {
+        background: #fb7185;
+      }
+
+      .load-status-message {
+        opacity: 0.92;
+      }
+
+      @keyframes pulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(255, 209, 102, 0.55);
+        }
+        70% {
+          box-shadow: 0 0 0 10px rgba(255, 209, 102, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(255, 209, 102, 0);
+        }
+      }
+
+      #i3rs-canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app-shell">
+      <h1>i3rs Web</h1>
+      <p>Open a MoTeC <code>.ld</code> file from the File menu inside the app.</p>
+      <div class="load-controls">
+        <label>
+          LD file
+          <input id="ld-file" type="file" accept=".ld" />
+        </label>
+        <label>
+          Optional LDX file
+          <input id="ldx-file" type="file" accept=".ldx" />
+        </label>
+        <button id="load-session" type="button">Load Session</button>
+        <button id="load-vir-lap" type="button">Load VIR_LAP Sample</button>
+      </div>
+      <div id="load-status" class="load-status" data-state="idle" aria-live="polite">
+        <span class="load-status-message">Web app starting...</span>
+      </div>
+    </div>
+    <canvas id="i3rs-canvas"></canvas>
+    <script>
+      const ldInput = document.getElementById("ld-file");
+      const ldxInput = document.getElementById("ldx-file");
+      const loadButton = document.getElementById("load-session");
+      const sampleButton = document.getElementById("load-vir-lap");
+      const statusEl = document.getElementById("load-status");
+      const statusMessageEl = statusEl.querySelector(".load-status-message");
+      const bundledLdUrl = new URL("VIR_LAP.ld", window.location.href);
+      const bundledLdxUrl = new URL("VIR_LAP.ldx", window.location.href);
+
+      const readAsUint8Array = async (file) => new Uint8Array(await file.arrayBuffer());
+      const readAsText = async (file) => await file.text();
+      const waitForPaint = async () =>
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const notifyLoadState = (state) => {
+        window.i3rsLoadState = state;
+        statusEl.dataset.state = state.state;
+        statusMessageEl.textContent = state.message;
+        if (typeof window.i3rsOnLoadStateChange === "function") {
+          try {
+            window.i3rsOnLoadStateChange(state);
+          } catch (err) {
+            console.error("load-state callback failed", err);
+          }
+        }
+      };
+      const setBusy = (busy) => {
+        loadButton.disabled = busy;
+        sampleButton.disabled = busy;
+      };
+      const setLoadState = (state, message, extra = {}) => {
+        notifyLoadState({
+          state,
+          message,
+          at: new Date().toISOString(),
+          ...extra,
+        });
+      };
+      const loadIntoApp = async (fileName, ldBytes, ldxText, source) => {
+        if (typeof window.i3rsLoadSession !== "function") {
+          throw new Error("The web app is still starting. Try again in a moment.");
+        }
+        setLoadState("loading", `Parsing ${fileName}...`, {
+          fileName,
+          source,
+          phase: "parse",
+        });
+        await waitForPaint();
+        const parseStart = performance.now();
+        window.i3rsLoadSession(fileName, ldBytes, ldxText ?? null);
+        const parseDurationMs = Math.round(performance.now() - parseStart);
+        let summary = null;
+        if (typeof window.i3rsSessionSummary === "function") {
+          const raw = window.i3rsSessionSummary();
+          if (raw) {
+            summary = JSON.parse(raw);
+          }
+        }
+        const loadedMessage = summary
+          ? `Loaded ${summary.file_name} with ${summary.channel_count} channels and ${summary.lap_count} laps in ${parseDurationMs} ms`
+          : `Loaded ${fileName} in ${parseDurationMs} ms`;
+        setLoadState("success", loadedMessage, {
+          fileName,
+          source,
+          phase: "done",
+          parseDurationMs,
+          summary,
+        });
+        return summary;
+      };
+
+      const waitForRuntime = async () => {
+        if (typeof window.i3rsLoadSession === "function") {
+          setLoadState("idle", "Ready to load telemetry.");
+          return;
+        }
+
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          if (typeof window.i3rsLoadSession === "function") {
+            setLoadState("idle", "Ready to load telemetry.");
+            return;
+          }
+        }
+
+        setLoadState("error", "Web app startup timed out.");
+      };
+
+      loadButton.addEventListener("click", async () => {
+        const ldFile = ldInput.files && ldInput.files[0];
+        if (!ldFile) {
+          setLoadState("error", "Choose an .ld file first.");
+          return;
+        }
+
+        setBusy(true);
+        try {
+          setLoadState("loading", `Reading ${ldFile.name}...`, {
+            fileName: ldFile.name,
+            source: "file-input",
+            phase: "read",
+          });
+          const ldBytes = await readAsUint8Array(ldFile);
+          const ldxFile = ldxInput.files && ldxInput.files[0];
+          let ldxText = null;
+          if (ldxFile) {
+            setLoadState("loading", `Reading ${ldxFile.name}...`, {
+              fileName: ldFile.name,
+              source: "file-input",
+              phase: "read-sidecar",
+            });
+            ldxText = await readAsText(ldxFile);
+          }
+          await loadIntoApp(ldFile.name, ldBytes, ldxText, "file-input");
+        } catch (err) {
+          console.error(err);
+          setLoadState("error", `Failed to load session: ${err}`, {
+            fileName: ldFile.name,
+            source: "file-input",
+            phase: "error",
+          });
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      sampleButton.addEventListener("click", async () => {
+        setBusy(true);
+        try {
+          setLoadState("loading", "Fetching bundled VIR_LAP sample...", {
+            fileName: "VIR_LAP.ld",
+            source: "bundled-sample",
+            phase: "fetch",
+          });
+          const [ldResponse, ldxResponse] = await Promise.all([
+            fetch(bundledLdUrl),
+            fetch(bundledLdxUrl),
+          ]);
+
+          if (!ldResponse.ok) {
+            throw new Error(`Failed to fetch VIR_LAP.ld (${ldResponse.status})`);
+          }
+          if (!ldxResponse.ok) {
+            throw new Error(`Failed to fetch VIR_LAP.ldx (${ldxResponse.status})`);
+          }
+
+          const [ldBuffer, ldxText] = await Promise.all([
+            ldResponse.arrayBuffer(),
+            ldxResponse.text(),
+          ]);
+          await loadIntoApp("VIR_LAP.ld", new Uint8Array(ldBuffer), ldxText, "bundled-sample");
+        } catch (err) {
+          console.error(err);
+          setLoadState("error", `Failed to load bundled sample: ${err}`, {
+            fileName: "VIR_LAP.ld",
+            source: "bundled-sample",
+            phase: "error",
+          });
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      waitForRuntime();
+    </script>
+  </body>
+</html>

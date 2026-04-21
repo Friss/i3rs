@@ -13,6 +13,7 @@ Every pull request runs:
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
 - `cargo publish -p i3rs-core --dry-run`
+- `trunk build --release` for `crates/i3rs-app`
 - cross-platform workspace builds on Ubuntu, macOS, and Windows
 
 ## Main Release Flow
@@ -23,7 +24,8 @@ Every push to `main` runs the release workflow. It:
 2. Checks whether the version tag already exists.
 3. Publishes `i3rs-core` and `i3rs-cli` to crates.io when `CARGO_REGISTRY_TOKEN` is configured.
 4. Packages desktop artifacts with `cargo-packager`.
-5. Creates a GitHub release for the current workspace version.
+5. Builds the web bundle with Trunk as another packaging matrix variant and archives it as `i3rs-web.tar.gz`.
+6. Creates a GitHub release for the current workspace version.
 
 If the tag for the current version already exists, the workflow stops after verification and skips crates.io publishing, packaging, and GitHub release creation.
 
@@ -56,3 +58,13 @@ The crates.io release scaffold currently targets:
 - [`i3rs-cli`](../crates/i3rs-cli/Cargo.toml)
 
 The desktop GUI crate [`i3rs-app`](../crates/i3rs-app/Cargo.toml) is marked `publish = false` and is distributed through packaged desktop artifacts instead of crates.io.
+
+## Web Bundle
+
+The release workflow now also publishes a web bundle artifact:
+
+- GitHub release asset: `i3rs-web.tar.gz`
+- Build source: [`crates/i3rs-app`](../crates/i3rs-app)
+- Build command: `trunk build --release`
+
+This archive contains the static web output from `crates/i3rs-app/dist/` and can be unpacked into another web project or static hosting setup.

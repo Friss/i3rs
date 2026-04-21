@@ -50,7 +50,8 @@ More detail is in [`docs/packaging.md`](docs/packaging.md).
 ## Releasing
 
 PRs are verified in GitHub Actions with linting, tests, a crates.io dry run for `i3rs-core`, and cross-platform builds.
-Pushes to `main` are scaffolded to publish `i3rs-core` and `i3rs-cli` to crates.io, package desktop artifacts, and create a GitHub release when the workspace version is new.
+PRs also verify that the web/wasm bundle builds successfully with Trunk.
+Pushes to `main` are scaffolded to publish `i3rs-core` and `i3rs-cli` to crates.io, package desktop artifacts, build a releasable web bundle, and create a GitHub release when the workspace version is new.
 
 Release details and required secrets are documented in [`docs/releasing.md`](docs/releasing.md).
 
@@ -70,6 +71,20 @@ You can also drag and drop `.ld` files onto the application window.
 
 Use `File > Save Project...` to capture the current worksheet layout, math channels, and referenced `.ld` sessions into a reusable `.i3rsproj` file.
 Use `View > Session Details` to compare the current run against another project session, and right-click plotted channels to save global color/unit defaults.
+
+### Web / Wasm
+
+Build the web bundle with Trunk:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install trunk --locked
+cd crates/i3rs-app
+trunk build --release
+```
+
+The generated bundle is written to `crates/i3rs-app/dist/`.
+The release workflow also publishes this bundle as a GitHub release asset named `i3rs-web.tar.gz`.
 
 ### CLI
 
