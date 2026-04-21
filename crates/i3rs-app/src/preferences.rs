@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::ChannelPreference;
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ThemeChoice {
+    #[default]
     System,
     Light,
     Dark,
@@ -21,12 +22,6 @@ pub struct AppPreferences {
     pub theme: ThemeChoice,
     #[serde(default)]
     pub channel_preferences: HashMap<String, ChannelPreference>,
-}
-
-impl Default for ThemeChoice {
-    fn default() -> Self {
-        Self::System
-    }
 }
 
 impl Default for AppPreferences {

@@ -874,13 +874,12 @@ impl App {
         let add_scatter = KeyboardShortcut::new(command_shift, Key::X);
         let add_fft = KeyboardShortcut::new(command_shift, Key::F);
 
-        if ctx.input_mut(|i| i.consume_shortcut(&open_file)) {
-            if let Some(path) = rfd::FileDialog::new()
+        if ctx.input_mut(|i| i.consume_shortcut(&open_file))
+            && let Some(path) = rfd::FileDialog::new()
                 .add_filter("MoTeC Log", &["ld"])
                 .pick_file()
-            {
-                self.open_file(path);
-            }
+        {
+            self.open_file(path);
         }
         if ctx.input_mut(|i| i.consume_shortcut(&save_project)) {
             self.save_project();
