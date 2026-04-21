@@ -23,6 +23,13 @@ pub struct DisplayUnitPreset {
     pub unit: &'static str,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct DisplayTransformFingerprint {
+    pub scale_bits: u64,
+    pub offset_bits: u64,
+    pub unit: Option<String>,
+}
+
 /// Resolve channel metadata (name, unit, freq, dec_places, enum_labels) from a ChannelId.
 pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> ChannelDisplayMeta {
     match id {
@@ -137,12 +144,12 @@ pub fn transform_channel_value(channel: &PlottedChannel, value: f64) -> f64 {
     value * channel.display_scale + channel.display_offset
 }
 
-pub fn display_transform_fingerprint(channel: &PlottedChannel) -> (u64, u64, Option<String>) {
-    (
-        channel.display_scale.to_bits(),
-        channel.display_offset.to_bits(),
-        channel.display_unit.clone(),
-    )
+pub fn display_transform_fingerprint(channel: &PlottedChannel) -> DisplayTransformFingerprint {
+    DisplayTransformFingerprint {
+        scale_bits: channel.display_scale.to_bits(),
+        offset_bits: channel.display_offset.to_bits(),
+        unit: channel.display_unit.clone(),
+    }
 }
 
 /// Interpolate a channel value at a given time using linear interpolation.

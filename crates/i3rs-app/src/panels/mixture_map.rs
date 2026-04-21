@@ -11,22 +11,25 @@ use eframe::egui;
 use crate::state::{ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
-    build_plotted_channel_info, create_plotted_channel, display_transform_fingerprint,
-    interp_at_time, resolve_plotted_channel_display_meta, segmented_channel_button,
-    show_plotted_channel_display_menu, transform_channel_value,
+    DisplayTransformFingerprint, build_plotted_channel_info, create_plotted_channel,
+    display_transform_fingerprint, interp_at_time, resolve_plotted_channel_display_meta,
+    segmented_channel_button, show_plotted_channel_display_menu, transform_channel_value,
 };
 
+#[derive(PartialEq, Eq)]
+struct HeatmapFingerprint {
+    x_data_ptr: usize,
+    y_data_ptr: usize,
+    value_data_ptr: usize,
+    zoom_key: Option<(u64, u64)>,
+    bins: usize,
+    x_transform: DisplayTransformFingerprint,
+    y_transform: DisplayTransformFingerprint,
+    value_transform: DisplayTransformFingerprint,
+}
+
 struct HeatmapCache {
-    fingerprint: (
-        usize,
-        usize,
-        usize,
-        Option<(u64, u64)>,
-        usize,
-        (u64, u64, Option<String>),
-        (u64, u64, Option<String>),
-        (u64, u64, Option<String>),
-    ),
+    fingerprint: HeatmapFingerprint,
     heatmap: Heatmap,
 }
 
@@ -209,16 +212,16 @@ impl MixtureMapPanel {
             .unwrap_or_else(|| (0.0, shared.data_duration.unwrap_or(0.0)));
 
         let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
-        let fingerprint = (
-            Arc::as_ptr(&x_ch.data) as usize,
-            Arc::as_ptr(&y_ch.data) as usize,
-            Arc::as_ptr(&v_ch.data) as usize,
+        let fingerprint = HeatmapFingerprint {
+            x_data_ptr: Arc::as_ptr(&x_ch.data) as usize,
+            y_data_ptr: Arc::as_ptr(&y_ch.data) as usize,
+            value_data_ptr: Arc::as_ptr(&v_ch.data) as usize,
             zoom_key,
-            self.bins,
-            display_transform_fingerprint(x_ch),
-            display_transform_fingerprint(y_ch),
-            display_transform_fingerprint(v_ch),
-        );
+            bins: self.bins,
+            x_transform: display_transform_fingerprint(x_ch),
+            y_transform: display_transform_fingerprint(y_ch),
+            value_transform: display_transform_fingerprint(v_ch),
+        };
 
         if self
             .cache

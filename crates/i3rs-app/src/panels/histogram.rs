@@ -8,9 +8,10 @@ use egui_plot::{Bar, BarChart, Legend, Plot};
 use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
-    build_plotted_channel_info, create_plotted_channel, display_transform_fingerprint,
-    get_visible_slice, interp_at_time, resolve_plotted_channel_display_meta,
-    segmented_channel_button, show_plotted_channel_display_menu, transform_channel_value,
+    DisplayTransformFingerprint, build_plotted_channel_info, create_plotted_channel,
+    display_transform_fingerprint, get_visible_slice, interp_at_time,
+    resolve_plotted_channel_display_meta, segmented_channel_button,
+    show_plotted_channel_display_menu, transform_channel_value,
 };
 
 /// Cached histogram bin counts for a single channel.
@@ -20,15 +21,23 @@ struct HistogramBins {
     counts: Vec<u64>,
 }
 
+#[derive(PartialEq, Eq)]
+struct HistogramChannelFingerprint {
+    data_ptr: usize,
+    display_transform: DisplayTransformFingerprint,
+}
+
+#[derive(PartialEq, Eq)]
+struct HistogramFingerprint {
+    channels: Vec<HistogramChannelFingerprint>,
+    zoom_key: Option<(u64, u64)>,
+    bin_count: usize,
+    per_lap: bool,
+    lap_count: usize,
+}
+
 struct HistogramCache {
-    /// (data_ptr, display_transform, zoom_key, bin_count, per_lap, num_laps)
-    fingerprint: (
-        Vec<(usize, (u64, u64, Option<String>))>,
-        Option<(u64, u64)>,
-        usize,
-        bool,
-        usize,
-    ),
+    fingerprint: HistogramFingerprint,
     /// One entry per chart: (bins, color, label)
     charts: Vec<(HistogramBins, egui::Color32, String)>,
 }
@@ -207,23 +216,21 @@ impl HistogramPanel {
 
         // Cache histogram computation
         let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
-        let channel_fingerprints: Vec<(usize, (u64, u64, Option<String>))> = self
+        let channel_fingerprints: Vec<HistogramChannelFingerprint> = self
             .channels
             .iter()
-            .map(|pc| {
-                (
-                    Arc::as_ptr(&pc.data) as usize,
-                    display_transform_fingerprint(pc),
-                )
+            .map(|pc| HistogramChannelFingerprint {
+                data_ptr: Arc::as_ptr(&pc.data) as usize,
+                display_transform: display_transform_fingerprint(pc),
             })
             .collect();
-        let fingerprint = (
-            channel_fingerprints,
+        let fingerprint = HistogramFingerprint {
+            channels: channel_fingerprints,
             zoom_key,
-            self.bin_count,
-            self.per_lap,
-            shared.laps.len(),
-        );
+            bin_count: self.bin_count,
+            per_lap: self.per_lap,
+            lap_count: shared.laps.len(),
+        };
 
         if self
             .cache
@@ -236,10 +243,10 @@ impl HistogramPanel {
                 let series_label = histogram_series_label(&name, &unit);
 
                 if !self.per_lap || shared.laps.is_empty() {
-                    let data_slice: Vec<f64> = get_visible_slice(&pc.data, freq, shared)
-                        .into_iter()
-                        .map(|value| transform_channel_value(pc, value))
-                        .collect();
+                    let mut data_slice = get_visible_slice(&pc.data, freq, shared);
+                    for value in &mut data_slice {
+                        *value = transform_channel_value(pc, *value);
+                    }
                     let bins = compute_histogram_bins(&data_slice, self.bin_count);
                     charts.push((bins, pc.color, series_label.clone()));
                 } else {
