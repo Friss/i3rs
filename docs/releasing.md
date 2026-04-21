@@ -37,14 +37,14 @@ If the secret is missing, the workflow still builds and publishes GitHub release
 
 ## Versioning
 
-The release workflow reads the version from [`Cargo.toml`](/Users/friss/Desktop/i3rs/Cargo.toml) under `workspace.package.version` and uses:
+The release workflow reads the version from [`Cargo.toml`](../Cargo.toml) under `workspace.package.version` and uses:
 
 - crates.io version: `0.1.0`
 - GitHub release tag: `v0.1.0`
 
 To cut a new release:
 
-1. Bump `workspace.package.version` in [`Cargo.toml`](/Users/friss/Desktop/i3rs/Cargo.toml).
+1. Bump `workspace.package.version` in [`Cargo.toml`](../Cargo.toml).
 2. Merge the change to `main`.
 3. Let the `Release Main` workflow publish crates and attach packaged binaries.
 
@@ -52,7 +52,7 @@ To cut a new release:
 
 The crates.io release scaffold currently targets:
 
-- [`i3rs-core`](/Users/friss/Desktop/i3rs/crates/i3rs-core/Cargo.toml)
-- [`i3rs-cli`](/Users/friss/Desktop/i3rs/crates/i3rs-cli/Cargo.toml)
+- [`i3rs-core`](../crates/i3rs-core/Cargo.toml)
+- [`i3rs-cli`](../crates/i3rs-cli/Cargo.toml)
 
-The desktop GUI crate [`i3rs-app`](/Users/friss/Desktop/i3rs/crates/i3rs-app/Cargo.toml) is marked `publish = false` and is distributed through packaged desktop artifacts instead of crates.io.
+The desktop GUI crate [`i3rs-app`](../crates/i3rs-app/Cargo.toml) is marked `publish = false` and is distributed through packaged desktop artifacts instead of crates.io.
