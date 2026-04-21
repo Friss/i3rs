@@ -2,7 +2,12 @@
 name = "i3rs-app"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 description = "MoTeC telemetry data analysis application"
+publish = false
 
 [dependencies]
 i3rs-core = { workspace = true }

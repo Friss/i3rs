@@ -11,8 +11,8 @@ use i3rs_core::{
 };
 
 use crate::state::{
-    CHANNEL_COLORS, ChannelId, DistanceAxisCache, GraphMode, GraphXAxis, PlottedChannel,
-    SharedState, YAxis,
+    CHANNEL_COLORS, ChannelId, ChannelPreference, DistanceAxisCache, GraphMode, GraphXAxis,
+    PlottedChannel, SharedState, YAxis, channel_preference_key,
 };
 
 use super::gauge::{
@@ -63,6 +63,9 @@ enum ContextAction {
     SetYAxis(ChannelId, YAxis),
     AddGauge(ChannelId),
     SetDisplayTransform(ChannelId, f64, f64, Option<String>),
+    SaveGlobalPreference(ChannelId, ChannelPreference),
+    ApplyGlobalPreference(ChannelId),
+    ClearGlobalPreference(ChannelId),
 }
 
 struct DisplayUnitPreset {
@@ -1627,7 +1630,7 @@ impl GraphPanel {
         }
     }
 
-    fn handle_context_menu(&mut self, response: &egui::Response, shared: &SharedState) {
+    fn handle_context_menu(&mut self, response: &egui::Response, shared: &mut SharedState) {
         response.context_menu(|ui| {
             ui.label("Channels:");
             ui.separator();
@@ -1637,12 +1640,12 @@ impl GraphPanel {
             for pc in &self.plotted_channels {
                 let (name, raw_unit, _, _) = resolve_channel_meta(pc.channel_id, shared);
                 ui.menu_button(&name, |ui| {
-                    Self::show_channel_menu(ui, pc, &raw_unit, &mut action);
+                    Self::show_channel_menu(ui, pc, &raw_unit, shared, &mut action);
                 });
             }
 
             if let Some(act) = action {
-                self.apply_context_action(act);
+                self.apply_context_action(act, shared);
             }
         });
     }
@@ -1652,7 +1655,7 @@ impl GraphPanel {
         response: &egui::Response,
         group: &[usize],
         all_meta: &[ChannelDisplayMeta],
-        shared: &SharedState,
+        shared: &mut SharedState,
     ) {
         let names: Vec<String> = group
             .iter()
@@ -1674,12 +1677,12 @@ impl GraphPanel {
                     .unwrap_or_default();
                 let raw_unit = resolve_channel_meta(pc.channel_id, shared).1;
                 ui.menu_button(name, |ui| {
-                    Self::show_channel_menu(ui, pc, &raw_unit, &mut action);
+                    Self::show_channel_menu(ui, pc, &raw_unit, shared, &mut action);
                 });
             }
 
             if let Some(action) = action {
-                self.apply_context_action(action);
+                self.apply_context_action(action, shared);
             }
         });
     }
@@ -1688,6 +1691,7 @@ impl GraphPanel {
         ui: &mut egui::Ui,
         pc: &PlottedChannel,
         raw_unit: &str,
+        shared: &SharedState,
         action: &mut Option<ContextAction>,
     ) {
         if ui.button("Remove").clicked() {
@@ -1757,6 +1761,36 @@ impl GraphPanel {
                 }
             }
         }
+
+        let pref_key = channel_preference_key(&resolve_channel_meta(pc.channel_id, shared).0);
+        let has_global_pref = shared.channel_preferences.contains_key(&pref_key);
+        ui.separator();
+        if ui.button("Save current style as global default").clicked() {
+            *action = Some(ContextAction::SaveGlobalPreference(
+                pc.channel_id,
+                ChannelPreference {
+                    color: Some([pc.color.r(), pc.color.g(), pc.color.b()]),
+                    display_scale: pc.display_scale,
+                    display_offset: pc.display_offset,
+                    display_unit: pc.display_unit.clone(),
+                },
+            ));
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_global_pref, egui::Button::new("Apply global default"))
+            .clicked()
+        {
+            *action = Some(ContextAction::ApplyGlobalPreference(pc.channel_id));
+            ui.close();
+        }
+        if ui
+            .add_enabled(has_global_pref, egui::Button::new("Clear global default"))
+            .clicked()
+        {
+            *action = Some(ContextAction::ClearGlobalPreference(pc.channel_id));
+            ui.close();
+        }
     }
 
     fn tiled_channel_groups(&self) -> Vec<Vec<usize>> {
@@ -1778,7 +1812,7 @@ impl GraphPanel {
         ordered_groups
     }
 
-    fn apply_context_action(&mut self, action: ContextAction) {
+    fn apply_context_action(&mut self, action: ContextAction, shared: &mut SharedState) {
         match action {
             ContextAction::Remove(id) => self.remove_channel(id),
             ContextAction::ChangeColor(id, color) => {
@@ -1809,6 +1843,52 @@ impl GraphPanel {
                     pc.display_offset = offset;
                     pc.display_unit = unit;
                 }
+            }
+            ContextAction::SaveGlobalPreference(id, preference) => {
+                let channel_name = resolve_channel_meta(id, shared).0;
+                shared
+                    .channel_preferences
+                    .insert(channel_preference_key(&channel_name), preference.clone());
+                shared.channel_preferences_dirty = true;
+
+                if let Some(pc) = self
+                    .plotted_channels
+                    .iter_mut()
+                    .find(|pc| pc.channel_id == id)
+                {
+                    if let Some(color) = preference.color {
+                        pc.color = egui::Color32::from_rgb(color[0], color[1], color[2]);
+                    }
+                    pc.display_scale = preference.display_scale;
+                    pc.display_offset = preference.display_offset;
+                    pc.display_unit = preference.display_unit;
+                }
+            }
+            ContextAction::ApplyGlobalPreference(id) => {
+                let channel_name = resolve_channel_meta(id, shared).0;
+                if let Some(preference) = shared
+                    .channel_preferences
+                    .get(&channel_preference_key(&channel_name))
+                    .cloned()
+                    && let Some(pc) = self
+                        .plotted_channels
+                        .iter_mut()
+                        .find(|pc| pc.channel_id == id)
+                {
+                    if let Some(color) = preference.color {
+                        pc.color = egui::Color32::from_rgb(color[0], color[1], color[2]);
+                    }
+                    pc.display_scale = preference.display_scale;
+                    pc.display_offset = preference.display_offset;
+                    pc.display_unit = preference.display_unit;
+                }
+            }
+            ContextAction::ClearGlobalPreference(id) => {
+                let channel_name = resolve_channel_meta(id, shared).0;
+                shared
+                    .channel_preferences
+                    .remove(&channel_preference_key(&channel_name));
+                shared.channel_preferences_dirty = true;
             }
             ContextAction::AddGauge(id) => {
                 if self

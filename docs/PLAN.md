@@ -197,12 +197,10 @@ crates/
 
 **Goal**: Production-quality release.
 
-- [ ] Application profiles (Circuit, Drag, Bike, Rally) with preconfigured layouts
-- [ ] Project system (save all sessions, math, layouts for a race weekend)
-- [ ] Global channel preferences (colors, scales, units)
-- [ ] Vehicle setup sheets
-- [ ] Session details editor + side-by-side comparison
-- [ ] Dark/light/high-contrast themes
+- [x] Project system (save all sessions, math, layouts for a race weekend)
+- [x] Global channel preferences (colors, scales, units)
+- [x] Session details editor + side-by-side comparison
+- [x] Dark/light/high-contrast themes
 - [ ] Keyboard shortcuts for all operations
 - [ ] Performance optimization pass
 - [ ] Cross-platform packaging: Windows MSI, macOS DMG, Linux AppImage

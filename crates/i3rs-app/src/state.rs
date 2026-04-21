@@ -2,6 +2,7 @@
 
 use eframe::egui;
 use i3rs_core::{Lap, LdFile, LdxFile, Sector, format_state_value, is_state_channel};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -160,6 +161,37 @@ pub enum GraphMode {
 pub enum GraphXAxis {
     Time,
     Distance,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ChannelPreference {
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+    #[serde(default = "default_display_scale")]
+    pub display_scale: f64,
+    #[serde(default)]
+    pub display_offset: f64,
+    #[serde(default)]
+    pub display_unit: Option<String>,
+}
+
+fn default_display_scale() -> f64 {
+    1.0
+}
+
+impl Default for ChannelPreference {
+    fn default() -> Self {
+        Self {
+            color: None,
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
+        }
+    }
+}
+
+pub fn channel_preference_key(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 #[derive(Clone)]
@@ -324,6 +356,10 @@ pub struct SharedState {
     // Channel aliases: maps alias name → canonical channel name
     pub channel_aliases: HashMap<String, String>,
 
+    // Global channel display preferences keyed by canonicalized channel name.
+    pub channel_preferences: HashMap<String, ChannelPreference>,
+    pub channel_preferences_dirty: bool,
+
     // Report cache
     pub report_cache: ReportCache,
 
@@ -359,6 +395,8 @@ impl SharedState {
             pending_toggle_channel: None,
             math_channels: Vec::new(),
             channel_aliases: HashMap::new(),
+            channel_preferences: HashMap::new(),
+            channel_preferences_dirty: false,
             report_cache: ReportCache::new(),
             sectors: Vec::new(),
             reference_lap: None,

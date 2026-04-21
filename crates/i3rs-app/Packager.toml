@@ -1,0 +1,26 @@
+product-name = "i3rs"
+name = "i3rs-app"
+version = "0.1.0"
+identifier = "io.github.friss.i3rs"
+publisher = "i3rs contributors"
+authors = ["i3rs contributors"]
+homepage = "https://github.com/Friss/i3rs"
+description = "Open-source motorsport telemetry analysis for MoTeC .ld files."
+long-description = """
+i3rs is a cross-platform, open-source alternative to MoTeC i2 Pro.
+It opens MoTeC .ld/.ldx files and provides synchronized graphs, lap overlays,
+track maps, histograms, FFT analysis, gauges, math channels, and saved projects.
+"""
+license-file = "../../LICENSE"
+before-packaging-command = "cargo build --release -p i3rs-app"
+out-dir = "../../dist/packager"
+binaries-dir = "../../target/release"
+icons = [
+  "packaging/icons/i3rs.icns",
+  "packaging/icons/i3rs.ico",
+  "packaging/icons/*.png",
+]
+
+[[binaries]]
+path = "i3rs-app"
+main = true

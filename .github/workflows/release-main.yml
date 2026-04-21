@@ -1,0 +1,199 @@
+name: Release Main
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.release_gate.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(python3 - <<'PY'
+          import pathlib, tomllib
+          root = pathlib.Path("Cargo.toml")
+          data = tomllib.loads(root.read_text())
+          print(data["workspace"]["package"]["version"])
+          PY
+          )
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: crates.io dry run
+        run: |
+          cargo publish -p i3rs-core --dry-run
+
+      - name: Check whether this version already has a git tag
+        id: release_gate
+        shell: bash
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists; skipping package/release creation."
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG does not exist yet; release pipeline will continue."
+          fi
+
+  publish-crates:
+    name: Publish crates.io packages
+    runs-on: ubuntu-latest
+    needs: verify
+    if: ${{ needs.verify.outputs.should_release == 'true' && secrets.CARGO_REGISTRY_TOKEN != '' }}
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Publish i3rs-core
+        shell: bash
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          if curl -sf "https://crates.io/api/v1/crates/i3rs-core/$VERSION" >/dev/null; then
+            echo "i3rs-core $VERSION already exists on crates.io"
+            exit 0
+          fi
+          cargo publish -p i3rs-core
+
+      - name: Wait for i3rs-core on crates.io
+        shell: bash
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          for _ in $(seq 1 20); do
+            if curl -sf "https://crates.io/api/v1/crates/i3rs-core/$VERSION" >/dev/null; then
+              echo "i3rs-core $VERSION is available"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Timed out waiting for i3rs-core $VERSION to appear on crates.io" >&2
+          exit 1
+
+      - name: Publish i3rs-cli
+        shell: bash
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          if curl -sf "https://crates.io/api/v1/crates/i3rs-cli/$VERSION" >/dev/null; then
+            echo "i3rs-cli $VERSION already exists on crates.io"
+            exit 0
+          fi
+          cargo publish -p i3rs-cli
+
+  package:
+    name: Package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: verify
+    if: ${{ needs.verify.outputs.should_release == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            format: appimage
+            artifact_name: i3rs-linux
+          - os: macos-latest
+            format: "app dmg"
+            artifact_name: i3rs-macos
+          - os: windows-latest
+            format: wix
+            artifact_name: i3rs-windows
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+
+      - name: Install WiX
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: choco install wixtoolset --no-progress -y
+
+      - name: Package application
+        working-directory: crates/i3rs-app
+        shell: bash
+        run: cargo packager --release --formats ${{ matrix.format }}
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/packager/**
+          if-no-files-found: error
+
+  github-release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs: [verify, package]
+    if: ${{ needs.verify.outputs.should_release == 'true' }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Prepare asset list
+        id: assets
+        shell: bash
+        run: |
+          find release-artifacts -type f > assets.txt
+          cat assets.txt
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ github.sha }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $(cat assets.txt) --clobber
+          else
+            gh release create "$TAG" $(cat assets.txt) \
+              --target "$TARGET" \
+              --title "i3rs v$VERSION" \
+              --generate-notes
+          fi

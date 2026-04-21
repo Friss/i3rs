@@ -5,9 +5,13 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+authors = ["Friss"]
+license = "MIT"
+homepage = "https://github.com/Friss/i3rs"
+repository = "https://github.com/Friss/i3rs"
 
 [workspace.dependencies]
-i3rs-core = { path = "crates/i3rs-core" }
+i3rs-core = { path = "crates/i3rs-core", version = "0.1.0" }
 half = "2.7.1"
 memmap2 = "0.9.10"
 eframe = "0.34.1"

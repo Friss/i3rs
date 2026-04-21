@@ -15,8 +15,11 @@ i3rs opens MoTeC `.ld` log files and provides time-series graphs, lap navigation
 - **Lap detection & navigation** -- parses lap boundaries from data or `.ldx` files, lap markers on the timeline, click-to-zoom
 - **Dockable panel layout** -- multiple graph panels, channel browser, cursor readout, and timeline overview in a resizable tabbed workspace
 - **Cross-panel synchronization** -- cursor position and zoom range stay in sync across all panels
-- **Workspace persistence** -- save and load panel layouts to JSON; multiple worksheet tabs
+- **Workspace + project persistence** -- save reusable race-weekend project files with session lists, math channels, overlays, and worksheet layouts
+- **Global channel preferences** -- reuse preferred colors and display units across sessions and projects
+- **Session comparison + themes** -- inspect session metadata side by side and switch between light, dark, and high-contrast themes
 - **Cross-platform** -- runs on macOS, Windows, and Linux via `wgpu` backends (Vulkan/Metal/DX12/OpenGL)
+- **Packaging scaffold** -- repository-managed `cargo-packager` config for macOS `.dmg`, Linux `.AppImage`, and Windows `.msi` builds
 
 ## Building
 
@@ -25,6 +28,31 @@ Requires Rust 2024 edition (rustc 1.85+).
 ```bash
 cargo build --release
 ```
+
+## Packaging
+
+i3rs now includes a checked-in `cargo-packager` configuration for release artifacts.
+
+```bash
+cargo install cargo-packager --locked
+cd crates/i3rs-app
+cargo packager --release --formats appimage
+```
+
+Use platform-native formats on each OS:
+
+- macOS: `cargo packager --release --formats app dmg`
+- Linux: `cargo packager --release --formats appimage`
+- Windows: `cargo packager --release --formats wix`
+
+More detail is in [`docs/packaging.md`](docs/packaging.md).
+
+## Releasing
+
+PRs are verified in GitHub Actions with linting, tests, a crates.io dry run for `i3rs-core`, and cross-platform builds.
+Pushes to `main` are scaffolded to publish `i3rs-core` and `i3rs-cli` to crates.io, package desktop artifacts, and create a GitHub release when the workspace version is new.
+
+Release details and required secrets are documented in [`docs/releasing.md`](docs/releasing.md).
 
 ## Usage
 
@@ -39,6 +67,9 @@ cargo run --release -p i3rs-app -- path/to/session.ld
 ```
 
 You can also drag and drop `.ld` files onto the application window.
+
+Use `File > Save Project...` to capture the current worksheet layout, math channels, and referenced `.ld` sessions into a reusable `.i3rsproj` file.
+Use `View > Session Details` to compare the current run against another project session, and right-click plotted channels to save global color/unit defaults.
 
 ### CLI
 
