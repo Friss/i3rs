@@ -141,12 +141,15 @@ jobs:
           - os: ubuntu-latest
             format: appimage
             artifact_name: i3rs-linux
+            artifact_path: dist/packager/*.AppImage
           - os: macos-latest
             format: "app"
             artifact_name: i3rs-macos
+            artifact_path: dist/packager/*-macos-app.zip
           - os: windows-latest
             format: wix
             artifact_name: i3rs-windows
+            artifact_path: dist/packager/*.msi
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -188,7 +191,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact_name }}
-          path: dist/packager/**
+          path: ${{ matrix.artifact_path }}
           if-no-files-found: error
 
   github-release:
@@ -213,15 +216,18 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.verify.outputs.tag }}
           VERSION: ${{ needs.verify.outputs.version }}
           TARGET: ${{ github.sha }}
         shell: bash
         run: |
+          mapfile -t assets < assets.txt
+
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" $(cat assets.txt) --clobber
+            gh release upload "$TAG" "${assets[@]}" --clobber
           else
-            gh release create "$TAG" $(cat assets.txt) \
+            gh release create "$TAG" "${assets[@]}" \
               --target "$TARGET" \
               --title "i3rs v$VERSION" \
               --generate-notes
