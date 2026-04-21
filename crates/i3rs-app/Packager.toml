@@ -1,6 +1,6 @@
 product-name = "i3rs"
 name = "i3rs-app"
-version = "0.1.1"
+version = "0.2.0"
 identifier = "io.github.friss.i3rs"
 publisher = "i3rs contributors"
 authors = ["i3rs contributors"]
