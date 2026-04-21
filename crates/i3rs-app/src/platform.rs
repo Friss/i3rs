@@ -71,7 +71,9 @@ pub fn save_workspace_file() -> Option<PathBuf> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn pick_workspace_file() -> Option<PathBuf> {
-    native_dialog().add_filter("Workspace", &["json"]).pick_file()
+    native_dialog()
+        .add_filter("Workspace", &["json"])
+        .pick_file()
 }
 
 #[cfg(target_arch = "wasm32")]

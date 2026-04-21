@@ -100,7 +100,9 @@ fn from_bytes_matches_open_for_channel_data() {
     let from_bytes = LdFile::from_bytes(bytes).unwrap();
     let ch_idx = 0;
 
-    let path_data = from_path.read_channel_data(&from_path.channels[ch_idx]).unwrap();
+    let path_data = from_path
+        .read_channel_data(&from_path.channels[ch_idx])
+        .unwrap();
     let bytes_data = from_bytes
         .read_channel_data(&from_bytes.channels[ch_idx])
         .unwrap();

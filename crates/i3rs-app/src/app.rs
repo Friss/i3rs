@@ -1,10 +1,10 @@
 //! Main application: coordinates panels and shared state.
 
-#[cfg(target_arch = "wasm32")]
-use std::any::Any;
 use eframe::egui;
 use egui_dock::{DockArea, DockState};
 use i3rs_core::{ExportChannel, LdFile, LdxFile, detect_laps, export_csv, find_ldx_for_ld};
+#[cfg(target_arch = "wasm32")]
+use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -246,7 +246,8 @@ impl App {
 
         if is_empty_default {
             let ld_ref = self.shared.ld_file.clone().unwrap();
-            let defaults = crate::default_layouts::create_default_worksheets(&ld_ref, &mut self.shared);
+            let defaults =
+                crate::default_layouts::create_default_worksheets(&ld_ref, &mut self.shared);
             if !defaults.is_empty() {
                 self.worksheets = defaults
                     .into_iter()
@@ -275,7 +276,7 @@ impl App {
         }
     }
 
-    fn process_platform_events(&mut self, ctx: &egui::Context) {
+    fn process_platform_events(&mut self, _ctx: &egui::Context) {
         #[cfg(target_arch = "wasm32")]
         while let Ok(event) = self.web_load_rx.try_recv() {
             match event {
@@ -308,10 +309,6 @@ impl App {
                     self.load_error = Some(err);
                 }
             }
-        }
-
-        if self.load_error.is_some() {
-            ctx.request_repaint();
         }
     }
 
@@ -1529,15 +1526,19 @@ impl eframe::App for App {
             self.show_menu_bar(ui, &ctx);
         });
 
-        if let Some(err) = self.load_error.clone() {
+        let mut dismiss_load_error = false;
+        if let Some(err) = &self.load_error {
             egui::Panel::top("load_error").show_inside(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
                     if ui.small_button("Dismiss").clicked() {
-                        self.load_error = None;
+                        dismiss_load_error = true;
                     }
                 });
             });
+        }
+        if dismiss_load_error {
+            self.load_error = None;
         }
 
         #[cfg(target_arch = "wasm32")]
