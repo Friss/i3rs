@@ -356,9 +356,11 @@ impl App {
             theme: self.theme_choice,
             channel_preferences: self.shared.channel_preferences.clone(),
         };
-        if let Err(e) = crate::preferences::save_preferences(&preferences) {
-            eprintln!("Failed to save preferences: {}", e);
-        }
+        std::thread::spawn(move || {
+            if let Err(e) = crate::preferences::save_preferences(&preferences) {
+                eprintln!("Failed to save preferences: {}", e);
+            }
+        });
     }
 
     fn save_project(&mut self) {
@@ -512,6 +514,22 @@ impl App {
             },
             Err(e) => eprintln!("Failed to read project file: {}", e),
         }
+    }
+
+    fn switch_project_session(&mut self, path: PathBuf) {
+        let mut workspace = self.build_workspace_snapshot();
+        workspace.last_file_path = Some(path.to_string_lossy().to_string());
+
+        self.open_file(path);
+
+        let loaded = crate::workspace::load_workspace(&workspace, &mut self.shared);
+        self.worksheets = loaded
+            .into_iter()
+            .map(|(name, dock_state)| Worksheet { name, dock_state })
+            .collect();
+        self.active_worksheet = workspace
+            .active_worksheet
+            .min(self.worksheets.len().saturating_sub(1));
     }
 
     fn current_session_summary(&self) -> Option<SessionSummary> {
@@ -768,26 +786,24 @@ impl App {
                         self.project_sessions
                             .iter()
                             .find(|record| &record.path == path)
-                            .cloned()
                     });
                     Self::show_session_summary_column(
                         &mut columns[0],
                         "Current Session",
                         current_summary.as_ref().unwrap(),
-                        current_record.as_ref(),
+                        current_record,
                     );
 
                     if let Some((path, summary)) = compare_summary.as_ref() {
                         let compare_record = self
                             .project_sessions
                             .iter()
-                            .find(|record| &record.path == path)
-                            .cloned();
+                            .find(|record| &record.path == path);
                         Self::show_session_summary_column(
                             &mut columns[1],
                             "Comparison Session",
                             summary,
-                            compare_record.as_ref(),
+                            compare_record,
                         );
                     } else {
                         columns[1]
@@ -1270,8 +1286,8 @@ impl App {
     fn show_session_info(&mut self, ui: &mut egui::Ui) {
         if let Some(ld) = &self.shared.ld_file {
             let s = &ld.session;
-            let current_session = self.shared.ld_path.clone();
-            let project_sessions = self.project_sessions.clone();
+            let current_session = self.shared.ld_path.as_ref();
+            let project_sessions = &self.project_sessions;
             let mut switch_to = None;
 
             ui.horizontal_wrapped(|ui| {
@@ -1289,7 +1305,6 @@ impl App {
 
                 if project_sessions.len() > 1 {
                     let selected_text = current_session
-                        .as_ref()
                         .and_then(|path| {
                             project_sessions
                                 .iter()
@@ -1301,11 +1316,10 @@ impl App {
                     egui::ComboBox::from_id_salt("project_session_switcher")
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
-                            for record in &project_sessions {
+                            for record in project_sessions {
                                 let label = session_record_label(record);
-                                let is_selected = current_session
-                                    .as_ref()
-                                    .is_some_and(|current| current == &record.path);
+                                let is_selected =
+                                    current_session.is_some_and(|current| current == &record.path);
                                 if ui.selectable_label(is_selected, label).clicked() {
                                     switch_to = Some(record.path.clone());
                                     ui.close();
@@ -1337,11 +1351,9 @@ impl App {
             });
 
             if let Some(path) = switch_to
-                && current_session
-                    .as_ref()
-                    .is_none_or(|current| current != &path)
+                && current_session.is_none_or(|current| current != &path)
             {
-                self.open_file(path);
+                self.switch_project_session(path);
             }
         }
     }

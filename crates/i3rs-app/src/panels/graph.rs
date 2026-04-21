@@ -179,6 +179,18 @@ pub struct GraphPanel {
 }
 
 impl GraphPanel {
+    fn preferred_color_for_channel(
+        channel_id: ChannelId,
+        shared: &SharedState,
+    ) -> Option<egui::Color32> {
+        let (name, _, _, _) = resolve_channel_meta(channel_id, shared);
+        let pref = shared
+            .channel_preferences
+            .get(&channel_preference_key(&name))?;
+        let [r, g, b] = pref.color?;
+        Some(egui::Color32::from_rgb(r, g, b))
+    }
+
     fn next_tile_group(&self) -> usize {
         self.plotted_channels
             .iter()
@@ -218,7 +230,9 @@ impl GraphPanel {
         }
         let color_idx = self.plotted_channels.len() % self.colors.len();
         if let Some(mut pc) = create_plotted_channel(channel_id, shared, color_idx) {
-            pc.color = self.colors[color_idx];
+            if Self::preferred_color_for_channel(channel_id, shared).is_none() {
+                pc.color = self.colors[color_idx];
+            }
             pc.tile_group = self.next_tile_group();
             self.plotted_channels.push(pc);
         }
