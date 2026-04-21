@@ -142,7 +142,7 @@ jobs:
             format: appimage
             artifact_name: i3rs-linux
           - os: macos-latest
-            format: "app dmg"
+            format: "app"
             artifact_name: i3rs-macos
           - os: windows-latest
             format: wix
@@ -168,6 +168,21 @@ jobs:
         working-directory: crates/i3rs-app
         shell: bash
         run: cargo packager --release --formats ${{ matrix.format }}
+
+      - name: Zip macOS app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP_PATH=$(find dist/packager -maxdepth 1 -type d -name '*.app' -print -quit)
+          if [ -z "$APP_PATH" ]; then
+            echo "No macOS .app bundle found in dist/packager" >&2
+            exit 1
+          fi
+
+          APP_NAME=$(basename "$APP_PATH" .app)
+          ZIP_PATH="dist/packager/${APP_NAME}-macos-app.zip"
+          rm -f "$ZIP_PATH"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
 
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
