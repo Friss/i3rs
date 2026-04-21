@@ -51,7 +51,7 @@ More detail is in [`docs/packaging.md`](docs/packaging.md).
 
 PRs are verified in GitHub Actions with linting, tests, a crates.io dry run for `i3rs-core`, and cross-platform builds.
 PRs also verify that the web/wasm bundle builds successfully with Trunk.
-Pushes to `main` are scaffolded to publish `i3rs-core` and `i3rs-cli` to crates.io, package desktop artifacts, build a releasable web bundle, and create a GitHub release when the workspace version is new.
+Pushes to `main` are scaffolded to publish `i3rs-core` and `i3rs-cli` to crates.io when the workspace version is new, and separately package desktop/web artifacts into a GitHub release when the app package version in [`crates/i3rs-app/Packager.toml`](crates/i3rs-app/Packager.toml) is new.
 
 Release details and required secrets are documented in [`docs/releasing.md`](docs/releasing.md).
 

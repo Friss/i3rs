@@ -21,13 +21,14 @@ Every pull request runs:
 Every push to `main` runs the release workflow. It:
 
 1. Re-runs formatting, linting, tests, and the `i3rs-core` crates.io dry run.
-2. Checks whether the version tag already exists.
-3. Publishes `i3rs-core` and `i3rs-cli` to crates.io when `CARGO_REGISTRY_TOKEN` is configured.
-4. Packages desktop artifacts with `cargo-packager`.
+2. Checks whether the crate release tag and app package release tag already exist.
+3. Publishes `i3rs-core` and `i3rs-cli` to crates.io when `CARGO_REGISTRY_TOKEN` is configured and the crate tag is new.
+4. Packages desktop artifacts with `cargo-packager` when the app package tag is new.
 5. Builds the web bundle with Trunk as another packaging matrix variant and archives it as `i3rs-web.tar.gz`.
-6. Creates a GitHub release for the current workspace version.
+6. Creates a GitHub release for the current app package version.
 
-If the tag for the current version already exists, the workflow stops after verification and skips crates.io publishing, packaging, and GitHub release creation.
+If the crate tag already exists, the workflow skips crates.io publishing for that version.
+If the app package tag already exists, the workflow skips packaging and GitHub release creation for that version.
 
 ## Required Secrets
 
@@ -39,16 +40,24 @@ If the secret is missing, the workflow still builds and publishes GitHub release
 
 ## Versioning
 
-The release workflow reads the version from [`Cargo.toml`](../Cargo.toml) under `workspace.package.version` and uses:
+The release workflow now tracks crate and app package releases separately:
 
-- crates.io version: `0.1.0`
-- GitHub release tag: `v0.1.0`
+- Crates.io version source: [`Cargo.toml`](../Cargo.toml) `workspace.package.version`
+- Crates.io tag: `v0.1.0`
+- App package version source: [`crates/i3rs-app/Packager.toml`](../crates/i3rs-app/Packager.toml) `version`
+- GitHub packaged release tag: `app-v0.1.0`
 
-To cut a new release:
+To cut a new crates.io release:
 
 1. Bump `workspace.package.version` in [`Cargo.toml`](../Cargo.toml).
 2. Merge the change to `main`.
-3. Let the `Release Main` workflow publish crates and attach packaged binaries.
+3. Let the `Release Main` workflow publish crates and create the crate tag.
+
+To cut a new packaged app release:
+
+1. Bump `version` in [`crates/i3rs-app/Packager.toml`](../crates/i3rs-app/Packager.toml).
+2. Merge the change to `main`.
+3. Let the `Release Main` workflow package binaries, build the web bundle, and create a GitHub release.
 
 ## crates.io Scope
 

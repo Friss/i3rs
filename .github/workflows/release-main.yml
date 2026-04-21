@@ -13,9 +13,12 @@ jobs:
     name: Verify
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
-      should_release: ${{ steps.release_gate.outputs.should_release }}
+      crate_version: ${{ steps.version.outputs.crate_version }}
+      crate_tag: ${{ steps.version.outputs.crate_tag }}
+      app_version: ${{ steps.version.outputs.app_version }}
+      app_tag: ${{ steps.version.outputs.app_tag }}
+      should_publish_crates: ${{ steps.release_gate.outputs.should_publish_crates }}
+      should_publish_package: ${{ steps.release_gate.outputs.should_publish_package }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -27,19 +30,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
-      - name: Read version
+      - name: Read versions
         id: version
         shell: bash
         run: |
-          VERSION=$(python3 - <<'PY'
+          mapfile -t versions < <(python3 - <<'PY'
           import pathlib, tomllib
-          root = pathlib.Path("Cargo.toml")
-          data = tomllib.loads(root.read_text())
-          print(data["workspace"]["package"]["version"])
+          workspace = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          packager = tomllib.loads(pathlib.Path("crates/i3rs-app/Packager.toml").read_text())
+          print(workspace["workspace"]["package"]["version"])
+          print(packager["version"])
           PY
           )
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          CRATE_VERSION="${versions[0]}"
+          APP_VERSION="${versions[1]}"
+          echo "crate_version=$CRATE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "crate_tag=v$CRATE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "app_tag=app-v$APP_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -54,24 +62,40 @@ jobs:
         run: |
           cargo publish -p i3rs-core --dry-run
 
-      - name: Check whether this version already has a git tag
+      - name: Check whether release tags already exist
         id: release_gate
         shell: bash
         run: |
-          TAG="${{ steps.version.outputs.tag }}"
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            echo "Tag $TAG already exists; skipping package/release creation."
+          tag_exists() {
+            git ls-remote --exit-code --tags origin "refs/tags/$1" >/dev/null 2>&1
+          }
+
+          CRATE_TAG="${{ steps.version.outputs.crate_tag }}"
+          APP_TAG="${{ steps.version.outputs.app_tag }}"
+
+          if tag_exists "$CRATE_TAG"; then
+            echo "should_publish_crates=false" >> "$GITHUB_OUTPUT"
+            echo "Crate tag $CRATE_TAG already exists; skipping crates.io release tagging."
           else
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "Tag $TAG does not exist yet; release pipeline will continue."
+            echo "should_publish_crates=true" >> "$GITHUB_OUTPUT"
+            echo "Crate tag $CRATE_TAG does not exist yet; crates.io publish checks will continue."
+          fi
+
+          if tag_exists "$APP_TAG"; then
+            echo "should_publish_package=false" >> "$GITHUB_OUTPUT"
+            echo "App tag $APP_TAG already exists; skipping package/release creation."
+          else
+            echo "should_publish_package=true" >> "$GITHUB_OUTPUT"
+            echo "App tag $APP_TAG does not exist yet; package release pipeline will continue."
           fi
 
   publish-crates:
     name: Publish crates.io packages
     runs-on: ubuntu-latest
     needs: verify
-    if: ${{ needs.verify.outputs.should_release == 'true' }}
+    if: ${{ needs.verify.outputs.should_publish_crates == 'true' }}
+    permissions:
+      contents: write
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
@@ -97,7 +121,7 @@ jobs:
         if: ${{ steps.token.outputs.available == 'true' }}
         shell: bash
         run: |
-          VERSION="${{ needs.verify.outputs.version }}"
+          VERSION="${{ needs.verify.outputs.crate_version }}"
 
           check_publish_needed() {
             local crate_name="$1"
@@ -123,11 +147,19 @@ jobs:
         if: ${{ steps.token.outputs.available == 'true' && steps.publish_gate.outputs['publish-i3rs-cli'] == 'true' }}
         run: cargo publish -p i3rs-cli
 
+      - name: Tag published crate release
+        if: ${{ steps.token.outputs.available == 'true' }}
+        shell: bash
+        run: |
+          TAG="${{ needs.verify.outputs.crate_tag }}"
+          git tag "$TAG" "${{ github.sha }}"
+          git push origin "refs/tags/$TAG"
+
   package:
     name: Package (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     needs: verify
-    if: ${{ needs.verify.outputs.should_release == 'true' }}
+    if: ${{ needs.verify.outputs.should_publish_package == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -227,7 +259,7 @@ jobs:
     name: Publish GitHub release
     runs-on: ubuntu-latest
     needs: [verify, package]
-    if: ${{ needs.verify.outputs.should_release == 'true' }}
+    if: ${{ needs.verify.outputs.should_publish_package == 'true' }}
     permissions:
       contents: write
     steps:
@@ -246,8 +278,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.verify.outputs.tag }}
-          VERSION: ${{ needs.verify.outputs.version }}
+          TAG: ${{ needs.verify.outputs.app_tag }}
+          VERSION: ${{ needs.verify.outputs.app_version }}
           TARGET: ${{ github.sha }}
         shell: bash
         run: |
@@ -258,6 +290,6 @@ jobs:
           else
             gh release create "$TAG" "${assets[@]}" \
               --target "$TARGET" \
-              --title "i3rs v$VERSION" \
+              --title "i3rs app v$VERSION" \
               --generate-notes
           fi
