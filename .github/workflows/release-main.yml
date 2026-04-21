@@ -92,42 +92,36 @@ jobs:
             echo "CARGO_REGISTRY_TOKEN is not configured; skipping crates.io publish steps."
           fi
 
-      - name: Publish i3rs-core
+      - name: Check which crate versions need publishing
+        id: publish_gate
         if: ${{ steps.token.outputs.available == 'true' }}
         shell: bash
         run: |
           VERSION="${{ needs.verify.outputs.version }}"
-          if curl -sf "https://crates.io/api/v1/crates/i3rs-core/$VERSION" >/dev/null; then
-            echo "i3rs-core $VERSION already exists on crates.io"
-            exit 0
-          fi
-          cargo publish -p i3rs-core
 
-      - name: Wait for i3rs-core on crates.io
-        if: ${{ steps.token.outputs.available == 'true' }}
-        shell: bash
-        run: |
-          VERSION="${{ needs.verify.outputs.version }}"
-          for _ in $(seq 1 20); do
-            if curl -sf "https://crates.io/api/v1/crates/i3rs-core/$VERSION" >/dev/null; then
-              echo "i3rs-core $VERSION is available"
-              exit 0
+          check_publish_needed() {
+            local crate_name="$1"
+            local response
+            response=$(curl -fsSL "https://crates.io/api/v1/crates/${crate_name}")
+
+            if CRATE_NAME="$crate_name" VERSION="$VERSION" RESPONSE="$response" python3 -c "import json, os, sys; crate_name = os.environ['CRATE_NAME']; version = os.environ['VERSION']; response = json.loads(os.environ['RESPONSE']); published_versions = {entry['num'] for entry in response.get('versions', [])}; already_published = version in published_versions; print(f'{crate_name} {version} already exists on crates.io' if already_published else f'{crate_name} {version} is not published yet'); sys.exit(0 if already_published else 1)"
+            then
+              echo "publish-${crate_name}=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "publish-${crate_name}=true" >> "$GITHUB_OUTPUT"
             fi
-            sleep 15
-          done
-          echo "Timed out waiting for i3rs-core $VERSION to appear on crates.io" >&2
-          exit 1
+          }
+
+          check_publish_needed i3rs-core
+          check_publish_needed i3rs-cli
+
+      - name: Publish i3rs-core
+        if: ${{ steps.token.outputs.available == 'true' && steps.publish_gate.outputs['publish-i3rs-core'] == 'true' }}
+        run: cargo publish -p i3rs-core
 
       - name: Publish i3rs-cli
-        if: ${{ steps.token.outputs.available == 'true' }}
-        shell: bash
-        run: |
-          VERSION="${{ needs.verify.outputs.version }}"
-          if curl -sf "https://crates.io/api/v1/crates/i3rs-cli/$VERSION" >/dev/null; then
-            echo "i3rs-cli $VERSION already exists on crates.io"
-            exit 0
-          fi
-          cargo publish -p i3rs-cli
+        if: ${{ steps.token.outputs.available == 'true' && steps.publish_gate.outputs['publish-i3rs-cli'] == 'true' }}
+        run: cargo publish -p i3rs-cli
 
   package:
     name: Package (${{ matrix.name }})

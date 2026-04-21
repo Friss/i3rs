@@ -11,11 +11,22 @@ use eframe::egui;
 use crate::state::{ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
-    build_plotted_channel_info, create_plotted_channel, interp_at_time, resolve_channel_meta,
+    build_plotted_channel_info, create_plotted_channel, display_transform_fingerprint,
+    interp_at_time, resolve_plotted_channel_display_meta, segmented_channel_button,
+    show_plotted_channel_display_menu, transform_channel_value,
 };
 
 struct HeatmapCache {
-    fingerprint: (usize, usize, usize, Option<(u64, u64)>, usize),
+    fingerprint: (
+        usize,
+        usize,
+        usize,
+        Option<(u64, u64)>,
+        usize,
+        (u64, u64, Option<String>),
+        (u64, u64, Option<String>),
+        (u64, u64, Option<String>),
+    ),
     heatmap: Heatmap,
 }
 
@@ -87,42 +98,72 @@ impl MixtureMapPanel {
 
         // Toolbar
         ui.horizontal(|ui| {
-            let x_name = self
-                .x_channel
-                .as_ref()
-                .map(|c| resolve_channel_meta(c.channel_id, shared).0)
-                .unwrap_or_else(|| "Drop X".into());
-            let y_name = self
-                .y_channel
-                .as_ref()
-                .map(|c| resolve_channel_meta(c.channel_id, shared).0)
-                .unwrap_or_else(|| "Drop Y".into());
-            let v_name = self
-                .value_channel
-                .as_ref()
-                .map(|c| resolve_channel_meta(c.channel_id, shared).0)
-                .unwrap_or_else(|| "Drop Value".into());
-
             ui.label("X:");
-            let xr = ui.button(&x_name);
-            if xr.secondary_clicked() {
-                self.x_channel = None;
+            let mut clear_x = false;
+            if let Some(channel) = self.x_channel.as_mut() {
+                let (x_name, _, _, _, _) = resolve_plotted_channel_display_meta(channel, shared);
+                let (xr, clear_clicked) =
+                    segmented_channel_button(ui, &x_name, None, "Clear X channel");
+                xr.context_menu(|ui| {
+                    if show_plotted_channel_display_menu(ui, channel, shared) {
+                        clear_x = true;
+                    }
+                });
+                if clear_clicked {
+                    clear_x = true;
+                }
+            } else {
+                ui.add_enabled(false, egui::Button::new("Drop X"));
             }
-            xr.on_hover_text("Right-click to clear");
+            if clear_x {
+                self.x_channel = None;
+                self.cache = None;
+            }
 
             ui.label("Y:");
-            let yr = ui.button(&y_name);
-            if yr.secondary_clicked() {
-                self.y_channel = None;
+            let mut clear_y = false;
+            if let Some(channel) = self.y_channel.as_mut() {
+                let (y_name, _, _, _, _) = resolve_plotted_channel_display_meta(channel, shared);
+                let (yr, clear_clicked) =
+                    segmented_channel_button(ui, &y_name, None, "Clear Y channel");
+                yr.context_menu(|ui| {
+                    if show_plotted_channel_display_menu(ui, channel, shared) {
+                        clear_y = true;
+                    }
+                });
+                if clear_clicked {
+                    clear_y = true;
+                }
+            } else {
+                ui.add_enabled(false, egui::Button::new("Drop Y"));
             }
-            yr.on_hover_text("Right-click to clear");
+            if clear_y {
+                self.y_channel = None;
+                self.cache = None;
+            }
 
             ui.label("Value:");
-            let vr = ui.button(&v_name);
-            if vr.secondary_clicked() {
-                self.value_channel = None;
+            let mut clear_value = false;
+            if let Some(channel) = self.value_channel.as_mut() {
+                let (value_name, _, _, _, _) =
+                    resolve_plotted_channel_display_meta(channel, shared);
+                let (vr, clear_clicked) =
+                    segmented_channel_button(ui, &value_name, None, "Clear value channel");
+                vr.context_menu(|ui| {
+                    if show_plotted_channel_display_menu(ui, channel, shared) {
+                        clear_value = true;
+                    }
+                });
+                if clear_clicked {
+                    clear_value = true;
+                }
+            } else {
+                ui.add_enabled(false, egui::Button::new("Drop Value"));
             }
-            vr.on_hover_text("Right-click to clear");
+            if clear_value {
+                self.value_channel = None;
+                self.cache = None;
+            }
 
             ui.label("Bins:");
             ui.add(egui::DragValue::new(&mut self.bins).range(5..=100).speed(1));
@@ -150,9 +191,12 @@ impl MixtureMapPanel {
             return;
         };
 
-        let (x_name, x_unit, x_freq, x_dec_places) = resolve_channel_meta(x_ch.channel_id, shared);
-        let (y_name, y_unit, y_freq, y_dec_places) = resolve_channel_meta(y_ch.channel_id, shared);
-        let (v_name, v_unit, v_freq, v_dec_places) = resolve_channel_meta(v_ch.channel_id, shared);
+        let (x_name, x_unit, x_freq, x_dec_places, _) =
+            resolve_plotted_channel_display_meta(x_ch, shared);
+        let (y_name, y_unit, y_freq, y_dec_places, _) =
+            resolve_plotted_channel_display_meta(y_ch, shared);
+        let (v_name, v_unit, v_freq, v_dec_places, _) =
+            resolve_plotted_channel_display_meta(v_ch, shared);
 
         let target_freq = x_freq.min(y_freq).min(v_freq);
         if target_freq == 0 {
@@ -171,6 +215,9 @@ impl MixtureMapPanel {
             Arc::as_ptr(&v_ch.data) as usize,
             zoom_key,
             self.bins,
+            display_transform_fingerprint(x_ch),
+            display_transform_fingerprint(y_ch),
+            display_transform_fingerprint(v_ch),
         );
 
         if self
@@ -191,6 +238,12 @@ impl MixtureMapPanel {
                 t1,
                 self.bins,
                 y_axis.fixed_range,
+                x_ch.display_scale,
+                x_ch.display_offset,
+                y_ch.display_scale,
+                y_ch.display_offset,
+                v_ch.display_scale,
+                v_ch.display_offset,
             );
             self.cache = Some(HeatmapCache {
                 fingerprint,
@@ -364,6 +417,8 @@ impl MixtureMapPanel {
                 interp_at_time(&y_ch.data, y_freq, cursor_time),
             )
         {
+            let x_val = transform_channel_value(x_ch, x_val);
+            let y_val = transform_channel_value(y_ch, y_val);
             let x_frac = normalized_fraction(x_val, heatmap.x_min, heatmap.x_max);
             let y_frac = normalized_fraction(y_val, heatmap.y_min, heatmap.y_max);
             let cx = plot_rect.min.x + x_frac as f32 * plot_rect.width();
@@ -414,6 +469,12 @@ fn compute_heatmap(
     t1: f64,
     bins: usize,
     y_fixed_range: Option<(f64, f64)>,
+    x_scale: f64,
+    x_offset: f64,
+    y_scale: f64,
+    y_offset: f64,
+    v_scale: f64,
+    v_offset: f64,
 ) -> Heatmap {
     let mut cells: Vec<HeatmapCell> = (0..bins * bins)
         .map(|_| HeatmapCell {
@@ -447,6 +508,9 @@ fn compute_heatmap(
             && y.is_finite()
             && v.is_finite()
         {
+            let x = x * x_scale + x_offset;
+            let y = y * y_scale + y_offset;
+            let v = v * v_scale + v_offset;
             if let Some((fixed_y_min, fixed_y_max)) = y_fixed_range
                 && (y < fixed_y_min || y > fixed_y_max)
             {

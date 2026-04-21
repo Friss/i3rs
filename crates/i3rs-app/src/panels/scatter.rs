@@ -8,11 +8,21 @@ use egui_plot::{Legend, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, Po
 use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
-    build_plotted_channel_info, create_plotted_channel, interp_at_time, resolve_channel_meta,
+    build_plotted_channel_info, create_plotted_channel, display_transform_fingerprint,
+    interp_at_time, resolve_plotted_channel_display_meta, segmented_channel_button,
+    show_plotted_channel_display_menu, transform_channel_value,
 };
 
 struct ScatterCache {
-    fingerprint: (usize, usize, usize, usize, Option<(u64, u64)>),
+    fingerprint: (
+        usize,
+        usize,
+        usize,
+        usize,
+        Option<(u64, u64)>,
+        (u64, u64, Option<String>),
+        (u64, u64, Option<String>),
+    ),
     points: Vec<ScatterPoint>,
     plot_points: Vec<PlotPoint>,
 }
@@ -92,30 +102,49 @@ impl ScatterPanel {
 
         // Toolbar
         ui.horizontal(|ui| {
-            let x_name = self
-                .x_channel
-                .as_ref()
-                .map(|c| resolve_channel_meta(c.channel_id, shared).0)
-                .unwrap_or_else(|| "Drop X channel".into());
-            let y_name = self
-                .y_channel
-                .as_ref()
-                .map(|c| resolve_channel_meta(c.channel_id, shared).0)
-                .unwrap_or_else(|| "Drop Y channel".into());
-
             ui.label("X:");
-            let x_resp = ui.button(&x_name);
-            if x_resp.secondary_clicked() {
-                self.x_channel = None;
+            let mut clear_x = false;
+            if let Some(channel) = self.x_channel.as_mut() {
+                let (x_name, _, _, _, _) = resolve_plotted_channel_display_meta(channel, shared);
+                let (x_resp, clear_clicked) =
+                    segmented_channel_button(ui, &x_name, None, "Clear X channel");
+                x_resp.context_menu(|ui| {
+                    if show_plotted_channel_display_menu(ui, channel, shared) {
+                        clear_x = true;
+                    }
+                });
+                if clear_clicked {
+                    clear_x = true;
+                }
+            } else {
+                ui.add_enabled(false, egui::Button::new("Drop X channel"));
             }
-            x_resp.on_hover_text("Right-click to clear");
+            if clear_x {
+                self.x_channel = None;
+                self.cache = None;
+            }
 
             ui.label("Y:");
-            let y_resp = ui.button(&y_name);
-            if y_resp.secondary_clicked() {
-                self.y_channel = None;
+            let mut clear_y = false;
+            if let Some(channel) = self.y_channel.as_mut() {
+                let (y_name, _, _, _, _) = resolve_plotted_channel_display_meta(channel, shared);
+                let (y_resp, clear_clicked) =
+                    segmented_channel_button(ui, &y_name, None, "Clear Y channel");
+                y_resp.context_menu(|ui| {
+                    if show_plotted_channel_display_menu(ui, channel, shared) {
+                        clear_y = true;
+                    }
+                });
+                if clear_clicked {
+                    clear_y = true;
+                }
+            } else {
+                ui.add_enabled(false, egui::Button::new("Drop Y channel"));
             }
-            y_resp.on_hover_text("Right-click to clear");
+            if clear_y {
+                self.y_channel = None;
+                self.cache = None;
+            }
 
             ui.label("Size:");
             ui.add(
@@ -140,8 +169,8 @@ impl ScatterPanel {
             return;
         };
 
-        let (x_name, x_unit, x_freq, _) = resolve_channel_meta(x_ch.channel_id, shared);
-        let (y_name, y_unit, y_freq, _) = resolve_channel_meta(y_ch.channel_id, shared);
+        let (x_name, x_unit, x_freq, _, _) = resolve_plotted_channel_display_meta(x_ch, shared);
+        let (y_name, y_unit, y_freq, _, _) = resolve_plotted_channel_display_meta(y_ch, shared);
 
         let x_label = if x_unit.is_empty() {
             x_name.clone()
@@ -177,6 +206,8 @@ impl ScatterPanel {
             Arc::as_ptr(&y_ch.data) as usize,
             y_ch.data.len(),
             zoom_key,
+            display_transform_fingerprint(x_ch),
+            display_transform_fingerprint(y_ch),
         );
 
         if self
@@ -184,8 +215,7 @@ impl ScatterPanel {
             .as_ref()
             .is_none_or(|c| c.fingerprint != fingerprint)
         {
-            let points =
-                build_scatter_points(&x_ch.data, x_freq, &y_ch.data, y_freq, target_freq, t0, t1);
+            let points = build_scatter_points(x_ch, x_freq, y_ch, y_freq, target_freq, t0, t1);
             let plot_points = points.iter().map(|p| PlotPoint::new(p.x, p.y)).collect();
             self.cache = Some(ScatterCache {
                 fingerprint,
@@ -210,8 +240,8 @@ impl ScatterPanel {
 
         // Cursor highlight point
         let cursor_point = shared.cursor_time.and_then(|t| {
-            let x_val = interp_at_time(&x_ch.data, x_freq, t)?;
-            let y_val = interp_at_time(&y_ch.data, y_freq, t)?;
+            let x_val = transform_channel_value(x_ch, interp_at_time(&x_ch.data, x_freq, t)?);
+            let y_val = transform_channel_value(y_ch, interp_at_time(&y_ch.data, y_freq, t)?);
             Some([x_val, y_val])
         });
         let mut clicked_cursor_time = None;
@@ -369,9 +399,9 @@ fn clamp_axis_bounds(
 
 /// Build scatter plot points by resampling both channels to a common frequency.
 fn build_scatter_points(
-    x_data: &[f64],
+    x_channel: &PlottedChannel,
     x_freq: u16,
-    y_data: &[f64],
+    y_channel: &PlottedChannel,
     y_freq: u16,
     target_freq: u16,
     t0: f64,
@@ -384,8 +414,8 @@ fn build_scatter_points(
     let start_sample = (t0 * target_freq as f64).floor() as usize;
     let end_sample = (t1 * target_freq as f64).ceil() as usize;
     let end_sample = end_sample
-        .min((x_data.len() as f64 * target_freq as f64 / x_freq.max(1) as f64) as usize)
-        .min((y_data.len() as f64 * target_freq as f64 / y_freq.max(1) as f64) as usize);
+        .min((x_channel.data.len() as f64 * target_freq as f64 / x_freq.max(1) as f64) as usize)
+        .min((y_channel.data.len() as f64 * target_freq as f64 / y_freq.max(1) as f64) as usize);
 
     // Limit to a reasonable number of points for rendering
     let max_points = 50_000;
@@ -396,12 +426,16 @@ fn build_scatter_points(
     while i < end_sample {
         let t = i as f64 / target_freq as f64;
         if let (Some(x), Some(y)) = (
-            interp_at_time(x_data, x_freq, t),
-            interp_at_time(y_data, y_freq, t),
+            interp_at_time(&x_channel.data, x_freq, t),
+            interp_at_time(&y_channel.data, y_freq, t),
         ) && x.is_finite()
             && y.is_finite()
         {
-            points.push(ScatterPoint { x, y, time: t });
+            points.push(ScatterPoint {
+                x: transform_channel_value(x_channel, x),
+                y: transform_channel_value(y_channel, y),
+                time: t,
+            });
         }
         i += step;
     }

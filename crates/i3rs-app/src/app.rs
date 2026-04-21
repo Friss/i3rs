@@ -176,14 +176,74 @@ impl App {
         DockState::new(vec![PanelTab::Graph(graph)])
     }
 
+    fn build_workspace_snapshot_with_popped_out_track_maps(
+        &self,
+        include_popped_out_track_maps: bool,
+    ) -> crate::workspace::WorkspaceFile {
+        let ws_refs: Vec<(String, &egui_dock::DockState<PanelTab>)> = self
+            .worksheets
+            .iter()
+            .map(|ws| (ws.name.clone(), &ws.dock_state))
+            .collect();
+        let mut workspace =
+            crate::workspace::save_workspace(&ws_refs, self.active_worksheet, &self.shared);
+
+        if include_popped_out_track_maps {
+            // Include popped-out track maps in the active worksheet so they're preserved.
+            for tm in &self.popped_out_track_maps {
+                let color_channel_name = tm.color_channel_idx.and_then(|idx| {
+                    self.shared
+                        .ld_file
+                        .as_ref()
+                        .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
+                });
+                if let Some(ws) = workspace.worksheets.get_mut(self.active_worksheet) {
+                    ws.panels.push(crate::workspace::PanelConfig::TrackMap(
+                        crate::workspace::TrackMapPanelConfig {
+                            id: tm.id,
+                            title: tm.title.clone(),
+                            color_channel_name,
+                        },
+                    ));
+                }
+            }
+        }
+
+        workspace
+    }
+
+    fn workspace_snapshot_for_session_reload(&self) -> Option<crate::workspace::WorkspaceFile> {
+        if is_startup_default_layout(&self.worksheets) {
+            None
+        } else {
+            Some(self.build_workspace_snapshot_with_popped_out_track_maps(false))
+        }
+    }
+
+    fn apply_workspace_snapshot(&mut self, workspace: crate::workspace::WorkspaceFile) {
+        let active_worksheet = workspace.active_worksheet;
+        let loaded = crate::workspace::load_workspace(&workspace, &mut self.shared);
+        self.worksheets = loaded
+            .into_iter()
+            .map(|(name, dock_state)| Worksheet { name, dock_state })
+            .collect();
+        self.active_worksheet = active_worksheet.min(self.worksheets.len().saturating_sub(1));
+    }
+
     pub fn open_file(&mut self, path: PathBuf) {
+        let workspace_snapshot = self.workspace_snapshot_for_session_reload();
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let ldx = find_ldx_for_ld(&path);
         match LdFile::open(&path) {
-            Ok(ld) => self.load_session(ld, file_name, Some(path), ldx),
+            Ok(ld) => {
+                self.load_session(ld, file_name, Some(path), ldx);
+                if let Some(workspace) = workspace_snapshot {
+                    self.apply_workspace_snapshot(workspace);
+                }
+            }
             Err(e) => self.load_error = Some(format!("Failed to open file: {e}")),
         }
     }
@@ -194,8 +254,12 @@ impl App {
         bytes: Vec<u8>,
         ldx: Option<LdxFile>,
     ) -> Result<(), String> {
+        let workspace_snapshot = self.workspace_snapshot_for_session_reload();
         let ld = LdFile::from_bytes(bytes)?;
         self.load_session(ld, file_name, None, ldx);
+        if let Some(workspace) = workspace_snapshot {
+            self.apply_workspace_snapshot(workspace);
+        }
         Ok(())
     }
 
@@ -212,11 +276,13 @@ impl App {
 
         let ld = Arc::new(ld);
         self.shared.laps = detect_laps(&ld);
-        self.shared.data_duration = Some(ld.duration_secs());
+        let data_duration = ld.duration_secs();
+        self.shared.data_duration = Some(data_duration);
         self.shared.ld_file = Some(ld);
         self.shared.ld_path = ld_path;
         self.shared.selected_lap = None;
-        self.shared.zoom_range = None;
+        self.shared.cursor_time = None;
+        self.shared.zoom_range = Some((0.0, data_duration));
         self.shared.invalidate_derived_caches();
 
         // Clear all panels' channels and caches across all worksheets
@@ -367,34 +433,7 @@ impl App {
     }
 
     fn build_workspace_snapshot(&self) -> crate::workspace::WorkspaceFile {
-        let ws_refs: Vec<(String, &egui_dock::DockState<PanelTab>)> = self
-            .worksheets
-            .iter()
-            .map(|ws| (ws.name.clone(), &ws.dock_state))
-            .collect();
-        let mut workspace =
-            crate::workspace::save_workspace(&ws_refs, self.active_worksheet, &self.shared);
-
-        // Include popped-out track maps in the active worksheet so they're preserved.
-        for tm in &self.popped_out_track_maps {
-            let color_channel_name = tm.color_channel_idx.and_then(|idx| {
-                self.shared
-                    .ld_file
-                    .as_ref()
-                    .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
-            });
-            if let Some(ws) = workspace.worksheets.get_mut(self.active_worksheet) {
-                ws.panels.push(crate::workspace::PanelConfig::TrackMap(
-                    crate::workspace::TrackMapPanelConfig {
-                        id: tm.id,
-                        title: tm.title.clone(),
-                        color_channel_name,
-                    },
-                ));
-            }
-        }
-
-        workspace
+        self.build_workspace_snapshot_with_popped_out_track_maps(true)
     }
 
     fn collect_known_project_sessions(
@@ -589,17 +628,9 @@ impl App {
                     self.shared.sectors = project.workspace.sectors.clone();
                     self.shared.reference_lap = project.workspace.reference_lap;
 
-                    let loaded =
-                        crate::workspace::load_workspace(&project.workspace, &mut self.shared);
-                    self.worksheets = loaded
-                        .into_iter()
-                        .map(|(name, dock_state)| Worksheet { name, dock_state })
-                        .collect();
-                    self.active_worksheet = project
-                        .workspace
-                        .active_worksheet
-                        .min(self.worksheets.len().saturating_sub(1));
-                    self.sync_project_sessions_from_workspace(&project.workspace);
+                    let workspace = project.workspace;
+                    self.sync_project_sessions_from_workspace(&workspace);
+                    self.apply_workspace_snapshot(workspace);
                 }
                 Err(e) => eprintln!("Failed to parse project: {}", e),
             },
@@ -608,19 +639,7 @@ impl App {
     }
 
     fn switch_project_session(&mut self, path: PathBuf) {
-        let mut workspace = self.build_workspace_snapshot();
-        workspace.last_file_path = Some(path.to_string_lossy().to_string());
-
         self.open_file(path);
-
-        let loaded = crate::workspace::load_workspace(&workspace, &mut self.shared);
-        self.worksheets = loaded
-            .into_iter()
-            .map(|(name, dock_state)| Worksheet { name, dock_state })
-            .collect();
-        self.active_worksheet = workspace
-            .active_worksheet
-            .min(self.worksheets.len().saturating_sub(1));
     }
 
     fn current_session_summary(&self) -> Option<SessionSummary> {
@@ -1167,15 +1186,8 @@ impl App {
                         self.shared.sectors = workspace.sectors.clone();
                         self.shared.reference_lap = workspace.reference_lap;
 
-                        let loaded = crate::workspace::load_workspace(&workspace, &mut self.shared);
-                        self.worksheets = loaded
-                            .into_iter()
-                            .map(|(name, dock_state)| Worksheet { name, dock_state })
-                            .collect();
-                        self.active_worksheet = workspace
-                            .active_worksheet
-                            .min(self.worksheets.len().saturating_sub(1));
                         self.sync_project_sessions_from_workspace(&workspace);
+                        self.apply_workspace_snapshot(workspace);
                     }
                     Err(e) => eprintln!("Failed to parse workspace: {}", e),
                 },
@@ -1749,10 +1761,39 @@ mod tests {
     use crate::panels::histogram::HistogramPanel;
     use crate::state::{ChannelId, PlottedChannel, YAxis};
 
+    const TEST_LD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/VIR_LAP.ld");
+
     fn worksheet_with_tabs(tabs: Vec<PanelTab>) -> Worksheet {
         Worksheet {
             name: "Test".into(),
             dock_state: DockState::new(tabs),
+        }
+    }
+
+    fn test_app(shared: SharedState, worksheets: Vec<Worksheet>) -> App {
+        App {
+            shared,
+            worksheets,
+            active_worksheet: 0,
+            show_channel_browser: true,
+            show_cursor_readout: true,
+            show_math_editor: false,
+            timeline: TimelinePanel::new(),
+            math_editor_state: MathEditorState::new(),
+            popped_out_track_maps: Vec::new(),
+            project_path: None,
+            project_name: None,
+            project_sessions: Vec::new(),
+            theme_choice: ThemeChoice::System,
+            show_channel_preferences: false,
+            show_session_details: false,
+            compare_session_path: None,
+            session_summary_cache: HashMap::new(),
+            load_error: None,
+            #[cfg(target_arch = "wasm32")]
+            web_load_tx: crate::platform::web_load_channel().0,
+            #[cfg(target_arch = "wasm32")]
+            web_load_rx: crate::platform::web_load_channel().1,
         }
     }
 
@@ -1790,5 +1831,99 @@ mod tests {
 
         let worksheet = worksheet_with_tabs(vec![PanelTab::Graph(graph)]);
         assert!(!is_startup_default_layout(&[worksheet]));
+    }
+
+    #[test]
+    fn opening_new_file_reapplies_current_workspace_channels() {
+        let path = PathBuf::from(TEST_LD);
+        let ld = Arc::new(LdFile::open(&path).expect("failed to open test .ld"));
+
+        let mut graph = GraphPanel::new(1, "Graph");
+        graph.plotted_channels.push(PlottedChannel {
+            channel_id: ChannelId::Physical(0),
+            color: egui::Color32::WHITE,
+            data: Arc::new(vec![1.0]),
+            tile_group: 0,
+            y_axis: YAxis::Left,
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
+            cached_min: 1.0,
+            cached_max: 1.0,
+            cached_avg: 1.0,
+        });
+
+        let mut shared = SharedState::new();
+        shared.file_name = "VIR_LAP.ld".into();
+        shared.laps = detect_laps(&ld);
+        shared.data_duration = Some(ld.duration_secs());
+        shared.ld_file = Some(ld);
+        shared.ld_path = Some(path.clone());
+
+        let worksheet = worksheet_with_tabs(vec![PanelTab::Graph(graph)]);
+        let mut app = test_app(shared, vec![worksheet]);
+
+        app.open_file(path);
+
+        let reloaded_graph = app.worksheets[0]
+            .dock_state
+            .iter_all_tabs()
+            .find_map(|(_, tab)| match tab {
+                PanelTab::Graph(graph) => Some(graph),
+                _ => None,
+            })
+            .expect("graph tab should exist");
+
+        assert_eq!(reloaded_graph.plotted_channels.len(), 1);
+    }
+
+    #[test]
+    fn opening_new_file_resets_time_window_to_full_session() {
+        let path = PathBuf::from(TEST_LD);
+        let ld = Arc::new(LdFile::open(&path).expect("failed to open test .ld"));
+        let duration = ld.duration_secs();
+
+        let mut shared = SharedState::new();
+        shared.file_name = "VIR_LAP.ld".into();
+        shared.laps = detect_laps(&ld);
+        shared.data_duration = Some(duration);
+        shared.ld_file = Some(ld);
+        shared.ld_path = Some(path.clone());
+        shared.cursor_time = Some(12.34);
+        shared.zoom_range = Some((1.0, 2.0));
+
+        let worksheet = worksheet_with_tabs(vec![PanelTab::Graph(GraphPanel::new(1, "Graph"))]);
+        let mut app = test_app(shared, vec![worksheet]);
+
+        app.open_file(path);
+
+        assert_eq!(app.shared.cursor_time, None);
+        assert_eq!(app.shared.zoom_range, Some((0.0, duration)));
+    }
+
+    #[test]
+    fn session_reload_snapshot_excludes_popped_out_track_maps() {
+        let shared = SharedState::new();
+        let worksheet = worksheet_with_tabs(vec![
+            PanelTab::Graph(GraphPanel::new(1, "Graph")),
+            PanelTab::Histogram(HistogramPanel::new(3, "Histogram")),
+        ]);
+        let mut app = test_app(shared, vec![worksheet]);
+        app.popped_out_track_maps
+            .push(TrackMapPanel::new(2, "Track Map 2"));
+
+        let workspace = app
+            .workspace_snapshot_for_session_reload()
+            .expect("custom layout should snapshot");
+        app.apply_workspace_snapshot(workspace);
+
+        let docked_track_maps = app.worksheets[0]
+            .dock_state
+            .iter_all_tabs()
+            .filter(|(_, tab)| matches!(tab, PanelTab::TrackMap(_)))
+            .count();
+
+        assert_eq!(docked_track_maps, 0);
+        assert_eq!(app.popped_out_track_maps.len(), 1);
     }
 }
