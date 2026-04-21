@@ -261,6 +261,18 @@ pub fn apply_channel_preferences(channel: &mut PlottedChannel, shared: &SharedSt
     channel.display_unit = pref.display_unit.clone();
 }
 
+fn merged_display_preference(
+    existing: Option<&ChannelPreference>,
+    channel: &PlottedChannel,
+) -> ChannelPreference {
+    ChannelPreference {
+        color: existing.and_then(|pref| pref.color),
+        display_scale: channel.display_scale,
+        display_offset: channel.display_offset,
+        display_unit: channel.display_unit.clone(),
+    }
+}
+
 pub fn show_plotted_channel_display_menu(
     ui: &mut egui::Ui,
     channel: &mut PlottedChannel,
@@ -312,12 +324,7 @@ pub fn show_plotted_channel_display_menu(
     {
         shared.channel_preferences.insert(
             pref_key.clone(),
-            ChannelPreference {
-                color: None,
-                display_scale: channel.display_scale,
-                display_offset: channel.display_offset,
-                display_unit: channel.display_unit.clone(),
-            },
+            merged_display_preference(shared.channel_preferences.get(&pref_key), channel),
         );
         shared.channel_preferences_dirty = true;
         ui.close();
@@ -382,4 +389,40 @@ pub fn segmented_channel_button(
     );
 
     (main_response, clear_response.clicked())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ChannelId;
+
+    #[test]
+    fn merged_display_preference_preserves_existing_color() {
+        let existing = ChannelPreference {
+            color: Some([1, 2, 3]),
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
+        };
+        let channel = PlottedChannel {
+            channel_id: ChannelId::Physical(0),
+            color: egui::Color32::WHITE,
+            data: Arc::new(vec![1.0]),
+            tile_group: 0,
+            y_axis: YAxis::Left,
+            display_scale: 2.0,
+            display_offset: 5.0,
+            display_unit: Some("psi".into()),
+            cached_min: 1.0,
+            cached_max: 1.0,
+            cached_avg: 1.0,
+        };
+
+        let merged = merged_display_preference(Some(&existing), &channel);
+
+        assert_eq!(merged.color, Some([1, 2, 3]));
+        assert_eq!(merged.display_scale, 2.0);
+        assert_eq!(merged.display_offset, 5.0);
+        assert_eq!(merged.display_unit.as_deref(), Some("psi"));
+    }
 }
