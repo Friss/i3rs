@@ -83,6 +83,10 @@ fn read_string(data: &[u8], offset: usize, len: usize) -> String {
     decode_string(&data[offset..offset + len])
 }
 
+pub fn normalize_channel_name(name: &str) -> String {
+    name.to_ascii_lowercase().replace(['.', '_'], " ")
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -206,6 +210,7 @@ pub struct LdFile {
     pub session: Session,
     pub event: Event,
     pub channels: Vec<ChannelMeta>,
+    normalized_name_index: HashMap<String, usize>,
     #[allow(dead_code)]
     chan_meta_ptr: u32,
 }
@@ -265,12 +270,19 @@ impl LdFile {
         let event = parse_event(data, event_ptr);
         let enum_tables = parse_enum_tables(data, chan_data_ptr as usize);
         let channels = parse_channel_metadata(data, chan_meta_ptr, &enum_tables);
+        let mut normalized_name_index = HashMap::new();
+        for channel in &channels {
+            normalized_name_index
+                .entry(normalize_channel_name(&channel.name))
+                .or_insert(channel.index);
+        }
 
         Ok(LdFile {
             backing,
             session,
             event,
             channels,
+            normalized_name_index,
             chan_meta_ptr,
         })
     }
@@ -286,6 +298,17 @@ impl LdFile {
             .iter()
             .map(|ch| ch.duration_secs())
             .fold(0.0_f64, f64::max)
+    }
+
+    pub fn find_channel_by_name(&self, name: &str) -> Option<&ChannelMeta> {
+        if let Some(channel) = self.channels.iter().find(|channel| channel.name == name) {
+            return Some(channel);
+        }
+
+        let normalized = normalize_channel_name(name);
+        self.normalized_name_index
+            .get(&normalized)
+            .and_then(|idx| self.channels.get(*idx))
     }
 
     /// Read and decode all sample data for a channel, applying MoTeC scaling.

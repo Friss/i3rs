@@ -56,6 +56,58 @@ fn channel_count() {
 }
 
 #[test]
+fn normalized_channel_lookup_finds_expected_channels() {
+    let ld = LdFile::open(TEST_LD).unwrap();
+    assert_eq!(
+        ld.find_channel_by_name("GPS_Latitude")
+            .map(|channel| channel.index),
+        ld.channels
+            .iter()
+            .find(|channel| channel.name == "GPS Latitude")
+            .map(|channel| channel.index)
+    );
+    assert_eq!(
+        ld.find_channel_by_name("Vehicle.Speed")
+            .map(|channel| channel.index),
+        ld.channels
+            .iter()
+            .find(|channel| channel.name == "Vehicle Speed")
+            .map(|channel| channel.index)
+    );
+}
+
+#[test]
+fn vir_lap_parser_snapshot() {
+    let ld = LdFile::open(TEST_LD).unwrap();
+    let laps = detect_laps(&ld);
+    let track = extract_gps_track(&ld).expect("GPS track should parse");
+
+    assert_eq!(ld.channels.len(), 199);
+    assert_eq!(laps.len(), 3);
+    assert_eq!(track.x.len(), 2660);
+
+    let engine_speed = ld
+        .channels
+        .iter()
+        .find(|channel| channel.name == "Engine Speed")
+        .expect("Engine Speed channel missing");
+    let lap_number = ld
+        .channels
+        .iter()
+        .find(|channel| channel.name == "Lap Number")
+        .expect("Lap Number channel missing");
+    let gps_latitude = ld
+        .channels
+        .iter()
+        .find(|channel| channel.name == "GPS Latitude")
+        .expect("GPS Latitude channel missing");
+
+    assert_eq!(engine_speed.n_data, 2660);
+    assert_eq!(lap_number.n_data, 266);
+    assert_eq!(gps_latitude.n_data, 2660);
+}
+
+#[test]
 fn duration_is_plausible() {
     let ld = LdFile::open(TEST_LD).unwrap();
     let dur = ld.duration_secs();

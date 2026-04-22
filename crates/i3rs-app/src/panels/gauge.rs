@@ -6,8 +6,8 @@ use eframe::egui;
 use crate::state::{ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
-    build_plotted_channel_info, create_plotted_channel, interp_at_time, resolve_channel_meta,
-    resolve_plotted_channel_display_meta,
+    build_plotted_channel_info, create_plotted_channel, interp_at_time, refresh_plotted_channel,
+    resolve_channel_meta, resolve_plotted_channel_display_meta,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +92,10 @@ impl GaugePanel {
             } else {
                 self.add_channel(ch_id, shared, GaugeStyle::Analog);
             }
+        }
+
+        for gauge in &mut self.gauges {
+            refresh_plotted_channel(&mut gauge.channel, shared);
         }
 
         if self.gauges.is_empty() {

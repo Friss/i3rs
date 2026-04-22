@@ -11,6 +11,12 @@ pub struct ExportChannel<'a> {
     pub dec_places: i16,
 }
 
+struct ExportResamplePlan<'a> {
+    data: &'a [f64],
+    dec_places: usize,
+    source_indices: Vec<usize>,
+}
+
 /// Export channels to a CSV file.
 ///
 /// All channels are resampled to the highest frequency via nearest-neighbor.
@@ -50,28 +56,42 @@ pub fn export_csv(
     }
     writeln!(writer).map_err(|e| e.to_string())?;
 
+    let channel_plans: Vec<ExportResamplePlan<'_>> = channels
+        .iter()
+        .map(|channel| {
+            let dec_places = channel.dec_places.max(0) as usize;
+            let source_indices = if channel.freq == max_freq {
+                (0..n_rows).map(|row| start_sample + row).collect()
+            } else {
+                let ratio = channel.freq as f64 / max_freq as f64;
+                (0..n_rows)
+                    .map(|row| ((start_sample + row) as f64 * ratio).round() as usize)
+                    .collect()
+            };
+            ExportResamplePlan {
+                data: channel.data,
+                dec_places,
+                source_indices,
+            }
+        })
+        .collect();
+
     // Rows
     let dt = 1.0 / max_freq as f64;
-    for i in 0..n_rows {
-        let time = (start_sample + i) as f64 * dt;
+    for row in 0..n_rows {
+        let time = (start_sample + row) as f64 * dt;
         write!(writer, "{:.6}", time).map_err(|e| e.to_string())?;
 
-        for ch in channels {
-            let src_idx = if ch.freq == max_freq {
-                start_sample + i
-            } else {
-                let t = time;
-                (t * ch.freq as f64).round() as usize
-            };
-            let val = if src_idx < ch.data.len() {
-                ch.data[src_idx]
-            } else if !ch.data.is_empty() {
-                ch.data[ch.data.len() - 1]
+        for plan in &channel_plans {
+            let src_idx = plan.source_indices[row];
+            let val = if src_idx < plan.data.len() {
+                plan.data[src_idx]
+            } else if !plan.data.is_empty() {
+                plan.data[plan.data.len() - 1]
             } else {
                 0.0
             };
-            let dec = ch.dec_places.max(0) as usize;
-            write!(writer, ",{:.prec$}", val, prec = dec).map_err(|e| e.to_string())?;
+            write!(writer, ",{:.prec$}", val, prec = plan.dec_places).map_err(|e| e.to_string())?;
         }
         writeln!(writer).map_err(|e| e.to_string())?;
     }

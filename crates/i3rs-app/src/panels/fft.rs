@@ -1,14 +1,15 @@
 //! FFT panel: frequency spectrum analysis for vibration diagnosis.
 
-use std::sync::Arc;
-
 use eframe::egui;
-use egui_plot::{Legend, Line, Plot, PlotPoints};
+use egui_plot::{Legend, Line, Plot, PlotPoint, PlotPoints};
 use i3rs_core::{FftPlanner, compute_fft_with_planner};
 
 use crate::state::{ChannelId, PlottedChannel, SharedState};
 
-use super::utils::{build_plotted_channel_info, create_plotted_channel, resolve_channel_meta};
+use super::utils::{
+    build_plotted_channel_info, create_plotted_channel, refresh_plotted_channel,
+    resolve_channel_meta,
+};
 
 /// Return the sub-slice of data visible in the current zoom range (no copy).
 fn visible_subslice<'a>(data: &'a [f64], freq: u16, shared: &SharedState) -> &'a [f64] {
@@ -24,9 +25,8 @@ fn visible_subslice<'a>(data: &'a [f64], freq: u16, shared: &SharedState) -> &'a
 /// Cached FFT result.
 struct FftCache {
     /// Fingerprint: (data pointer, data length, zoom range, channel_id).
-    fingerprint: (usize, usize, Option<(u64, u64)>, ChannelId),
-    frequencies: Vec<f64>,
-    magnitudes: Vec<f64>,
+    fingerprint: (usize, usize, Option<(u64, u64)>, ChannelId, bool),
+    plot_points: Vec<PlotPoint>,
 }
 
 pub struct FftPanel {
@@ -80,6 +80,8 @@ impl FftPanel {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
+        let _perf = crate::perf_metrics::scope("FFT draw");
+
         // Handle drop from channel browser
         if shared.dragging_channel.is_some()
             && ui.input(|i| i.pointer.any_released())
@@ -96,6 +98,10 @@ impl FftPanel {
             } else {
                 self.add_channel(ch_id, shared);
             }
+        }
+
+        for channel in &mut self.channels {
+            refresh_plotted_channel(channel, shared);
         }
 
         if self.channels.is_empty() {
@@ -142,7 +148,7 @@ impl FftPanel {
         }
 
         // Pre-compute FFT data outside the plot closure
-        let mut fft_lines: Vec<(Vec<[f64; 2]>, egui::Color32, String)> = Vec::new();
+        let mut fft_lines: Vec<(usize, egui::Color32, String)> = Vec::new();
 
         for (i, pc) in self.channels.iter().enumerate() {
             let (name, _, freq, _) = resolve_channel_meta(pc.channel_id, shared);
@@ -150,9 +156,9 @@ impl FftPanel {
                 continue;
             }
 
-            let ptr = Arc::as_ptr(&pc.data) as usize;
+            let ptr = pc.data.as_ptr() as usize;
             let len = pc.data.len();
-            let fingerprint = (ptr, len, zoom_key, pc.channel_id);
+            let fingerprint = (ptr, len, zoom_key, pc.channel_id, log_scale);
 
             let cache: &mut Option<FftCache> = &mut self.caches[i];
             let needs_recompute = cache.as_ref().is_none_or(|c| c.fingerprint != fingerprint);
@@ -160,30 +166,29 @@ impl FftPanel {
             if needs_recompute {
                 let data_slice = visible_subslice(&pc.data, freq, shared);
                 let result = compute_fft_with_planner(data_slice, freq as f64, &mut self.planner);
-                *cache = Some(FftCache {
-                    fingerprint,
-                    frequencies: result.frequencies,
-                    magnitudes: result.magnitudes,
-                });
-            }
-
-            if let Some(c) = cache.as_ref() {
-                let points: Vec<[f64; 2]> = c
+                let plot_points = result
                     .frequencies
                     .iter()
-                    .zip(c.magnitudes.iter())
-                    .skip(1) // skip DC component
-                    .map(|(&f, &m): (&f64, &f64)| {
+                    .zip(result.magnitudes.iter())
+                    .skip(1)
+                    .map(|(&f, &m)| {
                         let y = if log_scale {
                             (m.max(1e-12)).log10() * 20.0
                         } else {
                             m
                         };
-                        [f, y]
+                        PlotPoint::new(f, y)
                     })
                     .collect();
+                *cache = Some(FftCache {
+                    fingerprint,
+                    plot_points,
+                });
+            }
 
-                fft_lines.push((points, pc.color, name));
+            if let Some(c) = cache.as_ref() {
+                let _ = c;
+                fft_lines.push((i, pc.color, name));
             }
         }
 
@@ -199,8 +204,13 @@ impl FftPanel {
             .y_axis_label(y_label)
             .allow_boxed_zoom(true)
             .show(ui, |plot_ui| {
-                for (points, color, name) in &fft_lines {
-                    plot_ui.line(Line::new(name, PlotPoints::new(points.clone())).color(*color));
+                for (idx, color, name) in &fft_lines {
+                    if let Some(cache) = self.caches.get(*idx).and_then(|cache| cache.as_ref()) {
+                        plot_ui.line(
+                            Line::new(name, PlotPoints::Borrowed(cache.plot_points.as_slice()))
+                                .color(*color),
+                        );
+                    }
                 }
             });
     }

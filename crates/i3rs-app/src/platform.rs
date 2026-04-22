@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 #[cfg(target_arch = "wasm32")]
 use std::sync::mpsc::{Receiver, Sender, channel};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::{
+    Receiver as NativeReceiver, Sender as NativeSender, channel as native_channel,
+};
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Debug)]
@@ -14,6 +18,12 @@ pub enum WebLoadEvent {
         ldx_xml: Option<String>,
     },
     Error(String),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+pub enum NativePickEvent {
+    SessionPath(PathBuf),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -124,6 +134,14 @@ pub fn web_load_channel() -> (Sender<WebLoadEvent>, Receiver<WebLoadEvent>) {
     channel()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub fn native_pick_channel() -> (
+    NativeSender<NativePickEvent>,
+    NativeReceiver<NativePickEvent>,
+) {
+    native_channel()
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn begin_pick_session(tx: Sender<WebLoadEvent>, ctx: egui::Context) {
     wasm_bindgen_futures::spawn_local(async move {
@@ -168,6 +186,18 @@ pub fn begin_pick_session(tx: Sender<WebLoadEvent>, ctx: egui::Context) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn begin_pick_session(_ctx: &egui::Context) -> Option<PathBuf> {
-    native_dialog().add_filter("MoTeC Log", &["ld"]).pick_file()
+pub fn begin_pick_session(tx: NativeSender<NativePickEvent>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let picked = pollster::block_on(
+            rfd::AsyncFileDialog::new()
+                .set_title("Select a MoTeC .ld file")
+                .add_filter("MoTeC Log", &["ld"])
+                .pick_file(),
+        );
+
+        if let Some(handle) = picked {
+            let _ = tx.send(NativePickEvent::SessionPath(handle.path().to_path_buf()));
+            ctx.request_repaint();
+        }
+    });
 }

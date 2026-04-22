@@ -17,3 +17,10 @@ memmap2 = { workspace = true }
 quick-xml = { workspace = true }
 rustfft = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "perf_benches"
+harness = false

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::Lap;
-use crate::ld_parser::LdFile;
+use crate::ld_parser::{LdFile, normalize_channel_name};
 
 /// Normalized GPS track data ready for rendering.
 pub struct TrackData {
@@ -15,6 +15,192 @@ pub struct TrackData {
     pub time: Vec<f64>,
     /// GPS sample frequency (Hz).
     pub freq: u16,
+    spatial_index: Option<TrackSpatialIndex>,
+}
+
+impl TrackData {
+    pub fn from_normalized_parts(x: Vec<f64>, y: Vec<f64>, time: Vec<f64>, freq: u16) -> Self {
+        let spatial_index = TrackSpatialIndex::build(&x, &y);
+        Self {
+            x,
+            y,
+            time,
+            freq,
+            spatial_index,
+        }
+    }
+}
+
+struct TrackSpatialIndex {
+    min_x: f64,
+    min_y: f64,
+    cell_width: f64,
+    cell_height: f64,
+    cols: usize,
+    rows: usize,
+    cells: Vec<Vec<usize>>,
+}
+
+impl TrackSpatialIndex {
+    fn build(x: &[f64], y: &[f64]) -> Option<Self> {
+        if x.is_empty() || y.is_empty() {
+            return None;
+        }
+
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+
+        for (&xv, &yv) in x.iter().zip(y.iter()) {
+            if xv.is_finite() && yv.is_finite() {
+                min_x = min_x.min(xv);
+                max_x = max_x.max(xv);
+                min_y = min_y.min(yv);
+                max_y = max_y.max(yv);
+            }
+        }
+
+        if !min_x.is_finite() || !min_y.is_finite() {
+            return None;
+        }
+
+        let grid_dim = ((x.len() as f64 / 64.0).sqrt().ceil() as usize).clamp(4, 128);
+        let span_x = (max_x - min_x).max(1e-9);
+        let span_y = (max_y - min_y).max(1e-9);
+        let cell_width = span_x / grid_dim as f64;
+        let cell_height = span_y / grid_dim as f64;
+        let cell_count = grid_dim * grid_dim;
+        let mut cells = vec![Vec::new(); cell_count];
+
+        let index = Self {
+            min_x,
+            min_y,
+            cell_width,
+            cell_height,
+            cols: grid_dim,
+            rows: grid_dim,
+            cells: Vec::new(),
+        };
+
+        for (sample_idx, (&xv, &yv)) in x.iter().zip(y.iter()).enumerate() {
+            let (col, row) = index.cell_coords(xv, yv);
+            cells[index.cell_index(col, row)].push(sample_idx);
+        }
+
+        Some(Self { cells, ..index })
+    }
+
+    fn find_nearest(&self, track: &TrackData, x: f64, y: f64) -> usize {
+        let (base_col, base_row) = self.cell_coords(x, y);
+        let max_ring = self.cols.max(self.rows);
+        let mut best_idx = 0usize;
+        let mut best_dist = f64::INFINITY;
+
+        for ring in 0..max_ring {
+            self.for_each_ring_cell(base_col, base_row, ring, |col, row| {
+                for &sample_idx in &self.cells[self.cell_index(col, row)] {
+                    let dx = track.x[sample_idx] - x;
+                    let dy = track.y[sample_idx] - y;
+                    let dist = dx * dx + dy * dy;
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_idx = sample_idx;
+                    }
+                }
+            });
+
+            if best_dist.is_finite() {
+                let next_ring = ring + 1;
+                if next_ring >= max_ring {
+                    break;
+                }
+
+                let mut next_ring_min_dist = f64::INFINITY;
+                self.for_each_ring_cell(base_col, base_row, next_ring, |col, row| {
+                    let dist = self.cell_rect_distance2(col, row, x, y);
+                    next_ring_min_dist = next_ring_min_dist.min(dist);
+                });
+
+                if !next_ring_min_dist.is_finite() || best_dist <= next_ring_min_dist {
+                    break;
+                }
+            }
+        }
+
+        best_idx
+    }
+
+    fn for_each_ring_cell(
+        &self,
+        base_col: usize,
+        base_row: usize,
+        ring: usize,
+        mut visit: impl FnMut(usize, usize),
+    ) {
+        let min_col = base_col.saturating_sub(ring);
+        let max_col = (base_col + ring).min(self.cols.saturating_sub(1));
+        let min_row = base_row.saturating_sub(ring);
+        let max_row = (base_row + ring).min(self.rows.saturating_sub(1));
+
+        if ring == 0 {
+            visit(base_col, base_row);
+            return;
+        }
+
+        for col in min_col..=max_col {
+            visit(col, min_row);
+            if max_row != min_row {
+                visit(col, max_row);
+            }
+        }
+
+        if max_row > min_row + 1 {
+            for row in (min_row + 1)..max_row {
+                visit(min_col, row);
+                if max_col != min_col {
+                    visit(max_col, row);
+                }
+            }
+        }
+    }
+
+    fn cell_coords(&self, x: f64, y: f64) -> (usize, usize) {
+        let col = ((x - self.min_x) / self.cell_width).floor() as isize;
+        let row = ((y - self.min_y) / self.cell_height).floor() as isize;
+        (
+            col.clamp(0, self.cols.saturating_sub(1) as isize) as usize,
+            row.clamp(0, self.rows.saturating_sub(1) as isize) as usize,
+        )
+    }
+
+    fn cell_index(&self, col: usize, row: usize) -> usize {
+        row * self.cols + col
+    }
+
+    fn cell_rect_distance2(&self, col: usize, row: usize, x: f64, y: f64) -> f64 {
+        let x0 = self.min_x + col as f64 * self.cell_width;
+        let x1 = x0 + self.cell_width;
+        let y0 = self.min_y + row as f64 * self.cell_height;
+        let y1 = y0 + self.cell_height;
+
+        let dx = if x < x0 {
+            x0 - x
+        } else if x > x1 {
+            x - x1
+        } else {
+            0.0
+        };
+        let dy = if y < y0 {
+            y0 - y
+        } else if y > y1 {
+            y - y1
+        } else {
+            0.0
+        };
+
+        dx * dx + dy * dy
+    }
 }
 
 /// A track sector defined by GPS sample index boundaries.
@@ -87,14 +273,14 @@ pub fn extract_gps_track(ld: &LdFile) -> Option<TrackData> {
         }
     }
 
-    Some(TrackData { x, y, time, freq })
+    Some(TrackData::from_normalized_parts(x, y, time, freq))
 }
 
 /// Find a GPS channel by looking for "gps" + one of the given suffixes in the channel name.
 fn find_gps_channel<'a>(ld: &'a LdFile, suffixes: &[&str]) -> Option<&'a crate::ChannelMeta> {
     let channels = &ld.channels;
     channels.iter().find(|ch| {
-        let name = ch.name.to_lowercase().replace(['.', '_'], " ");
+        let name = normalize_channel_name(&ch.name);
         name.contains("gps") && suffixes.iter().any(|s| name.contains(s))
     })
 }
@@ -102,6 +288,10 @@ fn find_gps_channel<'a>(ld: &'a LdFile, suffixes: &[&str]) -> Option<&'a crate::
 /// Find the nearest GPS sample to the given normalized (x, y) coordinate.
 /// Returns the sample index.
 pub fn find_nearest_sample(track: &TrackData, x: f64, y: f64) -> usize {
+    if let Some(index) = &track.spatial_index {
+        return index.find_nearest(track, x, y);
+    }
+
     let mut best_idx = 0;
     let mut best_dist = f64::MAX;
     for i in 0..track.x.len() {
@@ -324,12 +514,12 @@ mod tests {
 
     #[test]
     fn test_find_nearest_sample() {
-        let track = TrackData {
-            x: vec![0.0, 1.0, 2.0, 3.0],
-            y: vec![0.0, 0.0, 1.0, 1.0],
-            time: vec![0.0, 0.05, 0.1, 0.15],
-            freq: 20,
-        };
+        let track = TrackData::from_normalized_parts(
+            vec![0.0, 1.0, 2.0, 3.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.05, 0.1, 0.15],
+            20,
+        );
         assert_eq!(find_nearest_sample(&track, 0.1, 0.1), 0);
         assert_eq!(find_nearest_sample(&track, 2.1, 0.9), 2);
         assert_eq!(find_nearest_sample(&track, 3.0, 1.0), 3);
@@ -337,12 +527,8 @@ mod tests {
 
     #[test]
     fn test_resample_to_track() {
-        let track = TrackData {
-            x: vec![0.0, 0.0],
-            y: vec![0.0, 0.0],
-            time: vec![0.0, 0.5],
-            freq: 2,
-        };
+        let track =
+            TrackData::from_normalized_parts(vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.5], 2);
         // 10 Hz source data
         let data: Vec<f64> = (0..10).map(|i| i as f64 * 10.0).collect();
         let resampled = resample_to_track(&track, &data, 10);

@@ -1,11 +1,15 @@
 //! Shared application state accessible by all panels.
 
 use eframe::egui;
-use i3rs_core::{Lap, LdFile, LdxFile, Sector, format_state_value, is_state_channel};
+use i3rs_core::{
+    DownsampledPoint, Lap, LdFile, LdxFile, Sector, TrackData, downsample_minmax,
+    format_state_value, is_state_channel,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Identifies a channel: either a physical channel from the .ld file or a math channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,7 +31,7 @@ pub enum YAxis {
 pub struct PlottedChannel {
     pub channel_id: ChannelId,
     pub color: egui::Color32,
-    pub data: Arc<Vec<f64>>,
+    pub data: Arc<[f64]>,
     pub tile_group: usize,
     pub y_axis: YAxis,
     pub display_scale: f64,
@@ -48,7 +52,7 @@ pub struct PlottedChannelInfo {
     pub freq: u16,
     pub dec_places: i16,
     pub color: egui::Color32,
-    pub data: Arc<Vec<f64>>,
+    pub data: Arc<[f64]>,
     pub display_scale: f64,
     pub display_offset: f64,
     /// Enum/state labels parsed from the .ld file (value → label).
@@ -79,23 +83,35 @@ impl PlottedChannelInfo {
 
 /// A user-defined math channel.
 pub struct MathChannelDef {
+    pub id: u64,
     pub name: String,
     pub expression: String,
     pub unit: String,
     pub dec_places: i16,
     pub freq: u16,
     /// Cached evaluation result.
-    pub data: Option<Arc<Vec<f64>>>,
+    pub data: Option<Arc<[f64]>>,
     /// Parse or evaluation error.
     pub error: Option<String>,
+    pub evaluation_state: MathEvaluationState,
     pub cached_min: f64,
     pub cached_max: f64,
     pub cached_avg: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MathEvaluationState {
+    Queued,
+    WaitingForInputs,
+    Running,
+    Ready,
+    Error,
+}
+
 impl MathChannelDef {
-    pub fn new(name: String, expression: String, unit: String, dec_places: i16) -> Self {
+    pub fn new(id: u64, name: String, expression: String, unit: String, dec_places: i16) -> Self {
         Self {
+            id,
             name,
             expression,
             unit,
@@ -103,6 +119,7 @@ impl MathChannelDef {
             freq: 0,
             data: None,
             error: None,
+            evaluation_state: MathEvaluationState::Queued,
             cached_min: 0.0,
             cached_max: 0.0,
             cached_avg: 0.0,
@@ -110,8 +127,104 @@ impl MathChannelDef {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChannelStats {
+    pub min: f64,
+    pub max: f64,
+    pub avg: f64,
+    pub stddev: f64,
+}
+
+pub struct DecodedChannel {
+    pub data: Arc<[f64]>,
+    pub stats: ChannelStats,
+    #[allow(dead_code)]
+    pub freq: u16,
+    lod_levels: RwLock<Vec<LodLevel>>,
+}
+
+#[derive(Clone)]
+pub struct LodLevel {
+    pub points: Arc<[DownsampledPoint]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DownsampleSeriesKey {
+    pub data_ptr: usize,
+    pub data_len: usize,
+    pub freq: u16,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub target_width: usize,
+}
+
+#[derive(Clone)]
+pub struct DownsampleSeriesRequest {
+    pub key: DownsampleSeriesKey,
+    pub data: Arc<[f64]>,
+    pub freq: u16,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub target_width: usize,
+}
+
+impl DecodedChannel {
+    pub fn best_lod_level_for_view(
+        &self,
+        visible_sample_count: usize,
+        target_width: usize,
+    ) -> Option<LodLevel> {
+        if visible_sample_count == 0 || target_width == 0 || self.data.is_empty() {
+            return None;
+        }
+
+        self.ensure_lod_levels();
+
+        let desired_visible_points = target_width.saturating_mul(2) as f64;
+        let visible_fraction = visible_sample_count as f64 / self.data.len().max(1) as f64;
+
+        let levels = self.lod_levels.read().ok()?;
+        levels
+            .iter()
+            .filter_map(|level| {
+                let estimated_visible_points = level.points.len() as f64 * visible_fraction;
+                (estimated_visible_points >= desired_visible_points)
+                    .then_some((estimated_visible_points, level.clone()))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, level)| level)
+    }
+
+    fn ensure_lod_levels(&self) {
+        if let Ok(levels) = self.lod_levels.read()
+            && !levels.is_empty()
+        {
+            return;
+        }
+
+        if let Ok(mut levels) = self.lod_levels.write() {
+            if !levels.is_empty() {
+                return;
+            }
+
+            for &target_buckets in &[2_048usize, 8_192, 32_768, 131_072] {
+                if self.data.len() > target_buckets.saturating_mul(2) {
+                    levels.push(LodLevel {
+                        points: Arc::from(downsample_minmax(
+                            &self.data,
+                            self.freq,
+                            0,
+                            target_buckets,
+                        )),
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Compute min, max, avg, stddev for a slice of finite f64 values.
-pub fn compute_channel_stats(data: &[f64]) -> (f64, f64, f64, f64) {
+pub fn compute_channel_stats(data: &[f64]) -> ChannelStats {
     let mut min = f64::MAX;
     let mut max = f64::MIN;
     let mut sum = 0.0;
@@ -131,7 +244,7 @@ pub fn compute_channel_stats(data: &[f64]) -> (f64, f64, f64, f64) {
     }
 
     if count == 0 {
-        return (0.0, 0.0, 0.0, 0.0);
+        return ChannelStats::default();
     }
 
     let avg = sum / count as f64;
@@ -144,7 +257,12 @@ pub fn compute_channel_stats(data: &[f64]) -> (f64, f64, f64, f64) {
     }
     let stddev = (var_sum / count as f64).sqrt();
 
-    (min, max, avg, stddev)
+    ChannelStats {
+        min,
+        max,
+        avg,
+        stddev,
+    }
 }
 
 /// Graph display mode.
@@ -196,7 +314,7 @@ pub fn channel_preference_key(name: &str) -> String {
 
 #[derive(Clone)]
 pub struct DistanceAxisCache {
-    pub data: Arc<Vec<f64>>,
+    pub data: Arc<[f64]>,
     pub freq: u16,
 }
 
@@ -216,10 +334,10 @@ pub struct CachedChannelStats {
     pub name: String,
     pub color: egui::Color32,
     pub dec_places: i16,
-    /// Full session stats: (min, max, avg, stddev).
-    pub session: (f64, f64, f64, f64),
-    /// Per-lap stats: (lap_name, min, max, avg, stddev).
-    pub per_lap: Vec<(String, f64, f64, f64, f64)>,
+    /// Full session stats.
+    pub session: ChannelStats,
+    /// Per-lap stats.
+    pub per_lap: Vec<(String, ChannelStats)>,
 }
 
 /// Cache for report panel statistics, invalidated when channels or laps change.
@@ -245,7 +363,7 @@ impl ReportCache {
             return false;
         }
         for (i, info) in registry.iter().enumerate() {
-            let ptr = Arc::as_ptr(&info.data) as usize;
+            let ptr = info.data.as_ptr() as usize;
             let (ref name, cached_ptr, cached_len, ref unit, scale_bits, offset_bits) =
                 self.fingerprint[i];
             if name != &info.name
@@ -268,7 +386,7 @@ impl ReportCache {
             .map(|info| {
                 (
                     info.name.clone(),
-                    Arc::as_ptr(&info.data) as usize,
+                    info.data.as_ptr() as usize,
                     info.data.len(),
                     info.unit.clone(),
                     info.display_scale.to_bits(),
@@ -281,13 +399,13 @@ impl ReportCache {
 
         for info in registry {
             let mut session = compute_channel_stats(&info.data);
-            session.0 = info.transform_value(session.0);
-            session.1 = info.transform_value(session.1);
+            session.min = info.transform_value(session.min);
+            session.max = info.transform_value(session.max);
             if info.display_scale < 0.0 {
-                std::mem::swap(&mut session.0, &mut session.1);
+                std::mem::swap(&mut session.min, &mut session.max);
             }
-            session.2 = info.transform_value(session.2);
-            session.3 *= info.display_scale.abs();
+            session.avg = info.transform_value(session.avg);
+            session.stddev *= info.display_scale.abs();
             let freq = info.freq;
             let mut per_lap = Vec::with_capacity(laps.len());
 
@@ -298,14 +416,14 @@ impl ReportCache {
                 let end = end_sample.min(info.data.len());
                 if start < end {
                     let mut stats = compute_channel_stats(&info.data[start..end]);
-                    stats.0 = info.transform_value(stats.0);
-                    stats.1 = info.transform_value(stats.1);
+                    stats.min = info.transform_value(stats.min);
+                    stats.max = info.transform_value(stats.max);
                     if info.display_scale < 0.0 {
-                        std::mem::swap(&mut stats.0, &mut stats.1);
+                        std::mem::swap(&mut stats.min, &mut stats.max);
                     }
-                    stats.2 = info.transform_value(stats.2);
-                    stats.3 *= info.display_scale.abs();
-                    per_lap.push((lap.name.clone(), stats.0, stats.1, stats.2, stats.3));
+                    stats.avg = info.transform_value(stats.avg);
+                    stats.stddev *= info.display_scale.abs();
+                    per_lap.push((lap.name.clone(), stats));
                 }
             }
 
@@ -322,6 +440,7 @@ impl ReportCache {
 
 /// State shared across all panels.
 pub struct SharedState {
+    pub session_id: u64,
     pub ld_file: Option<Arc<LdFile>>,
     pub ld_path: Option<PathBuf>,
     pub file_name: String,
@@ -369,14 +488,28 @@ pub struct SharedState {
 
     // Next panel ID counter
     pub next_panel_id: u64,
+    next_math_channel_id: u64,
 
     // Derived channel caches
     pub distance_axis_cache: Option<DistanceAxisCache>,
+    pub decoded_channel_cache: RefCell<HashMap<usize, Arc<DecodedChannel>>>,
+    pending_channel_decodes: RefCell<HashSet<usize>>,
+    requested_channel_decodes: RefCell<Vec<usize>>,
+    pending_math_evaluations: RefCell<HashSet<u64>>,
+    requested_math_evaluations: RefCell<Vec<u64>>,
+    downsampled_series_cache: RefCell<HashMap<DownsampleSeriesKey, Arc<[DownsampledPoint]>>>,
+    pending_downsampled_series: RefCell<HashSet<DownsampleSeriesKey>>,
+    requested_downsampled_series: RefCell<Vec<DownsampleSeriesRequest>>,
+    track_data_cache: RefCell<Option<Arc<TrackData>>>,
+    pending_track_data_build: RefCell<bool>,
+    requested_track_data_build: RefCell<bool>,
+    resolved_track_data_build: RefCell<bool>,
 }
 
 impl SharedState {
     pub fn new() -> Self {
         Self {
+            session_id: 0,
             ld_file: None,
             ld_path: None,
             file_name: String::new(),
@@ -401,11 +534,237 @@ impl SharedState {
             sectors: Vec::new(),
             reference_lap: None,
             next_panel_id: 1,
+            next_math_channel_id: 1,
             distance_axis_cache: None,
+            decoded_channel_cache: RefCell::new(HashMap::new()),
+            pending_channel_decodes: RefCell::new(HashSet::new()),
+            requested_channel_decodes: RefCell::new(Vec::new()),
+            pending_math_evaluations: RefCell::new(HashSet::new()),
+            requested_math_evaluations: RefCell::new(Vec::new()),
+            downsampled_series_cache: RefCell::new(HashMap::new()),
+            pending_downsampled_series: RefCell::new(HashSet::new()),
+            requested_downsampled_series: RefCell::new(Vec::new()),
+            track_data_cache: RefCell::new(None),
+            pending_track_data_build: RefCell::new(false),
+            requested_track_data_build: RefCell::new(false),
+            resolved_track_data_build: RefCell::new(false),
         }
     }
 
     pub fn invalidate_derived_caches(&mut self) {
         self.distance_axis_cache = None;
+        self.downsampled_series_cache.borrow_mut().clear();
+        self.pending_downsampled_series.borrow_mut().clear();
+        self.requested_downsampled_series.borrow_mut().clear();
+    }
+
+    pub fn invalidate_session_caches(&mut self) {
+        self.invalidate_derived_caches();
+        self.decoded_channel_cache.borrow_mut().clear();
+        self.pending_channel_decodes.borrow_mut().clear();
+        self.requested_channel_decodes.borrow_mut().clear();
+        self.pending_math_evaluations.borrow_mut().clear();
+        self.requested_math_evaluations.borrow_mut().clear();
+        self.track_data_cache.borrow_mut().take();
+        *self.pending_track_data_build.borrow_mut() = false;
+        *self.requested_track_data_build.borrow_mut() = false;
+        *self.resolved_track_data_build.borrow_mut() = false;
+    }
+
+    pub fn downsampled_series_if_ready(
+        &self,
+        key: &DownsampleSeriesKey,
+    ) -> Option<Arc<[DownsampledPoint]>> {
+        self.downsampled_series_cache
+            .borrow()
+            .get(key)
+            .map(Arc::clone)
+    }
+
+    pub fn request_downsampled_series(&self, request: DownsampleSeriesRequest) {
+        if self
+            .downsampled_series_cache
+            .borrow()
+            .contains_key(&request.key)
+        {
+            return;
+        }
+
+        let mut pending = self.pending_downsampled_series.borrow_mut();
+        if !pending.insert(request.key.clone()) {
+            return;
+        }
+
+        self.requested_downsampled_series.borrow_mut().push(request);
+    }
+
+    pub fn take_requested_downsampled_series(&self) -> Vec<DownsampleSeriesRequest> {
+        let mut requested = self.requested_downsampled_series.borrow_mut();
+        std::mem::take(&mut *requested)
+    }
+
+    pub fn request_math_channel_evaluation_by_id(&self, math_id: u64) {
+        let mut pending = self.pending_math_evaluations.borrow_mut();
+        if !pending.insert(math_id) {
+            return;
+        }
+        self.requested_math_evaluations.borrow_mut().push(math_id);
+    }
+
+    pub fn take_requested_math_channel_evaluations(&self) -> Vec<u64> {
+        let mut requested = self.requested_math_evaluations.borrow_mut();
+        std::mem::take(&mut *requested)
+    }
+
+    pub fn complete_math_channel_evaluation(&self, math_id: u64) {
+        self.pending_math_evaluations.borrow_mut().remove(&math_id);
+    }
+
+    pub fn cancel_math_channel_evaluation(&self, math_id: u64) {
+        self.pending_math_evaluations.borrow_mut().remove(&math_id);
+    }
+
+    pub fn has_pending_math_evaluations(&self) -> bool {
+        !self.pending_math_evaluations.borrow().is_empty()
+            || !self.requested_math_evaluations.borrow().is_empty()
+    }
+
+    pub fn are_math_channels_settled(&self) -> bool {
+        !self.has_pending_math_evaluations()
+            && self.math_channels.iter().all(|mc| {
+                matches!(
+                    mc.evaluation_state,
+                    MathEvaluationState::Ready | MathEvaluationState::Error
+                )
+            })
+    }
+
+    pub fn create_math_channel_def(
+        &mut self,
+        name: String,
+        expression: String,
+        unit: String,
+        dec_places: i16,
+    ) -> MathChannelDef {
+        let id = self.next_math_channel_id;
+        self.next_math_channel_id += 1;
+        MathChannelDef::new(id, name, expression, unit, dec_places)
+    }
+
+    pub fn math_channel_index_by_id(&self, math_id: u64) -> Option<usize> {
+        self.math_channels.iter().position(|mc| mc.id == math_id)
+    }
+
+    pub fn store_downsampled_series(
+        &self,
+        key: DownsampleSeriesKey,
+        points: Vec<DownsampledPoint>,
+    ) {
+        self.pending_downsampled_series.borrow_mut().remove(&key);
+        self.downsampled_series_cache
+            .borrow_mut()
+            .insert(key, Arc::from(points));
+    }
+
+    pub fn cancel_downsampled_series(&self, key: &DownsampleSeriesKey) {
+        self.pending_downsampled_series.borrow_mut().remove(key);
+    }
+
+    pub fn track_data_if_ready(&self) -> Option<Arc<TrackData>> {
+        self.track_data_cache.borrow().as_ref().map(Arc::clone)
+    }
+
+    pub fn request_track_data_build(&self) {
+        if self.track_data_cache.borrow().is_some()
+            || *self.pending_track_data_build.borrow()
+            || *self.resolved_track_data_build.borrow()
+        {
+            return;
+        }
+
+        *self.pending_track_data_build.borrow_mut() = true;
+        *self.requested_track_data_build.borrow_mut() = true;
+    }
+
+    pub fn take_requested_track_data_build(&self) -> bool {
+        let mut requested = self.requested_track_data_build.borrow_mut();
+        let was_requested = *requested;
+        *requested = false;
+        was_requested
+    }
+
+    pub fn is_track_data_build_pending(&self) -> bool {
+        *self.pending_track_data_build.borrow()
+    }
+
+    pub fn store_track_data(&self, track_data: Option<TrackData>) {
+        *self.pending_track_data_build.borrow_mut() = false;
+        *self.resolved_track_data_build.borrow_mut() = true;
+        *self.track_data_cache.borrow_mut() = track_data.map(Arc::new);
+    }
+
+    pub fn cancel_track_data_build(&self) {
+        *self.pending_track_data_build.borrow_mut() = false;
+    }
+
+    pub fn decoded_physical_channel_if_ready(
+        &self,
+        channel_idx: usize,
+    ) -> Option<Arc<DecodedChannel>> {
+        self.decoded_channel_cache
+            .borrow()
+            .get(&channel_idx)
+            .map(Arc::clone)
+    }
+
+    pub fn request_physical_channel_decode(&self, channel_idx: usize) {
+        if self
+            .decoded_channel_cache
+            .borrow()
+            .contains_key(&channel_idx)
+        {
+            return;
+        }
+
+        let mut pending = self.pending_channel_decodes.borrow_mut();
+        if !pending.insert(channel_idx) {
+            return;
+        }
+
+        self.requested_channel_decodes
+            .borrow_mut()
+            .push(channel_idx);
+    }
+
+    pub fn take_requested_physical_channel_decodes(&self) -> Vec<usize> {
+        let mut requested = self.requested_channel_decodes.borrow_mut();
+        std::mem::take(&mut *requested)
+    }
+
+    pub fn store_decoded_physical_channel(
+        &self,
+        channel_idx: usize,
+        data: Vec<f64>,
+        stats: ChannelStats,
+        freq: u16,
+    ) {
+        self.pending_channel_decodes
+            .borrow_mut()
+            .remove(&channel_idx);
+        self.decoded_channel_cache.borrow_mut().insert(
+            channel_idx,
+            Arc::new(DecodedChannel {
+                data: Arc::from(data),
+                stats,
+                freq,
+                lod_levels: RwLock::new(Vec::new()),
+            }),
+        );
+    }
+
+    pub fn cancel_physical_channel_decode(&self, channel_idx: usize) {
+        self.pending_channel_decodes
+            .borrow_mut()
+            .remove(&channel_idx);
     }
 }

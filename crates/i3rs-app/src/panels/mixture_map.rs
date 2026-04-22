@@ -4,16 +4,15 @@
 //! The panel bins the data into a 2D grid and colors each cell by the
 //! average value channel reading in that bin.
 
-use std::sync::Arc;
-
 use eframe::egui;
 
 use crate::state::{ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
     DisplayTransformFingerprint, build_plotted_channel_info, create_plotted_channel,
-    display_transform_fingerprint, interp_at_time, resolve_plotted_channel_display_meta,
-    segmented_channel_button, show_plotted_channel_display_menu, transform_channel_value,
+    display_transform_fingerprint, interp_at_time, refresh_plotted_channel,
+    resolve_plotted_channel_display_meta, segmented_channel_button,
+    show_plotted_channel_display_menu, transform_channel_value,
 };
 
 #[derive(PartialEq, Eq)]
@@ -97,6 +96,16 @@ impl MixtureMapPanel {
         // Handle pending toggle
         if let Some(ch_id) = shared.pending_toggle_channel.take() {
             self.add_channel(ch_id, shared);
+        }
+
+        if let Some(channel) = self.x_channel.as_mut() {
+            refresh_plotted_channel(channel, shared);
+        }
+        if let Some(channel) = self.y_channel.as_mut() {
+            refresh_plotted_channel(channel, shared);
+        }
+        if let Some(channel) = self.value_channel.as_mut() {
+            refresh_plotted_channel(channel, shared);
         }
 
         // Toolbar
@@ -213,9 +222,9 @@ impl MixtureMapPanel {
 
         let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
         let fingerprint = HeatmapFingerprint {
-            x_data_ptr: Arc::as_ptr(&x_ch.data) as usize,
-            y_data_ptr: Arc::as_ptr(&y_ch.data) as usize,
-            value_data_ptr: Arc::as_ptr(&v_ch.data) as usize,
+            x_data_ptr: x_ch.data.as_ptr() as usize,
+            y_data_ptr: y_ch.data.as_ptr() as usize,
+            value_data_ptr: v_ch.data.as_ptr() as usize,
             zoom_key,
             bins: self.bins,
             x_transform: display_transform_fingerprint(x_ch),

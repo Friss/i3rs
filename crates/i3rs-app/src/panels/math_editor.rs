@@ -5,7 +5,8 @@ use i3rs_core::math_engine::ChannelData;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::state::{MathChannelDef, SharedState};
+use crate::background_jobs::EvaluatedMathChannel;
+use crate::state::{MathChannelDef, MathEvaluationState, SharedState};
 
 /// A predefined math channel template.
 struct PredefinedCalc {
@@ -172,14 +173,14 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
                 )
                 .clicked()
             {
-                let mut mc = MathChannelDef::new(
+                let math_channel = shared.create_math_channel_def(
                     editor.new_name.clone(),
                     editor.new_expression.clone(),
                     editor.new_unit.clone(),
                     2,
                 );
-                evaluate_math_channel(&mut mc, shared);
-                shared.math_channels.push(mc);
+                shared.math_channels.push(math_channel);
+                queue_math_channel_evaluation(shared, shared.math_channels.len() - 1);
                 shared.invalidate_derived_caches();
                 editor.new_name.clear();
                 editor.new_expression.clear();
@@ -292,11 +293,14 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
         });
 
     if let Some(idx) = to_reevaluate {
-        evaluate_single_math_channel(shared, idx);
+        queue_math_channel_evaluation(shared, idx);
         shared.invalidate_derived_caches();
     }
 
     if let Some(idx) = to_remove {
+        if let Some(math_id) = shared.math_channels.get(idx).map(|mc| mc.id) {
+            shared.cancel_math_channel_evaluation(math_id);
+        }
         shared.math_channels.remove(idx);
         shared.invalidate_derived_caches();
     }
@@ -372,14 +376,20 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
 fn build_channel_data_map(
     shared: &SharedState,
     expression: &str,
-    exclude_idx: usize,
-) -> HashMap<String, ChannelData> {
+    exclude_math_id: u64,
+) -> EvaluationInputs {
     let mut channel_data: HashMap<String, ChannelData> = HashMap::new();
+    let mut waiting_on_inputs = false;
 
     // Parse expression to find which channels are referenced
     let refs: Vec<String> = match i3rs_core::parse_expression(expression) {
         Ok(expr) => i3rs_core::referenced_channels(&expr),
-        Err(_) => return channel_data,
+        Err(_) => {
+            return EvaluationInputs {
+                channel_data,
+                waiting_on_inputs: false,
+            };
+        }
     };
 
     // Expand alias targets so we also load channels referenced indirectly
@@ -400,88 +410,83 @@ fn build_channel_data_map(
                     || r.replace('_', ".") == ch.name
                     || r.eq_ignore_ascii_case(&ch.name)
             });
-            if needed && let Some(data) = ld.read_channel_data(ch) {
-                channel_data.insert(
-                    ch.name.clone(),
-                    ChannelData {
-                        samples: data,
-                        freq: ch.freq,
-                    },
-                );
+            if needed {
+                if let Some(decoded) = shared.decoded_physical_channel_if_ready(ch.index) {
+                    channel_data.insert(
+                        ch.name.clone(),
+                        ChannelData {
+                            samples: decoded.data.to_vec(),
+                            freq: ch.freq,
+                        },
+                    );
+                } else {
+                    shared.request_physical_channel_decode(ch.index);
+                    waiting_on_inputs = true;
+                }
             }
         }
     }
 
     // Add other evaluated math channels that are referenced
-    for (i, other) in shared.math_channels.iter().enumerate() {
-        if i != exclude_idx
-            && resolved_refs.iter().any(|r| r == &other.name)
-            && let Some(ref data) = other.data
-        {
-            channel_data.insert(
-                other.name.clone(),
-                ChannelData {
-                    samples: (**data).clone(),
-                    freq: other.freq,
-                },
-            );
+    for other in &shared.math_channels {
+        if other.id != exclude_math_id && resolved_refs.iter().any(|r| r == &other.name) {
+            if let Some(ref data) = other.data {
+                channel_data.insert(
+                    other.name.clone(),
+                    ChannelData {
+                        samples: data.to_vec(),
+                        freq: other.freq,
+                    },
+                );
+            } else if matches!(
+                other.evaluation_state,
+                MathEvaluationState::Queued
+                    | MathEvaluationState::WaitingForInputs
+                    | MathEvaluationState::Running
+            ) {
+                waiting_on_inputs = true;
+            }
         }
     }
 
-    channel_data
+    EvaluationInputs {
+        channel_data,
+        waiting_on_inputs,
+    }
 }
 
-/// Evaluate a single math channel definition (used when adding a new one).
-pub fn evaluate_math_channel(mc: &mut MathChannelDef, shared: &SharedState) {
-    let channel_data = build_channel_data_map(shared, &mc.expression, usize::MAX);
-    eval_mc(mc, &channel_data, &shared.channel_aliases);
+pub struct MathEvaluationJobInput {
+    pub math_id: u64,
+    pub expression: String,
+    pub aliases: HashMap<String, String>,
+    pub channel_data: HashMap<String, ChannelData>,
 }
 
-/// Evaluate a single math channel by index within shared.math_channels.
-fn evaluate_single_math_channel(shared: &mut SharedState, idx: usize) {
-    let expr = shared.math_channels[idx].expression.clone();
-    let channel_data = build_channel_data_map(shared, &expr, idx);
-    let aliases = shared.channel_aliases.clone();
-    eval_mc(&mut shared.math_channels[idx], &channel_data, &aliases);
-}
-
-fn eval_mc(
+fn mark_math_channel_status(
     mc: &mut MathChannelDef,
-    channel_data: &HashMap<String, ChannelData>,
-    aliases: &HashMap<String, String>,
+    evaluation_state: MathEvaluationState,
+    message: Option<&str>,
 ) {
-    match i3rs_core::evaluate_expression_with_aliases(&mc.expression, channel_data, aliases) {
-        Ok((samples, freq)) => {
-            let (min, max, avg, _) = crate::state::compute_channel_stats(&samples);
-            mc.freq = freq;
-            mc.data = Some(Arc::new(samples));
-            mc.error = None;
-            mc.cached_min = min;
-            mc.cached_max = max;
-            mc.cached_avg = avg;
-        }
-        Err(e) => {
-            mc.data = None;
-            mc.error = Some(e);
-        }
-    }
+    mc.data = None;
+    mc.freq = 0;
+    mc.error = message.map(str::to_string);
+    mc.evaluation_state = evaluation_state;
+    mc.cached_min = 0.0;
+    mc.cached_max = 0.0;
+    mc.cached_avg = 0.0;
 }
 
 /// Evaluate all math channels in dependency order (topological sort).
 pub fn evaluate_all_math_channels(shared: &mut SharedState) {
-    let order = topological_eval_order(shared);
-    let aliases = shared.channel_aliases.clone();
-    for i in order {
-        let expr = shared.math_channels[i].expression.clone();
-        let channel_data = build_channel_data_map(shared, &expr, i);
-        eval_mc(&mut shared.math_channels[i], &channel_data, &aliases);
+    for idx in topological_eval_order(shared) {
+        queue_math_channel_evaluation(shared, idx);
     }
     shared.invalidate_derived_caches();
 }
 
 /// Compute a topological evaluation order for math channels based on their dependencies.
 /// Falls back to original index order for channels involved in cycles.
-fn topological_eval_order(shared: &SharedState) -> Vec<usize> {
+pub fn topological_eval_order(shared: &SharedState) -> Vec<usize> {
     let n = shared.math_channels.len();
     if n == 0 {
         return Vec::new();
@@ -549,6 +554,89 @@ fn topological_eval_order(shared: &SharedState) -> Vec<usize> {
     order
 }
 
+pub fn queue_math_channel_evaluation(shared: &mut SharedState, idx: usize) {
+    let Some(mc) = shared.math_channels.get_mut(idx) else {
+        return;
+    };
+    let math_id = mc.id;
+    mark_math_channel_status(
+        mc,
+        MathEvaluationState::Queued,
+        Some("Queued for evaluation..."),
+    );
+    shared.request_math_channel_evaluation_by_id(math_id);
+}
+
+pub fn build_math_evaluation_job(
+    shared: &mut SharedState,
+    math_id: u64,
+) -> Option<MathEvaluationJobInput> {
+    let idx = shared.math_channel_index_by_id(math_id)?;
+    let expression = shared.math_channels.get(idx)?.expression.clone();
+    let inputs = build_channel_data_map(shared, &expression, math_id);
+    if inputs.waiting_on_inputs {
+        if let Some(mc) = shared.math_channels.get_mut(idx) {
+            mark_math_channel_status(
+                mc,
+                MathEvaluationState::WaitingForInputs,
+                Some("Waiting for source channels..."),
+            );
+        }
+        return None;
+    }
+
+    if let Some(mc) = shared.math_channels.get_mut(idx) {
+        mark_math_channel_status(mc, MathEvaluationState::Running, Some("Evaluating..."));
+    }
+
+    Some(MathEvaluationJobInput {
+        math_id,
+        expression,
+        aliases: shared.channel_aliases.clone(),
+        channel_data: inputs.channel_data,
+    })
+}
+
+pub fn apply_math_evaluation_result(
+    shared: &mut SharedState,
+    math_id: u64,
+    expression: &str,
+    result: Result<EvaluatedMathChannel, String>,
+) -> bool {
+    let Some(idx) = shared.math_channel_index_by_id(math_id) else {
+        return false;
+    };
+    let Some(mc) = shared.math_channels.get_mut(idx) else {
+        return false;
+    };
+    if mc.expression != expression {
+        return false;
+    }
+
+    match result {
+        Ok(evaluated) => {
+            mc.freq = evaluated.freq;
+            mc.data = Some(Arc::from(evaluated.samples));
+            mc.error = None;
+            mc.evaluation_state = MathEvaluationState::Ready;
+            mc.cached_min = evaluated.stats.min;
+            mc.cached_max = evaluated.stats.max;
+            mc.cached_avg = evaluated.stats.avg;
+        }
+        Err(err) => {
+            mc.data = None;
+            mc.freq = 0;
+            mc.error = Some(err);
+            mc.evaluation_state = MathEvaluationState::Error;
+            mc.cached_min = 0.0;
+            mc.cached_max = 0.0;
+            mc.cached_avg = 0.0;
+        }
+    }
+
+    true
+}
+
 /// Save math channels to a JSON file.
 pub fn save_math_channels(shared: &SharedState) {
     let configs: Vec<crate::workspace::MathChannelConfig> = shared
@@ -578,7 +666,7 @@ pub fn load_math_channels(shared: &mut SharedState) {
                 match serde_json::from_str::<Vec<crate::workspace::MathChannelConfig>>(&json) {
                     Ok(configs) => {
                         for config in configs {
-                            let mc = MathChannelDef::new(
+                            let mc = shared.create_math_channel_def(
                                 config.name,
                                 config.expression,
                                 config.unit,
@@ -622,4 +710,37 @@ fn is_duplicate_name(name: &str, shared: &SharedState, exclude_math_idx: Option<
         }
     }
     false
+}
+struct EvaluationInputs {
+    channel_data: HashMap<String, ChannelData>,
+    waiting_on_inputs: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_math_evaluation_job, queue_math_channel_evaluation};
+    use crate::state::SharedState;
+
+    #[test]
+    fn math_jobs_follow_channel_ids_after_list_reordering() {
+        let mut shared = SharedState::new();
+        let first = shared.create_math_channel_def("A".into(), "1".into(), String::new(), 2);
+        let second = shared.create_math_channel_def("B".into(), "2".into(), String::new(), 2);
+        let second_id = second.id;
+        shared.math_channels.push(first);
+        shared.math_channels.push(second);
+
+        queue_math_channel_evaluation(&mut shared, 1);
+        assert_eq!(
+            shared.take_requested_math_channel_evaluations(),
+            vec![second_id]
+        );
+
+        shared.math_channels.remove(0);
+
+        let job = build_math_evaluation_job(&mut shared, second_id)
+            .expect("remaining math channel should still be addressable by id");
+        assert_eq!(job.math_id, second_id);
+        assert_eq!(shared.math_channels[0].name, "B");
+    }
 }

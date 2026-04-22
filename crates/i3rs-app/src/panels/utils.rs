@@ -7,13 +7,14 @@ use eframe::egui;
 
 use crate::state::{
     CHANNEL_COLORS, ChannelId, ChannelPreference, PlottedChannel, PlottedChannelInfo, SharedState,
-    YAxis, channel_preference_key, compute_channel_stats,
+    YAxis, channel_preference_key,
 };
 
 pub type ChannelDisplayMeta = (String, String, u16, i16, Arc<HashMap<i64, String>>);
 
 static EMPTY_ENUM_LABELS: LazyLock<Arc<HashMap<i64, String>>> =
     LazyLock::new(|| Arc::new(HashMap::new()));
+static EMPTY_SAMPLES: LazyLock<Arc<[f64]>> = LazyLock::new(|| Arc::from(Vec::<f64>::new()));
 
 #[derive(Clone, Copy)]
 pub struct DisplayUnitPreset {
@@ -187,16 +188,20 @@ pub fn get_visible_slice(data: &[f64], freq: u16, shared: &SharedState) -> Vec<f
     }
 }
 
-/// Load raw channel data from a ChannelId, returning the data vector.
-pub fn load_channel_data(channel_id: ChannelId, shared: &SharedState) -> Option<Vec<f64>> {
+/// Load raw channel data from a ChannelId, returning the immutable shared sample buffer.
+pub fn load_channel_data(channel_id: ChannelId, shared: &SharedState) -> Option<Arc<[f64]>> {
     match channel_id {
         ChannelId::Physical(idx) => {
-            let ld = shared.ld_file.as_ref()?;
-            ld.read_channel_data(ld.channels.get(idx)?)
+            if let Some(decoded) = shared.decoded_physical_channel_if_ready(idx) {
+                Some(Arc::clone(&decoded.data))
+            } else {
+                shared.request_physical_channel_decode(idx);
+                Some(Arc::clone(&EMPTY_SAMPLES))
+            }
         }
         ChannelId::Math(idx) => {
             let mc = shared.math_channels.get(idx)?;
-            Some((**mc.data.as_ref()?).clone())
+            Some(Arc::clone(mc.data.as_ref()?))
         }
     }
 }
@@ -208,22 +213,78 @@ pub fn create_plotted_channel(
     color_idx: usize,
 ) -> Option<PlottedChannel> {
     let data = load_channel_data(channel_id, shared)?;
-    let (min, max, avg, _) = compute_channel_stats(&data);
+    let (cached_min, cached_max, cached_avg) = match channel_id {
+        ChannelId::Physical(idx) => {
+            if let Some(decoded) = shared.decoded_physical_channel_if_ready(idx) {
+                (decoded.stats.min, decoded.stats.max, decoded.stats.avg)
+            } else {
+                (0.0, 0.0, 0.0)
+            }
+        }
+        ChannelId::Math(idx) => {
+            let mc = shared.math_channels.get(idx)?;
+            (mc.cached_min, mc.cached_max, mc.cached_avg)
+        }
+    };
     let mut plotted = PlottedChannel {
         channel_id,
         color: CHANNEL_COLORS[color_idx % CHANNEL_COLORS.len()],
-        data: Arc::new(data),
+        data,
         tile_group: color_idx,
         y_axis: YAxis::Left,
         display_scale: 1.0,
         display_offset: 0.0,
         display_unit: None,
-        cached_min: min,
-        cached_max: max,
-        cached_avg: avg,
+        cached_min,
+        cached_max,
+        cached_avg,
     };
     apply_channel_preferences(&mut plotted, shared);
     Some(plotted)
+}
+
+pub fn refresh_plotted_channel(channel: &mut PlottedChannel, shared: &SharedState) -> bool {
+    match channel.channel_id {
+        ChannelId::Physical(idx) => {
+            if let Some(decoded) = shared.decoded_physical_channel_if_ready(idx) {
+                let changed = channel.data.as_ptr() != decoded.data.as_ptr()
+                    || channel.data.len() != decoded.data.len()
+                    || channel.cached_min.to_bits() != decoded.stats.min.to_bits()
+                    || channel.cached_max.to_bits() != decoded.stats.max.to_bits()
+                    || channel.cached_avg.to_bits() != decoded.stats.avg.to_bits();
+                if changed {
+                    channel.data = Arc::clone(&decoded.data);
+                    channel.cached_min = decoded.stats.min;
+                    channel.cached_max = decoded.stats.max;
+                    channel.cached_avg = decoded.stats.avg;
+                }
+                changed
+            } else {
+                shared.request_physical_channel_decode(idx);
+                false
+            }
+        }
+        ChannelId::Math(idx) => {
+            let Some(math_channel) = shared.math_channels.get(idx) else {
+                return false;
+            };
+            let Some(data) = &math_channel.data else {
+                return false;
+            };
+            let changed = channel.data.as_ptr() != data.as_ptr()
+                || channel.data.len() != data.len()
+                || channel.cached_min.to_bits() != math_channel.cached_min.to_bits()
+                || channel.cached_max.to_bits() != math_channel.cached_max.to_bits()
+                || channel.cached_avg.to_bits() != math_channel.cached_avg.to_bits();
+            if changed {
+                channel.data = Arc::clone(data);
+                channel.cached_min = math_channel.cached_min;
+                channel.cached_max = math_channel.cached_max;
+                channel.cached_avg = math_channel.cached_avg;
+            }
+            changed
+        }
+    }
 }
 
 /// Build readout metadata for a plotted channel.
@@ -407,7 +468,7 @@ mod tests {
         let channel = PlottedChannel {
             channel_id: ChannelId::Physical(0),
             color: egui::Color32::WHITE,
-            data: Arc::new(vec![1.0]),
+            data: Arc::from(vec![1.0]),
             tile_group: 0,
             y_axis: YAxis::Left,
             display_scale: 2.0,
