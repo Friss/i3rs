@@ -666,12 +666,12 @@ fn output_len_impl(expr: &Expr, resolver: &ChannelResolver<'_>, output_freq: u16
     let refs = referenced_channels(expr);
     let mut max_duration: f64 = 0.0;
     for name in &refs {
-        if let Some((_, channel)) = resolver.get_channel(name) {
-            if channel.freq > 0 {
-                let dur = channel.samples.len() as f64 / channel.freq as f64;
-                if dur > max_duration {
-                    max_duration = dur;
-                }
+        if let Some((_, channel)) = resolver.get_channel(name)
+            && channel.freq > 0
+        {
+            let dur = channel.samples.len() as f64 / channel.freq as f64;
+            if dur > max_duration {
+                max_duration = dur;
             }
         }
     }
