@@ -460,8 +460,8 @@ pub struct BackgroundJobs {
 impl BackgroundJobs {
     pub fn new() -> Self {
         let (request_tx, request_rx) =
-            crossbeam_channel::bounded::<(JobRequest, egui::Context)>(64);
-        let (result_tx, result_rx) = crossbeam_channel::bounded::<JobResult>(64);
+            crossbeam_channel::unbounded::<(JobRequest, egui::Context)>();
+        let (result_tx, result_rx) = crossbeam_channel::unbounded::<JobResult>();
 
         std::thread::spawn(move || {
             while let Ok((request, ctx)) = request_rx.recv() {
