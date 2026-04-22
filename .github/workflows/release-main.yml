@@ -137,6 +137,7 @@ jobs:
           }
 
           check_publish_needed i3rs-core
+          sleep 5s
           check_publish_needed i3rs-cli
 
       - name: Publish i3rs-core
