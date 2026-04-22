@@ -1,7 +1,5 @@
 //! Histogram panel: distribution of channel values with per-lap breakdown.
 
-use std::sync::Arc;
-
 use eframe::egui;
 use egui_plot::{Bar, BarChart, Legend, Plot};
 
@@ -9,7 +7,7 @@ use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
     DisplayTransformFingerprint, build_plotted_channel_info, create_plotted_channel,
-    display_transform_fingerprint, get_visible_slice, interp_at_time,
+    display_transform_fingerprint, get_visible_slice, interp_at_time, refresh_plotted_channel,
     resolve_plotted_channel_display_meta, segmented_channel_button,
     show_plotted_channel_display_menu, transform_channel_value,
 };
@@ -111,6 +109,10 @@ impl HistogramPanel {
             } else {
                 self.add_channel(ch_id, shared);
             }
+        }
+
+        for channel in &mut self.channels {
+            refresh_plotted_channel(channel, shared);
         }
 
         if self.channels.is_empty() {
@@ -220,7 +222,7 @@ impl HistogramPanel {
             .channels
             .iter()
             .map(|pc| HistogramChannelFingerprint {
-                data_ptr: Arc::as_ptr(&pc.data) as usize,
+                data_ptr: pc.data.as_ptr() as usize,
                 display_transform: display_transform_fingerprint(pc),
             })
             .collect();

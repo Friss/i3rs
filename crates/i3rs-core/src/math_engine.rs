@@ -1,9 +1,8 @@
 //! Math channel evaluator: evaluates parsed expressions against channel data.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::math_expr::{BinOp, Expr, parse_expression, referenced_channels};
 
@@ -36,6 +35,36 @@ impl std::error::Error for MathError {}
 // Channel name resolution
 // ---------------------------------------------------------------------------
 
+fn normalize_channel_name(name: &str) -> String {
+    name.to_ascii_lowercase().replace(['.', '_'], " ")
+}
+
+fn resolve_actual_channel_name<'a>(
+    reference: &str,
+    available: &'a HashMap<String, ChannelData>,
+    normalized_name_index: &HashMap<String, String>,
+) -> Option<&'a str> {
+    if let Some((key, _)) = available.get_key_value(reference) {
+        return Some(key);
+    }
+
+    let with_spaces = reference.replace('_', " ");
+    if let Some((key, _)) = available.get_key_value(&with_spaces) {
+        return Some(key);
+    }
+
+    let with_dots = reference.replace('_', ".");
+    if let Some((key, _)) = available.get_key_value(&with_dots) {
+        return Some(key);
+    }
+
+    let normalized = normalize_channel_name(reference);
+    normalized_name_index
+        .get(&normalized)
+        .and_then(|key| available.get_key_value(key).map(|(key, _)| key.as_str()))
+}
+
+#[allow(dead_code)]
 /// Resolve a channel reference against available channel names.
 ///
 /// Resolution priority: exact → underscore-to-space → underscore-to-dot
@@ -45,39 +74,35 @@ fn resolve_channel_name<'a>(
     available: &'a HashMap<String, ChannelData>,
     aliases: &HashMap<String, String>,
 ) -> Option<&'a str> {
-    if let Some((k, _)) = available.get_key_value(reference) {
-        return Some(k);
+    let mut normalized_name_index = HashMap::new();
+    for key in available.keys() {
+        normalized_name_index
+            .entry(normalize_channel_name(key))
+            .or_insert_with(|| key.clone());
+    }
+
+    if let Some(key) = resolve_actual_channel_name(reference, available, &normalized_name_index) {
+        return Some(key);
     }
 
     let with_spaces = reference.replace('_', " ");
-    if let Some((k, _)) = available.get_key_value(&with_spaces) {
-        return Some(k);
-    }
-
     let with_dots = reference.replace('_', ".");
-    if let Some((k, _)) = available.get_key_value(&with_dots) {
-        return Some(k);
-    }
-
     for variant in [reference, with_spaces.as_str(), with_dots.as_str()] {
         if let Some(target) = aliases.get(variant)
-            && let Some((k, _)) = available.get_key_value(target)
+            && let Some(key) =
+                resolve_actual_channel_name(target, available, &normalized_name_index)
         {
-            return Some(k);
-        }
-    }
-
-    for key in available.keys() {
-        if key.eq_ignore_ascii_case(reference) {
             return Some(key);
         }
     }
 
+    let normalized_reference = normalize_channel_name(reference);
     for (alias, target) in aliases {
-        if alias.eq_ignore_ascii_case(reference)
-            && let Some((k, _)) = available.get_key_value(target)
+        if normalize_channel_name(alias) == normalized_reference
+            && let Some(key) =
+                resolve_actual_channel_name(target, available, &normalized_name_index)
         {
-            return Some(k);
+            return Some(key);
         }
     }
 
@@ -111,18 +136,12 @@ pub fn resolve_alias_target(reference: &str, aliases: &HashMap<String, String>) 
 // ---------------------------------------------------------------------------
 
 /// Resample a channel to a target frequency using linear interpolation.
-/// Returns a borrowed slice when no resampling is needed.
-fn resample<'a>(
-    data: &'a [f64],
-    src_freq: u16,
-    target_freq: u16,
-    target_len: usize,
-) -> Cow<'a, [f64]> {
+fn resample(data: &[f64], src_freq: u16, target_freq: u16, target_len: usize) -> Vec<f64> {
     if src_freq == target_freq && data.len() == target_len {
-        return Cow::Borrowed(data);
+        return data.to_vec();
     }
     if data.is_empty() {
-        return Cow::Owned(vec![0.0; target_len]);
+        return vec![0.0; target_len];
     }
 
     let mut out = Vec::with_capacity(target_len);
@@ -141,7 +160,7 @@ fn resample<'a>(
         };
         out.push(val);
     }
-    Cow::Owned(out)
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +168,401 @@ fn resample<'a>(
 // ---------------------------------------------------------------------------
 
 static EMPTY_ALIASES: LazyLock<HashMap<String, String>> = LazyLock::new(HashMap::new);
+static PARSED_EXPRESSION_CACHE: LazyLock<RwLock<HashMap<String, Arc<Expr>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn parse_expression_cached(expression: &str) -> Result<Arc<Expr>, crate::math_expr::ParseError> {
+    if let Ok(cache) = PARSED_EXPRESSION_CACHE.read()
+        && let Some(parsed) = cache.get(expression)
+    {
+        return Ok(Arc::clone(parsed));
+    }
+
+    let parsed = Arc::new(parse_expression(expression)?);
+    if let Ok(mut cache) = PARSED_EXPRESSION_CACHE.write() {
+        cache.insert(expression.to_string(), Arc::clone(&parsed));
+    }
+    Ok(parsed)
+}
+
+struct ChannelResolver<'a> {
+    channels: &'a HashMap<String, ChannelData>,
+    normalized_name_index: HashMap<String, String>,
+    alias_name_index: HashMap<String, String>,
+}
+
+impl<'a> ChannelResolver<'a> {
+    fn new(channels: &'a HashMap<String, ChannelData>, aliases: &HashMap<String, String>) -> Self {
+        let mut normalized_name_index = HashMap::new();
+        for key in channels.keys() {
+            normalized_name_index
+                .entry(normalize_channel_name(key))
+                .or_insert_with(|| key.clone());
+        }
+
+        let mut alias_name_index = HashMap::new();
+        for (alias, target) in aliases {
+            if let Some(actual) =
+                resolve_actual_channel_name(target, channels, &normalized_name_index)
+            {
+                alias_name_index.insert(alias.clone(), actual.to_string());
+                alias_name_index
+                    .entry(normalize_channel_name(alias))
+                    .or_insert_with(|| actual.to_string());
+            }
+        }
+
+        Self {
+            channels,
+            normalized_name_index,
+            alias_name_index,
+        }
+    }
+
+    fn resolve(&self, reference: &str) -> Option<&str> {
+        if let Some(key) =
+            resolve_actual_channel_name(reference, self.channels, &self.normalized_name_index)
+        {
+            return Some(key);
+        }
+
+        let with_spaces = reference.replace('_', " ");
+        let with_dots = reference.replace('_', ".");
+        for variant in [reference, with_spaces.as_str(), with_dots.as_str()] {
+            if let Some(actual) = self.alias_name_index.get(variant) {
+                return Some(actual.as_str());
+            }
+        }
+
+        let normalized = normalize_channel_name(reference);
+        self.alias_name_index
+            .get(&normalized)
+            .or_else(|| self.normalized_name_index.get(&normalized))
+            .map(String::as_str)
+    }
+
+    fn get_channel(&self, reference: &str) -> Option<(&str, &'a ChannelData)> {
+        let key = self.resolve(reference)?;
+        self.channels
+            .get_key_value(key)
+            .map(|(key, value)| (key.as_str(), value))
+    }
+}
+
+struct EvaluationContext<'a> {
+    resolver: ChannelResolver<'a>,
+    output_freq: u16,
+    output_len: usize,
+    resample_cache: HashMap<(String, u16, u16, usize), Arc<Vec<f64>>>,
+    node_outputs: HashMap<usize, Arc<Vec<f64>>>,
+}
+
+impl<'a> EvaluationContext<'a> {
+    fn new(
+        channels: &'a HashMap<String, ChannelData>,
+        aliases: &'a HashMap<String, String>,
+        output_freq: u16,
+        output_len: usize,
+    ) -> Self {
+        Self {
+            resolver: ChannelResolver::new(channels, aliases),
+            output_freq,
+            output_len,
+            resample_cache: HashMap::new(),
+            node_outputs: HashMap::new(),
+        }
+    }
+
+    fn evaluate(&mut self, expr: &Expr) -> Result<Arc<Vec<f64>>, MathError> {
+        let node_id = expr as *const Expr as usize;
+        if let Some(cached) = self.node_outputs.get(&node_id) {
+            return Ok(Arc::clone(cached));
+        }
+
+        let output = match expr {
+            Expr::Number(n) => Arc::new(vec![*n; self.output_len]),
+
+            Expr::Channel(name) => {
+                let (resolved, channel) =
+                    self.resolver.get_channel(name).ok_or_else(|| MathError {
+                        message: format!("unknown channel '{}'", name),
+                    })?;
+                let cache_key = (
+                    resolved.to_string(),
+                    channel.freq,
+                    self.output_freq,
+                    self.output_len,
+                );
+                if let Some(cached) = self.resample_cache.get(&cache_key) {
+                    Arc::clone(cached)
+                } else {
+                    let resampled = if channel.freq == self.output_freq
+                        && channel.samples.len() == self.output_len
+                    {
+                        channel.samples.clone()
+                    } else {
+                        resample(
+                            &channel.samples,
+                            channel.freq,
+                            self.output_freq,
+                            self.output_len,
+                        )
+                    };
+                    let resampled = Arc::new(resampled);
+                    self.resample_cache
+                        .insert(cache_key, Arc::clone(&resampled));
+                    resampled
+                }
+            }
+
+            Expr::UnaryNeg(inner) => {
+                let vals = self.evaluate(inner)?;
+                Arc::new(vals.iter().map(|v| -*v).collect())
+            }
+
+            Expr::BinaryOp(lhs, op, rhs) => {
+                let left = self.evaluate(lhs)?;
+                let right = self.evaluate(rhs)?;
+                Arc::new(
+                    left.iter()
+                        .zip(right.iter())
+                        .map(|(&l, &r)| match op {
+                            BinOp::Add => l + r,
+                            BinOp::Sub => l - r,
+                            BinOp::Mul => l * r,
+                            BinOp::Div => {
+                                if r == 0.0 {
+                                    f64::NAN
+                                } else {
+                                    l / r
+                                }
+                            }
+                            BinOp::Mod => {
+                                if r == 0.0 {
+                                    f64::NAN
+                                } else {
+                                    l % r
+                                }
+                            }
+                            BinOp::Gt => {
+                                if l > r {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            BinOp::Lt => {
+                                if l < r {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            BinOp::Gte => {
+                                if l >= r {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            BinOp::Lte => {
+                                if l <= r {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            BinOp::Eq => {
+                                if l == r {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            BinOp::Neq => {
+                                if l != r {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            BinOp::And => {
+                                if !l.is_nan() && l != 0.0 && !r.is_nan() && r != 0.0 {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            BinOp::Or => {
+                                if (!l.is_nan() && l != 0.0) || (!r.is_nan() && r != 0.0) {
+                                    1.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                        })
+                        .collect(),
+                )
+            }
+
+            Expr::FuncCall(name, args) => self.evaluate_function(name, args)?,
+        };
+
+        self.node_outputs.insert(node_id, Arc::clone(&output));
+        Ok(output)
+    }
+
+    fn evaluate_function(&mut self, name: &str, args: &[Expr]) -> Result<Arc<Vec<f64>>, MathError> {
+        match name {
+            "smooth" => {
+                if args.len() != 2 {
+                    return Err(MathError {
+                        message: "smooth() requires 2 arguments: smooth(channel, window_size)"
+                            .into(),
+                    });
+                }
+                let data = self.evaluate(&args[0])?;
+                let window = match &args[1] {
+                    Expr::Number(n) => *n as usize,
+                    _ => self.evaluate(&args[1])?[0] as usize,
+                };
+                Ok(Arc::new(moving_average(&data, window.max(1))))
+            }
+            "derivative" => {
+                if args.len() != 1 {
+                    return Err(MathError {
+                        message: "derivative() requires 1 argument".into(),
+                    });
+                }
+                let data = self.evaluate(&args[0])?;
+                Ok(Arc::new(finite_derivative(&data, self.output_freq)))
+            }
+            "integrate" => {
+                if args.len() != 1 {
+                    return Err(MathError {
+                        message: "integrate() requires 1 argument".into(),
+                    });
+                }
+                let data = self.evaluate(&args[0])?;
+                Ok(Arc::new(cumulative_integral(&data, self.output_freq)))
+            }
+            "abs" => self.unary_fn(args, f64::abs),
+            "sqrt" => self.unary_fn(args, f64::sqrt),
+            "sin" => self.unary_fn(args, f64::sin),
+            "cos" => self.unary_fn(args, f64::cos),
+            "tan" => self.unary_fn(args, f64::tan),
+            "asin" => self.unary_fn(args, f64::asin),
+            "acos" => self.unary_fn(args, f64::acos),
+            "atan" => self.unary_fn(args, f64::atan),
+            "log" | "ln" => self.unary_fn(args, f64::ln),
+            "exp" => self.unary_fn(args, f64::exp),
+            "floor" => self.unary_fn(args, f64::floor),
+            "ceil" => self.unary_fn(args, f64::ceil),
+            "round" => self.unary_fn(args, f64::round),
+            "atan2" => self.binary_fn(args, f64::atan2),
+            "pow" => self.binary_fn(args, f64::powf),
+            "min" => self.binary_fn(args, f64::min),
+            "max" => self.binary_fn(args, f64::max),
+            "clamp" => {
+                if args.len() != 3 {
+                    return Err(MathError {
+                        message: "clamp() requires 3 arguments: clamp(value, min, max)".into(),
+                    });
+                }
+                let val = self.evaluate(&args[0])?;
+                let lo = self.evaluate(&args[1])?;
+                let hi = self.evaluate(&args[2])?;
+                Ok(Arc::new(
+                    val.iter()
+                        .zip(lo.iter())
+                        .zip(hi.iter())
+                        .map(|((&v, &l), &h)| v.clamp(l, h))
+                        .collect(),
+                ))
+            }
+            "gate" => {
+                if args.len() != 2 {
+                    return Err(MathError {
+                        message: "gate() requires 2 arguments: gate(data, condition)".into(),
+                    });
+                }
+                let data = self.evaluate(&args[0])?;
+                let cond = self.evaluate(&args[1])?;
+                Ok(Arc::new(
+                    data.iter()
+                        .zip(cond.iter())
+                        .map(|(&d, &c)| if c != 0.0 { d } else { f64::NAN })
+                        .collect(),
+                ))
+            }
+            "if_then" => {
+                if args.len() != 3 {
+                    return Err(MathError {
+                        message:
+                            "if_then() requires 3 arguments: if_then(condition, true_val, false_val)"
+                                .into(),
+                    });
+                }
+                let cond = self.evaluate(&args[0])?;
+                let true_val = self.evaluate(&args[1])?;
+                let false_val = self.evaluate(&args[2])?;
+                Ok(Arc::new(
+                    cond.iter()
+                        .zip(true_val.iter())
+                        .zip(false_val.iter())
+                        .map(|((&c, &t), &f)| if c != 0.0 { t } else { f })
+                        .collect(),
+                ))
+            }
+            "kmh_to_mph" => self.unary_fn(args, |v| v * 0.621371),
+            "mph_to_kmh" => self.unary_fn(args, |v| v * 1.60934),
+            "c_to_f" => self.unary_fn(args, |v| v * 9.0 / 5.0 + 32.0),
+            "f_to_c" => self.unary_fn(args, |v| (v - 32.0) * 5.0 / 9.0),
+            "kpa_to_psi" => self.unary_fn(args, |v| v * 0.145038),
+            "psi_to_kpa" => self.unary_fn(args, |v| v * 6.89476),
+            "bar_to_psi" => self.unary_fn(args, |v| v * 14.5038),
+            "psi_to_bar" => self.unary_fn(args, |v| v / 14.5038),
+            "deg_to_rad" => self.unary_fn(args, f64::to_radians),
+            "rad_to_deg" => self.unary_fn(args, f64::to_degrees),
+            "kg_to_lb" => self.unary_fn(args, |v| v * 2.20462),
+            "lb_to_kg" => self.unary_fn(args, |v| v * 0.453592),
+            "m_to_ft" => self.unary_fn(args, |v| v * 3.28084),
+            "ft_to_m" => self.unary_fn(args, |v| v * 0.3048),
+            "nm_to_lbft" => self.unary_fn(args, |v| v * 0.737562),
+            "lbft_to_nm" => self.unary_fn(args, |v| v * 1.35582),
+            _ => Err(MathError {
+                message: format!("unknown function '{}'", name),
+            }),
+        }
+    }
+
+    fn unary_fn(&mut self, args: &[Expr], f: fn(f64) -> f64) -> Result<Arc<Vec<f64>>, MathError> {
+        if args.len() != 1 {
+            return Err(MathError {
+                message: "function requires 1 argument".into(),
+            });
+        }
+        let data = self.evaluate(&args[0])?;
+        Ok(Arc::new(data.iter().copied().map(f).collect()))
+    }
+
+    fn binary_fn(
+        &mut self,
+        args: &[Expr],
+        f: fn(f64, f64) -> f64,
+    ) -> Result<Arc<Vec<f64>>, MathError> {
+        if args.len() != 2 {
+            return Err(MathError {
+                message: "function requires 2 arguments".into(),
+            });
+        }
+        let a = self.evaluate(&args[0])?;
+        let b = self.evaluate(&args[1])?;
+        Ok(Arc::new(
+            a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)).collect(),
+        ))
+    }
+}
 
 /// Evaluate a parsed expression against channel data (no aliases).
 pub fn evaluate(
@@ -157,307 +571,8 @@ pub fn evaluate(
     output_freq: u16,
     output_len: usize,
 ) -> Result<Vec<f64>, MathError> {
-    eval_impl(expr, channels, output_freq, output_len, &EMPTY_ALIASES)
-}
-
-fn eval_impl(
-    expr: &Expr,
-    channels: &HashMap<String, ChannelData>,
-    output_freq: u16,
-    output_len: usize,
-    aliases: &HashMap<String, String>,
-) -> Result<Vec<f64>, MathError> {
-    match expr {
-        Expr::Number(n) => Ok(vec![*n; output_len]),
-
-        Expr::Channel(name) => {
-            let resolved =
-                resolve_channel_name(name, channels, aliases).ok_or_else(|| MathError {
-                    message: format!("unknown channel '{}'", name),
-                })?;
-            let ch = &channels[resolved];
-            Ok(resample(&ch.samples, ch.freq, output_freq, output_len).into_owned())
-        }
-
-        Expr::UnaryNeg(inner) => {
-            let vals = eval_impl(inner, channels, output_freq, output_len, aliases)?;
-            Ok(vals.into_iter().map(|v| -v).collect())
-        }
-
-        Expr::BinaryOp(lhs, op, rhs) => {
-            let left = eval_impl(lhs, channels, output_freq, output_len, aliases)?;
-            let right = eval_impl(rhs, channels, output_freq, output_len, aliases)?;
-            let result = left
-                .iter()
-                .zip(right.iter())
-                .map(|(&l, &r)| match op {
-                    BinOp::Add => l + r,
-                    BinOp::Sub => l - r,
-                    BinOp::Mul => l * r,
-                    BinOp::Div => {
-                        if r == 0.0 {
-                            f64::NAN
-                        } else {
-                            l / r
-                        }
-                    }
-                    BinOp::Mod => {
-                        if r == 0.0 {
-                            f64::NAN
-                        } else {
-                            l % r
-                        }
-                    }
-                    BinOp::Gt => {
-                        if l > r {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    BinOp::Lt => {
-                        if l < r {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    BinOp::Gte => {
-                        if l >= r {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    BinOp::Lte => {
-                        if l <= r {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    BinOp::Eq => {
-                        if l == r {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    BinOp::Neq => {
-                        if l != r {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    BinOp::And => {
-                        if !l.is_nan() && l != 0.0 && !r.is_nan() && r != 0.0 {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    BinOp::Or => {
-                        if (!l.is_nan() && l != 0.0) || (!r.is_nan() && r != 0.0) {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                })
-                .collect();
-            Ok(result)
-        }
-
-        Expr::FuncCall(name, args) => {
-            eval_function(name, args, channels, output_freq, output_len, aliases)
-        }
-    }
-}
-
-fn eval_function(
-    name: &str,
-    args: &[Expr],
-    channels: &HashMap<String, ChannelData>,
-    freq: u16,
-    len: usize,
-    aliases: &HashMap<String, String>,
-) -> Result<Vec<f64>, MathError> {
-    match name {
-        // smooth(channel, window_size)
-        "smooth" => {
-            if args.len() != 2 {
-                return Err(MathError {
-                    message: "smooth() requires 2 arguments: smooth(channel, window_size)".into(),
-                });
-            }
-            let data = eval_impl(&args[0], channels, freq, len, aliases)?;
-            let window = match &args[1] {
-                Expr::Number(n) => *n as usize,
-                _ => {
-                    let w = eval_impl(&args[1], channels, freq, len, aliases)?;
-                    w[0] as usize
-                }
-            };
-            Ok(moving_average(&data, window.max(1)))
-        }
-
-        // derivative(channel) — finite difference * freq
-        "derivative" => {
-            if args.len() != 1 {
-                return Err(MathError {
-                    message: "derivative() requires 1 argument".into(),
-                });
-            }
-            let data = eval_impl(&args[0], channels, freq, len, aliases)?;
-            Ok(finite_derivative(&data, freq))
-        }
-
-        // integrate(channel) — cumulative sum / freq
-        "integrate" => {
-            if args.len() != 1 {
-                return Err(MathError {
-                    message: "integrate() requires 1 argument".into(),
-                });
-            }
-            let data = eval_impl(&args[0], channels, freq, len, aliases)?;
-            Ok(cumulative_integral(&data, freq))
-        }
-
-        // Single-argument math functions
-        "abs" => unary_fn(args, channels, freq, len, aliases, f64::abs),
-        "sqrt" => unary_fn(args, channels, freq, len, aliases, f64::sqrt),
-        "sin" => unary_fn(args, channels, freq, len, aliases, f64::sin),
-        "cos" => unary_fn(args, channels, freq, len, aliases, f64::cos),
-        "tan" => unary_fn(args, channels, freq, len, aliases, f64::tan),
-        "asin" => unary_fn(args, channels, freq, len, aliases, f64::asin),
-        "acos" => unary_fn(args, channels, freq, len, aliases, f64::acos),
-        "atan" => unary_fn(args, channels, freq, len, aliases, f64::atan),
-        "log" | "ln" => unary_fn(args, channels, freq, len, aliases, f64::ln),
-        "exp" => unary_fn(args, channels, freq, len, aliases, f64::exp),
-        "floor" => unary_fn(args, channels, freq, len, aliases, f64::floor),
-        "ceil" => unary_fn(args, channels, freq, len, aliases, f64::ceil),
-        "round" => unary_fn(args, channels, freq, len, aliases, f64::round),
-
-        // Two-argument functions
-        "atan2" => binary_fn(args, channels, freq, len, aliases, f64::atan2),
-        "pow" => binary_fn(args, channels, freq, len, aliases, f64::powf),
-        "min" => binary_fn(args, channels, freq, len, aliases, f64::min),
-        "max" => binary_fn(args, channels, freq, len, aliases, f64::max),
-
-        // clamp(value, min, max)
-        "clamp" => {
-            if args.len() != 3 {
-                return Err(MathError {
-                    message: "clamp() requires 3 arguments: clamp(value, min, max)".into(),
-                });
-            }
-            let val = eval_impl(&args[0], channels, freq, len, aliases)?;
-            let lo = eval_impl(&args[1], channels, freq, len, aliases)?;
-            let hi = eval_impl(&args[2], channels, freq, len, aliases)?;
-            Ok(val
-                .iter()
-                .zip(lo.iter())
-                .zip(hi.iter())
-                .map(|((&v, &l), &h)| v.clamp(l, h))
-                .collect())
-        }
-
-        // gate(data, condition) — returns data where condition is non-zero, NAN otherwise
-        "gate" => {
-            if args.len() != 2 {
-                return Err(MathError {
-                    message: "gate() requires 2 arguments: gate(data, condition)".into(),
-                });
-            }
-            let data = eval_impl(&args[0], channels, freq, len, aliases)?;
-            let cond = eval_impl(&args[1], channels, freq, len, aliases)?;
-            Ok(data
-                .iter()
-                .zip(cond.iter())
-                .map(|(&d, &c)| if c != 0.0 { d } else { f64::NAN })
-                .collect())
-        }
-
-        // if_then(condition, true_value, false_value)
-        "if_then" => {
-            if args.len() != 3 {
-                return Err(MathError {
-                    message:
-                        "if_then() requires 3 arguments: if_then(condition, true_val, false_val)"
-                            .into(),
-                });
-            }
-            let cond = eval_impl(&args[0], channels, freq, len, aliases)?;
-            let true_val = eval_impl(&args[1], channels, freq, len, aliases)?;
-            let false_val = eval_impl(&args[2], channels, freq, len, aliases)?;
-            Ok(cond
-                .iter()
-                .zip(true_val.iter())
-                .zip(false_val.iter())
-                .map(|((&c, &t), &f)| if c != 0.0 { t } else { f })
-                .collect())
-        }
-
-        // Unit conversion functions
-        "kmh_to_mph" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.621371),
-        "mph_to_kmh" => unary_fn(args, channels, freq, len, aliases, |v| v * 1.60934),
-        "c_to_f" => unary_fn(args, channels, freq, len, aliases, |v| v * 9.0 / 5.0 + 32.0),
-        "f_to_c" => unary_fn(args, channels, freq, len, aliases, |v| {
-            (v - 32.0) * 5.0 / 9.0
-        }),
-        "kpa_to_psi" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.145038),
-        "psi_to_kpa" => unary_fn(args, channels, freq, len, aliases, |v| v * 6.89476),
-        "bar_to_psi" => unary_fn(args, channels, freq, len, aliases, |v| v * 14.5038),
-        "psi_to_bar" => unary_fn(args, channels, freq, len, aliases, |v| v / 14.5038),
-        "deg_to_rad" => unary_fn(args, channels, freq, len, aliases, |v| v.to_radians()),
-        "rad_to_deg" => unary_fn(args, channels, freq, len, aliases, |v| v.to_degrees()),
-        "kg_to_lb" => unary_fn(args, channels, freq, len, aliases, |v| v * 2.20462),
-        "lb_to_kg" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.453592),
-        "m_to_ft" => unary_fn(args, channels, freq, len, aliases, |v| v * 3.28084),
-        "ft_to_m" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.3048),
-        "nm_to_lbft" => unary_fn(args, channels, freq, len, aliases, |v| v * 0.737562),
-        "lbft_to_nm" => unary_fn(args, channels, freq, len, aliases, |v| v * 1.35582),
-
-        _ => Err(MathError {
-            message: format!("unknown function '{}'", name),
-        }),
-    }
-}
-
-fn unary_fn(
-    args: &[Expr],
-    channels: &HashMap<String, ChannelData>,
-    freq: u16,
-    len: usize,
-    aliases: &HashMap<String, String>,
-    f: fn(f64) -> f64,
-) -> Result<Vec<f64>, MathError> {
-    if args.len() != 1 {
-        return Err(MathError {
-            message: "function requires 1 argument".into(),
-        });
-    }
-    let data = eval_impl(&args[0], channels, freq, len, aliases)?;
-    Ok(data.into_iter().map(f).collect())
-}
-
-fn binary_fn(
-    args: &[Expr],
-    channels: &HashMap<String, ChannelData>,
-    freq: u16,
-    len: usize,
-    aliases: &HashMap<String, String>,
-    f: fn(f64, f64) -> f64,
-) -> Result<Vec<f64>, MathError> {
-    if args.len() != 2 {
-        return Err(MathError {
-            message: "function requires 2 arguments".into(),
-        });
-    }
-    let a = eval_impl(&args[0], channels, freq, len, aliases)?;
-    let b = eval_impl(&args[1], channels, freq, len, aliases)?;
-    Ok(a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)).collect())
+    let mut context = EvaluationContext::new(channels, &EMPTY_ALIASES, output_freq, output_len);
+    Ok((*context.evaluate(expr)?).clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -519,19 +634,16 @@ fn cumulative_integral(data: &[f64], freq: u16) -> Vec<f64> {
 
 /// Determine the output frequency for an expression: max freq of all referenced channels.
 pub fn determine_output_freq(expr: &Expr, channels: &HashMap<String, ChannelData>) -> u16 {
-    output_freq_impl(expr, channels, &EMPTY_ALIASES)
+    let resolver = ChannelResolver::new(channels, &EMPTY_ALIASES);
+    output_freq_impl(expr, &resolver)
 }
 
-fn output_freq_impl(
-    expr: &Expr,
-    channels: &HashMap<String, ChannelData>,
-    aliases: &HashMap<String, String>,
-) -> u16 {
+fn output_freq_impl(expr: &Expr, resolver: &ChannelResolver<'_>) -> u16 {
     let refs = referenced_channels(expr);
     let mut max_freq = 1u16;
     for name in &refs {
-        if let Some(resolved) = resolve_channel_name(name, channels, aliases) {
-            let f = channels[resolved].freq;
+        if let Some((_, channel)) = resolver.get_channel(name) {
+            let f = channel.freq;
             if f > max_freq {
                 max_freq = f;
             }
@@ -546,25 +658,20 @@ pub fn determine_output_len(
     channels: &HashMap<String, ChannelData>,
     output_freq: u16,
 ) -> usize {
-    output_len_impl(expr, channels, output_freq, &EMPTY_ALIASES)
+    let resolver = ChannelResolver::new(channels, &EMPTY_ALIASES);
+    output_len_impl(expr, &resolver, output_freq)
 }
 
-fn output_len_impl(
-    expr: &Expr,
-    channels: &HashMap<String, ChannelData>,
-    output_freq: u16,
-    aliases: &HashMap<String, String>,
-) -> usize {
+fn output_len_impl(expr: &Expr, resolver: &ChannelResolver<'_>, output_freq: u16) -> usize {
     let refs = referenced_channels(expr);
     let mut max_duration: f64 = 0.0;
     for name in &refs {
-        if let Some(resolved) = resolve_channel_name(name, channels, aliases) {
-            let ch = &channels[resolved];
-            if ch.freq > 0 {
-                let dur = ch.samples.len() as f64 / ch.freq as f64;
-                if dur > max_duration {
-                    max_duration = dur;
-                }
+        if let Some((_, channel)) = resolver.get_channel(name)
+            && channel.freq > 0
+        {
+            let dur = channel.samples.len() as f64 / channel.freq as f64;
+            if dur > max_duration {
+                max_duration = dur;
             }
         }
     }
@@ -585,14 +692,16 @@ pub fn evaluate_expression_with_aliases(
     channels: &HashMap<String, ChannelData>,
     aliases: &HashMap<String, String>,
 ) -> Result<(Vec<f64>, u16), String> {
-    let expr = parse_expression(expression).map_err(|e| e.to_string())?;
-    let freq = output_freq_impl(&expr, channels, aliases);
-    let len = output_len_impl(&expr, channels, freq, aliases);
+    let expr = parse_expression_cached(expression).map_err(|e| e.to_string())?;
+    let resolver = ChannelResolver::new(channels, aliases);
+    let freq = output_freq_impl(&expr, &resolver);
+    let len = output_len_impl(&expr, &resolver, freq);
     if len == 0 {
         return Err("expression references no channels with data".into());
     }
-    let samples = eval_impl(&expr, channels, freq, len, aliases).map_err(|e| e.to_string())?;
-    Ok((samples, freq))
+    let mut context = EvaluationContext::new(channels, aliases, freq, len);
+    let samples = context.evaluate(&expr).map_err(|e| e.to_string())?;
+    Ok(((*samples).clone(), freq))
 }
 
 // ---------------------------------------------------------------------------
@@ -859,5 +968,22 @@ mod tests {
         let (result, _) =
             evaluate_expression_with_aliases("Revs / Velocity", &channels, &aliases).unwrap();
         assert_eq!(result, vec![100.0, 100.0, 100.0, 100.0, 100.0]);
+    }
+
+    #[test]
+    fn eval_alias_and_channel_resolution_uses_normalized_names() {
+        let channels = HashMap::from([(
+            "Vehicle Speed".into(),
+            ChannelData {
+                samples: vec![1.0, 2.0, 3.0, 4.0],
+                freq: 2,
+            },
+        )]);
+        let aliases = HashMap::from([("Speed.Value".into(), "Vehicle_Speed".into())]);
+
+        let (result, _) =
+            evaluate_expression_with_aliases("Speed_Value + Vehicle_Speed", &channels, &aliases)
+                .unwrap();
+        assert_eq!(result, vec![2.0, 4.0, 6.0, 8.0]);
     }
 }

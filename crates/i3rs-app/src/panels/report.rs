@@ -54,18 +54,18 @@ impl ReportPanel {
 
                         for cached in &shared.report_cache.stats {
                             let dec = cached.dec_places.max(0) as usize;
-                            let (min, max, avg, stddev) = cached.session;
+                            let session = cached.session;
 
                             ui.colored_label(cached.color, &cached.name);
                             ui.label("All");
-                            ui.monospace(format!("{:.prec$}", min, prec = dec));
-                            ui.monospace(format!("{:.prec$}", max, prec = dec));
-                            ui.monospace(format!("{:.prec$}", avg, prec = dec));
-                            ui.monospace(format!("{:.prec$}", stddev, prec = dec));
+                            ui.monospace(format!("{:.prec$}", session.min, prec = dec));
+                            ui.monospace(format!("{:.prec$}", session.max, prec = dec));
+                            ui.monospace(format!("{:.prec$}", session.avg, prec = dec));
+                            ui.monospace(format!("{:.prec$}", session.stddev, prec = dec));
                             ui.end_row();
 
                             // Per-lap stats
-                            for (lap_name, lmin, lmax, lavg, lstddev) in &cached.per_lap {
+                            for (lap_name, lap_stats) in &cached.per_lap {
                                 let is_selected = shared
                                     .selected_lap
                                     .and_then(|idx| shared.laps.get(idx))
@@ -78,10 +78,10 @@ impl ReportPanel {
                                 } else {
                                     ui.label(label);
                                 }
-                                ui.monospace(format!("{:.prec$}", lmin, prec = dec));
-                                ui.monospace(format!("{:.prec$}", lmax, prec = dec));
-                                ui.monospace(format!("{:.prec$}", lavg, prec = dec));
-                                ui.monospace(format!("{:.prec$}", lstddev, prec = dec));
+                                ui.monospace(format!("{:.prec$}", lap_stats.min, prec = dec));
+                                ui.monospace(format!("{:.prec$}", lap_stats.max, prec = dec));
+                                ui.monospace(format!("{:.prec$}", lap_stats.avg, prec = dec));
+                                ui.monospace(format!("{:.prec$}", lap_stats.stddev, prec = dec));
                                 ui.end_row();
                             }
                         }

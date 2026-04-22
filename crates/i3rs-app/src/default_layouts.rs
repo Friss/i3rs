@@ -15,9 +15,8 @@ use crate::panels::graph::GraphPanel;
 use crate::panels::histogram::HistogramPanel;
 use crate::panels::mixture_map::MixtureMapPanel;
 use crate::panels::scatter::ScatterPanel;
-use crate::state::{
-    CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState, YAxis, compute_channel_stats,
-};
+use crate::panels::utils::create_plotted_channel;
+use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState, YAxis};
 
 /// A graph-centric default worksheet.
 struct GraphWorksheetTemplate {
@@ -313,15 +312,7 @@ fn channel_name_matches(actual: &str, candidate: &str) -> bool {
 }
 
 fn normalize_channel_name(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
+    i3rs_core::normalize_channel_name(name)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -329,12 +320,8 @@ fn normalize_channel_name(name: &str) -> String {
 
 /// Find a channel index by name (case-insensitive, partial match with prefix).
 fn find_channel(ld: &LdFile, name: &str) -> Option<usize> {
-    if let Some(idx) = ld
-        .channels
-        .iter()
-        .position(|ch| ch.name.eq_ignore_ascii_case(name))
-    {
-        return Some(idx);
+    if let Some(channel) = ld.find_channel_by_name(name) {
+        return Some(channel.index);
     }
 
     ld.channels
@@ -378,27 +365,16 @@ fn next_panel_id(shared: &mut SharedState) -> u64 {
 }
 
 fn make_plotted_channel(
-    ld: &LdFile,
+    shared: &SharedState,
     channel_idx: usize,
     color: egui::Color32,
     tile_group: usize,
 ) -> Option<PlottedChannel> {
-    let channel = ld.channels.get(channel_idx)?;
-    let data = ld.read_channel_data(channel)?;
-    let (cached_min, cached_max, cached_avg, _) = compute_channel_stats(&data);
-    Some(PlottedChannel {
-        channel_id: ChannelId::Physical(channel_idx),
-        color,
-        data: Arc::new(data),
-        tile_group,
-        y_axis: YAxis::Left,
-        display_scale: 1.0,
-        display_offset: 0.0,
-        display_unit: None,
-        cached_min,
-        cached_max,
-        cached_avg,
-    })
+    let mut channel = create_plotted_channel(ChannelId::Physical(channel_idx), shared, tile_group)?;
+    channel.color = color;
+    channel.tile_group = tile_group;
+    channel.y_axis = YAxis::Left;
+    Some(channel)
 }
 
 fn build_graph_panel(
@@ -429,7 +405,7 @@ fn build_graph_panel(
             })
             .unwrap_or(i);
         if let Some(pc) = make_plotted_channel(
-            ld,
+            shared,
             chan_idx,
             CHANNEL_COLORS[i % CHANNEL_COLORS.len()],
             tile_group,
@@ -485,7 +461,7 @@ fn build_histogram_panel(
     for (i, candidates) in channel_names.iter().enumerate() {
         if let Some(idx) = find_first_channel(ld, candidates)
             && let Some(pc) =
-                make_plotted_channel(ld, idx, CHANNEL_COLORS[i % CHANNEL_COLORS.len()], i)
+                make_plotted_channel(shared, idx, CHANNEL_COLORS[i % CHANNEL_COLORS.len()], i)
         {
             panel.channels.push(pc);
         }
@@ -507,9 +483,9 @@ fn build_mixture_map_panel(
     let value_idx = find_first_channel(ld, value_names)?;
     let mut panel = MixtureMapPanel::new(next_panel_id(shared), title);
     panel.bins = bins;
-    panel.x_channel = make_plotted_channel(ld, x_idx, CHANNEL_COLORS[0], 0);
-    panel.y_channel = make_plotted_channel(ld, y_idx, CHANNEL_COLORS[1], 1);
-    panel.value_channel = make_plotted_channel(ld, value_idx, CHANNEL_COLORS[2], 2);
+    panel.x_channel = make_plotted_channel(shared, x_idx, CHANNEL_COLORS[0], 0);
+    panel.y_channel = make_plotted_channel(shared, y_idx, CHANNEL_COLORS[1], 1);
+    panel.value_channel = make_plotted_channel(shared, value_idx, CHANNEL_COLORS[2], 2);
     (panel.x_channel.is_some() && panel.y_channel.is_some() && panel.value_channel.is_some())
         .then_some(panel)
 }
@@ -606,8 +582,8 @@ fn build_oil_pressure_worksheet(
             panel.point_size = 1.75;
             panel.bounds_padding_frac = 0.10;
             panel.lock_bounds = true;
-            panel.x_channel = make_plotted_channel(ld, x_idx, CHANNEL_COLORS[0], 0);
-            panel.y_channel = make_plotted_channel(ld, y_idx, CHANNEL_COLORS[4], 1);
+            panel.x_channel = make_plotted_channel(shared, x_idx, CHANNEL_COLORS[0], 0);
+            panel.y_channel = make_plotted_channel(shared, y_idx, CHANNEL_COLORS[4], 1);
             (panel.x_channel.is_some() && panel.y_channel.is_some()).then_some(panel)
         }
         _ => None,
@@ -615,7 +591,7 @@ fn build_oil_pressure_worksheet(
 
     let graph = y_idx.and_then(|idx| {
         let mut panel = GraphPanel::new(next_panel_id(shared), "Engine Oil Pressure");
-        if let Some(pc) = make_plotted_channel(ld, idx, CHANNEL_COLORS[0], 0) {
+        if let Some(pc) = make_plotted_channel(shared, idx, CHANNEL_COLORS[0], 0) {
             panel.plotted_channels.push(pc);
             Some(panel)
         } else {

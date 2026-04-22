@@ -3,10 +3,9 @@
 use std::sync::Arc;
 
 use eframe::egui;
-use egui_plot::{Line, MarkerShape, Plot, PlotPoints, Points};
+use egui_plot::{Line, MarkerShape, Plot, PlotPoint, PlotPoints, Points};
 use i3rs_core::{
-    Sector, SectorTime, TrackData, compute_color_map, compute_sector_times, extract_gps_track,
-    find_nearest_sample,
+    Sector, SectorTime, TrackData, compute_color_map, compute_sector_times, find_nearest_sample,
 };
 
 use crate::state::{CHANNEL_COLORS, SharedState};
@@ -17,8 +16,8 @@ pub struct TrackMapPanel {
     track_data: Option<Arc<TrackData>>,
     /// Channel index for rainbow coloring (None = solid color).
     pub color_channel_idx: Option<usize>,
-    /// Cached per-sample RGBA colors (wrapped in Arc to avoid per-frame clone).
-    cached_colors: Option<Arc<Vec<[u8; 4]>>>,
+    /// Cached per-sample RGBA colors.
+    cached_colors: Option<Arc<[[u8; 4]]>>,
     cached_color_range: Option<(f64, f64)>,
     color_channel_name: String,
     editing_sectors: bool,
@@ -27,6 +26,9 @@ pub struct TrackMapPanel {
     cached_sector_times: Option<CachedSectorReport>,
     /// Fingerprint for track/color cache invalidation.
     cache_fingerprint: Option<(usize, Option<usize>)>,
+    track_line_cache: Option<CachedTrackLine>,
+    cursor_marker_cache: Option<CachedTrackMarker>,
+    sector_marker_cache: Option<CachedSectorMarkers>,
     /// Search filter for the color channel dropdown.
     color_filter: String,
     /// Whether this panel is currently in a popped-out OS window.
@@ -43,6 +45,55 @@ struct CachedSectorReport {
     times: Vec<Vec<SectorTime>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TrackLineFingerprint {
+    track_ptr: usize,
+    track_len: usize,
+    colors_ptr: usize,
+    colors_len: usize,
+}
+
+struct CachedTrackLine {
+    fingerprint: TrackLineFingerprint,
+    solid_points: Vec<PlotPoint>,
+    colored_segments: Vec<CachedColoredTrackSegment>,
+}
+
+struct CachedColoredTrackSegment {
+    color: egui::Color32,
+    points: [PlotPoint; 2],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TrackMarkerFingerprint {
+    track_ptr: usize,
+    track_len: usize,
+    sample_idx: usize,
+}
+
+struct CachedTrackMarker {
+    fingerprint: TrackMarkerFingerprint,
+    points: [PlotPoint; 1],
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SectorMarkersFingerprint {
+    track_ptr: usize,
+    track_len: usize,
+    start_indices: Vec<usize>,
+}
+
+struct CachedSectorMarkers {
+    fingerprint: SectorMarkersFingerprint,
+    markers: Vec<CachedSectorMarker>,
+}
+
+struct CachedSectorMarker {
+    name: String,
+    color: egui::Color32,
+    points: [PlotPoint; 1],
+}
+
 impl TrackMapPanel {
     pub fn new(id: u64, title: impl Into<String>) -> Self {
         Self {
@@ -57,6 +108,9 @@ impl TrackMapPanel {
             pending_sector_start: None,
             cached_sector_times: None,
             cache_fingerprint: None,
+            track_line_cache: None,
+            cursor_marker_cache: None,
+            sector_marker_cache: None,
             color_filter: String::new(),
             is_popped_out: false,
             pop_out_requested: false,
@@ -72,9 +126,12 @@ impl TrackMapPanel {
         self.cached_sector_times = None;
         self.color_channel_idx = None;
         self.cache_fingerprint = None;
+        self.clear_render_caches();
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
+        let _perf = crate::perf_metrics::scope("track-map draw");
+
         // If popped out, handle OS window close → dock back
         if self.is_popped_out && ui.input(|i| i.viewport().close_requested()) {
             ui.ctx()
@@ -86,7 +143,16 @@ impl TrackMapPanel {
 
         let Some(track) = &self.track_data else {
             ui.centered_and_justified(|ui| {
-                ui.label("No GPS data found (requires GPS Latitude and GPS Longitude channels)");
+                if shared.is_track_data_build_pending() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Building GPS track...");
+                    });
+                } else {
+                    ui.label(
+                        "No GPS data found (requires GPS Latitude and GPS Longitude channels)",
+                    );
+                }
             });
             return;
         };
@@ -119,18 +185,23 @@ impl TrackMapPanel {
             .show_axes(false)
             .show_grid(false);
 
-        let colors_ref = self.cached_colors.clone();
-
+        let colors = self.cached_colors.clone();
         let response = plot.show(ui, |plot_ui| {
-            Self::draw_track_line(plot_ui, &track, colors_ref.as_deref());
+            Self::draw_track_line(
+                plot_ui,
+                &mut self.track_line_cache,
+                &track,
+                colors.as_deref(),
+            );
 
-            Self::draw_sector_markers(plot_ui, &track, sectors);
+            Self::draw_sector_markers(plot_ui, &mut self.sector_marker_cache, &track, sectors);
 
             if let Some(t) = cursor_time {
-                Self::draw_cursor_marker(plot_ui, &track, t);
+                Self::draw_cursor_marker(plot_ui, &mut self.cursor_marker_cache, &track, t);
             }
 
             if let Some(coord) = plot_ui.pointer_coordinate() {
+                let _hover_perf = crate::perf_metrics::scope("track hover lookup");
                 let idx = find_nearest_sample(&track, coord.x, coord.y);
                 hover_idx = Some(idx);
 
@@ -181,19 +252,32 @@ impl TrackMapPanel {
                 .unwrap_or(true);
 
         if track_stale {
-            if let Some(ld) = &shared.ld_file {
-                self.track_data = extract_gps_track(ld).map(Arc::new);
+            if shared.ld_file.is_some() {
+                if let Some(track_data) = shared.track_data_if_ready() {
+                    self.track_data = Some(track_data);
+                } else {
+                    shared.request_track_data_build();
+                    self.track_data = None;
+                }
             } else {
                 self.track_data = None;
             }
             self.cached_colors = None;
             self.cached_color_range = None;
             self.cached_sector_times = None;
+            self.clear_render_caches();
+        } else if self.track_data.is_none() {
+            if let Some(track_data) = shared.track_data_if_ready() {
+                self.track_data = Some(track_data);
+            } else if shared.ld_file.is_some() {
+                shared.request_track_data_build();
+            }
         }
 
         if self.cache_fingerprint != Some(fingerprint) {
             self.cached_colors = None;
             self.cached_color_range = None;
+            self.track_line_cache = None;
         }
 
         self.cache_fingerprint = Some(fingerprint);
@@ -214,82 +298,113 @@ impl TrackMapPanel {
         let Some(ch) = ld.channels.get(ch_idx) else {
             return;
         };
-        let Some(data) = ld.read_channel_data(ch) else {
+        let Some(decoded) = shared.decoded_physical_channel_if_ready(ch_idx) else {
+            shared.request_physical_channel_decode(ch_idx);
             return;
         };
 
         self.color_channel_name = ch.name.clone();
-        let (colors, vmin, vmax) = compute_color_map(track, &data, ch.freq);
+        let (colors, vmin, vmax) = compute_color_map(track, &decoded.data, ch.freq);
         self.cached_color_range = Some((vmin, vmax));
-        self.cached_colors = Some(Arc::new(colors));
+        self.cached_colors = Some(Arc::from(colors));
+        self.track_line_cache = None;
     }
 
-    fn draw_track_line(
-        plot_ui: &mut egui_plot::PlotUi,
+    fn draw_track_line<'a>(
+        plot_ui: &mut egui_plot::PlotUi<'a>,
+        cache: &'a mut Option<CachedTrackLine>,
         track: &TrackData,
-        colors: Option<&Vec<[u8; 4]>>,
+        colors: Option<&[[u8; 4]]>,
     ) {
-        if let Some(colors) = colors {
-            for (i, c) in colors
-                .iter()
-                .enumerate()
-                .take(track.x.len().saturating_sub(1))
-            {
-                let segment = Line::new(
-                    "",
-                    PlotPoints::new(vec![
-                        [track.x[i], track.y[i]],
-                        [track.x[i + 1], track.y[i + 1]],
-                    ]),
+        let fingerprint = TrackLineFingerprint {
+            track_ptr: track as *const TrackData as usize,
+            track_len: track.x.len(),
+            colors_ptr: colors.map_or(0, |colors| colors.as_ptr() as usize),
+            colors_len: colors.map_or(0, |colors| colors.len()),
+        };
+
+        let cached =
+            cache.get_or_insert_with(|| CachedTrackLine::build(track, colors, fingerprint));
+        if cached.fingerprint != fingerprint {
+            *cached = CachedTrackLine::build(track, colors, fingerprint);
+        }
+
+        if cached.colored_segments.is_empty() {
+            if !cached.solid_points.is_empty() {
+                let line = Line::new(
+                    "Track",
+                    PlotPoints::Borrowed(cached.solid_points.as_slice()),
                 )
-                .width(3.0)
-                .color(egui::Color32::from_rgb(c[0], c[1], c[2]));
-                plot_ui.line(segment);
-            }
-        } else {
-            let points: Vec<[f64; 2]> = track
-                .x
-                .iter()
-                .zip(track.y.iter())
-                .map(|(&x, &y)| [x, y])
-                .collect();
-            let line = Line::new("Track", PlotPoints::new(points))
                 .width(2.5)
                 .color(egui::Color32::from_rgb(50, 255, 200));
-            plot_ui.line(line);
+                plot_ui.line(line);
+            }
+        } else {
+            for segment in &cached.colored_segments {
+                let line = Line::new("", PlotPoints::Borrowed(segment.points.as_slice()))
+                    .width(3.0)
+                    .color(segment.color);
+                plot_ui.line(line);
+            }
         }
     }
 
-    fn draw_cursor_marker(plot_ui: &mut egui_plot::PlotUi, track: &TrackData, time: f64) {
+    fn draw_cursor_marker<'a>(
+        plot_ui: &mut egui_plot::PlotUi<'a>,
+        cache: &'a mut Option<CachedTrackMarker>,
+        track: &TrackData,
+        time: f64,
+    ) {
         let sample_idx = (time * track.freq as f64).round() as usize;
         let sample_idx = sample_idx.min(track.x.len().saturating_sub(1));
 
-        if sample_idx < track.x.len() {
-            let marker = Points::new(
-                "cursor",
-                PlotPoints::new(vec![[track.x[sample_idx], track.y[sample_idx]]]),
-            )
+        if sample_idx >= track.x.len() {
+            return;
+        }
+
+        let fingerprint = TrackMarkerFingerprint {
+            track_ptr: track as *const TrackData as usize,
+            track_len: track.x.len(),
+            sample_idx,
+        };
+        let cached =
+            cache.get_or_insert_with(|| CachedTrackMarker::build(track, sample_idx, fingerprint));
+        if cached.fingerprint != fingerprint {
+            *cached = CachedTrackMarker::build(track, sample_idx, fingerprint);
+        }
+
+        let marker = Points::new("cursor", PlotPoints::Borrowed(cached.points.as_slice()))
             .shape(MarkerShape::Circle)
             .radius(6.0)
             .color(egui::Color32::from_rgb(255, 255, 0))
             .filled(true);
-            plot_ui.points(marker);
-        }
+        plot_ui.points(marker);
     }
 
-    fn draw_sector_markers(plot_ui: &mut egui_plot::PlotUi, track: &TrackData, sectors: &[Sector]) {
-        for (i, sector) in sectors.iter().enumerate() {
-            let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
+    fn draw_sector_markers<'a>(
+        plot_ui: &mut egui_plot::PlotUi<'a>,
+        cache: &'a mut Option<CachedSectorMarkers>,
+        track: &TrackData,
+        sectors: &[Sector],
+    ) {
+        let fingerprint = SectorMarkersFingerprint {
+            track_ptr: track as *const TrackData as usize,
+            track_len: track.x.len(),
+            start_indices: sectors.iter().map(|sector| sector.start_index).collect(),
+        };
+        let cached = cache
+            .get_or_insert_with(|| CachedSectorMarkers::build(track, sectors, fingerprint.clone()));
+        if cached.fingerprint != fingerprint {
+            *cached = CachedSectorMarkers::build(track, sectors, fingerprint);
+        }
 
-            if sector.start_index < track.x.len() {
-                let pt = vec![[track.x[sector.start_index], track.y[sector.start_index]]];
-                let marker = Points::new(format!("{} start", sector.name), PlotPoints::new(pt))
-                    .shape(MarkerShape::Diamond)
-                    .radius(8.0)
-                    .color(color)
-                    .filled(true);
-                plot_ui.points(marker);
-            }
+        for marker in &cached.markers {
+            let points = Points::new(&marker.name, PlotPoints::Borrowed(marker.points.as_slice()))
+                .shape(MarkerShape::Diamond)
+                .radius(8.0)
+                .color(marker.color)
+                .filled(true);
+            plot_ui.points(points);
         }
     }
 
@@ -419,6 +534,13 @@ impl TrackMapPanel {
         self.cached_colors = None;
         self.cached_color_range = None;
         self.cache_fingerprint = None;
+        self.track_line_cache = None;
+    }
+
+    fn clear_render_caches(&mut self) {
+        self.track_line_cache = None;
+        self.cursor_marker_cache = None;
+        self.sector_marker_cache = None;
     }
 
     fn draw_color_legend(ui: &mut egui::Ui, vmin: f64, vmax: f64) {
@@ -558,6 +680,80 @@ impl TrackMapPanel {
     }
 }
 
+impl CachedTrackLine {
+    fn build(
+        track: &TrackData,
+        colors: Option<&[[u8; 4]]>,
+        fingerprint: TrackLineFingerprint,
+    ) -> Self {
+        if let Some(colors) = colors {
+            let colored_segments = colors
+                .iter()
+                .enumerate()
+                .take(track.x.len().saturating_sub(1))
+                .map(|(idx, color)| CachedColoredTrackSegment {
+                    color: egui::Color32::from_rgb(color[0], color[1], color[2]),
+                    points: [
+                        PlotPoint::new(track.x[idx], track.y[idx]),
+                        PlotPoint::new(track.x[idx + 1], track.y[idx + 1]),
+                    ],
+                })
+                .collect();
+
+            Self {
+                fingerprint,
+                solid_points: Vec::new(),
+                colored_segments,
+            }
+        } else {
+            let solid_points = track
+                .x
+                .iter()
+                .zip(track.y.iter())
+                .map(|(&x, &y)| PlotPoint::new(x, y))
+                .collect();
+
+            Self {
+                fingerprint,
+                solid_points,
+                colored_segments: Vec::new(),
+            }
+        }
+    }
+}
+
+impl CachedTrackMarker {
+    fn build(track: &TrackData, sample_idx: usize, fingerprint: TrackMarkerFingerprint) -> Self {
+        Self {
+            fingerprint,
+            points: [PlotPoint::new(track.x[sample_idx], track.y[sample_idx])],
+        }
+    }
+}
+
+impl CachedSectorMarkers {
+    fn build(track: &TrackData, sectors: &[Sector], fingerprint: SectorMarkersFingerprint) -> Self {
+        let markers = sectors
+            .iter()
+            .enumerate()
+            .filter(|(_, sector)| sector.start_index < track.x.len())
+            .map(|(idx, sector)| CachedSectorMarker {
+                name: format!("{} start", sector.name),
+                color: CHANNEL_COLORS[idx % CHANNEL_COLORS.len()],
+                points: [PlotPoint::new(
+                    track.x[sector.start_index],
+                    track.y[sector.start_index],
+                )],
+            })
+            .collect();
+
+        Self {
+            fingerprint,
+            markers,
+        }
+    }
+}
+
 fn delta_color(delta: f64) -> egui::Color32 {
     if delta < -0.01 {
         egui::Color32::from_rgb(100, 255, 100) // green = faster
@@ -565,5 +761,79 @@ fn delta_color(delta: f64) -> egui::Color32 {
         egui::Color32::from_rgb(255, 100, 100) // red = slower
     } else {
         egui::Color32::from_gray(200)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_panel() -> TrackMapPanel {
+        TrackMapPanel::new(1, "Track")
+    }
+
+    #[test]
+    fn clear_cache_clears_track_render_caches() {
+        let mut panel = sample_panel();
+        panel.track_line_cache = Some(CachedTrackLine {
+            fingerprint: TrackLineFingerprint {
+                track_ptr: 1,
+                track_len: 2,
+                colors_ptr: 3,
+                colors_len: 4,
+            },
+            solid_points: vec![PlotPoint::new(0.0, 0.0)],
+            colored_segments: Vec::new(),
+        });
+        panel.cursor_marker_cache = Some(CachedTrackMarker {
+            fingerprint: TrackMarkerFingerprint {
+                track_ptr: 1,
+                track_len: 2,
+                sample_idx: 0,
+            },
+            points: [PlotPoint::new(0.0, 0.0)],
+        });
+        panel.sector_marker_cache = Some(CachedSectorMarkers {
+            fingerprint: SectorMarkersFingerprint {
+                track_ptr: 1,
+                track_len: 2,
+                start_indices: vec![0],
+            },
+            markers: Vec::new(),
+        });
+
+        panel.clear_cache();
+
+        assert!(panel.track_line_cache.is_none());
+        assert!(panel.cursor_marker_cache.is_none());
+        assert!(panel.sector_marker_cache.is_none());
+    }
+
+    #[test]
+    fn invalidate_color_cache_only_drops_track_line_geometry() {
+        let mut panel = sample_panel();
+        panel.track_line_cache = Some(CachedTrackLine {
+            fingerprint: TrackLineFingerprint {
+                track_ptr: 1,
+                track_len: 2,
+                colors_ptr: 3,
+                colors_len: 4,
+            },
+            solid_points: vec![PlotPoint::new(0.0, 0.0)],
+            colored_segments: Vec::new(),
+        });
+        panel.cursor_marker_cache = Some(CachedTrackMarker {
+            fingerprint: TrackMarkerFingerprint {
+                track_ptr: 1,
+                track_len: 2,
+                sample_idx: 0,
+            },
+            points: [PlotPoint::new(0.0, 0.0)],
+        });
+
+        panel.invalidate_color_cache();
+
+        assert!(panel.track_line_cache.is_none());
+        assert!(panel.cursor_marker_cache.is_some());
     }
 }

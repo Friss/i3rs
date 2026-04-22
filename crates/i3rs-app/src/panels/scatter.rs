@@ -1,7 +1,5 @@
 //! Scatter/XY plot panel: channel vs channel visualization.
 
-use std::sync::Arc;
-
 use eframe::egui;
 use egui_plot::{Legend, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, Points};
 
@@ -9,8 +7,9 @@ use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
     DisplayTransformFingerprint, build_plotted_channel_info, create_plotted_channel,
-    display_transform_fingerprint, interp_at_time, resolve_plotted_channel_display_meta,
-    segmented_channel_button, show_plotted_channel_display_menu, transform_channel_value,
+    display_transform_fingerprint, interp_at_time, refresh_plotted_channel,
+    resolve_plotted_channel_display_meta, segmented_channel_button,
+    show_plotted_channel_display_menu, transform_channel_value,
 };
 
 #[derive(PartialEq, Eq)]
@@ -89,6 +88,8 @@ impl ScatterPanel {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
+        let _perf = crate::perf_metrics::scope("scatter draw");
+
         // Handle drop from channel browser
         if shared.dragging_channel.is_some()
             && ui.input(|i| i.pointer.any_released())
@@ -101,6 +102,13 @@ impl ScatterPanel {
         // Handle pending toggle
         if let Some(ch_id) = shared.pending_toggle_channel.take() {
             self.add_channel(ch_id, shared);
+        }
+
+        if let Some(channel) = self.x_channel.as_mut() {
+            refresh_plotted_channel(channel, shared);
+        }
+        if let Some(channel) = self.y_channel.as_mut() {
+            refresh_plotted_channel(channel, shared);
         }
 
         // Toolbar
@@ -204,9 +212,9 @@ impl ScatterPanel {
 
         let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
         let fingerprint = ScatterFingerprint {
-            x_data_ptr: Arc::as_ptr(&x_ch.data) as usize,
+            x_data_ptr: x_ch.data.as_ptr() as usize,
             x_data_len: x_ch.data.len(),
-            y_data_ptr: Arc::as_ptr(&y_ch.data) as usize,
+            y_data_ptr: y_ch.data.as_ptr() as usize,
             y_data_len: y_ch.data.len(),
             zoom_key,
             x_transform: display_transform_fingerprint(x_ch),
@@ -253,7 +261,7 @@ impl ScatterPanel {
 
         plot.show(ui, |plot_ui| {
             plot_ui.points(
-                Points::new(&series_name, PlotPoints::Owned(plot_points.clone()))
+                Points::new(&series_name, PlotPoints::Borrowed(plot_points.as_slice()))
                     .shape(MarkerShape::Circle)
                     .filled(false)
                     .radius(point_size)

@@ -2,13 +2,17 @@
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState};
-use i3rs_core::{ExportChannel, LdFile, LdxFile, detect_laps, export_csv, find_ldx_for_ld};
+use i3rs_core::{ExportChannel, LdFile, LdxFile, detect_laps, export_csv};
 #[cfg(target_arch = "wasm32")]
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::background_jobs::{
+    BackgroundJobs, JobRequest, JobResult, LoadSessionSource, LoadedSession,
+    load_session_from_bytes, load_session_from_path,
+};
 use crate::panels::fft::FftPanel;
 use crate::panels::gauge::GaugePanel;
 use crate::panels::graph::GraphPanel;
@@ -57,6 +61,12 @@ pub struct LoadedSessionSummary {
     pub file_name: String,
     pub channel_count: usize,
     pub lap_count: usize,
+}
+
+struct PendingSessionLoad {
+    request_id: u64,
+    workspace_snapshot: Option<crate::workspace::WorkspaceFile>,
+    file_label: String,
 }
 
 fn is_startup_default_layout(worksheets: &[Worksheet]) -> bool {
@@ -125,6 +135,15 @@ pub struct App {
     compare_session_path: Option<PathBuf>,
     session_summary_cache: HashMap<PathBuf, SessionSummary>,
     load_error: Option<String>,
+    background_jobs: BackgroundJobs,
+    pending_session_load: Option<PendingSessionLoad>,
+    pending_workspace_restore: Option<crate::workspace::WorkspaceFile>,
+    next_session_id: u64,
+    next_request_id: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    native_pick_tx: std::sync::mpsc::Sender<crate::platform::NativePickEvent>,
+    #[cfg(not(target_arch = "wasm32"))]
+    native_pick_rx: std::sync::mpsc::Receiver<crate::platform::NativePickEvent>,
     #[cfg(target_arch = "wasm32")]
     web_load_tx: std::sync::mpsc::Sender<crate::platform::WebLoadEvent>,
     #[cfg(target_arch = "wasm32")]
@@ -135,6 +154,8 @@ impl App {
     pub fn new(cc: &eframe::CreationContext) -> Self {
         #[cfg(target_arch = "wasm32")]
         let (web_load_tx, web_load_rx) = crate::platform::web_load_channel();
+        #[cfg(not(target_arch = "wasm32"))]
+        let (native_pick_tx, native_pick_rx) = crate::platform::native_pick_channel();
         let preferences = crate::preferences::load_preferences();
         let mut shared = SharedState::new();
         shared.channel_preferences = preferences.channel_preferences.clone();
@@ -163,6 +184,15 @@ impl App {
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,
+            background_jobs: BackgroundJobs::new(),
+            pending_session_load: None,
+            pending_workspace_restore: None,
+            next_session_id: 1,
+            next_request_id: 1,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_pick_tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_pick_rx,
             #[cfg(target_arch = "wasm32")]
             web_load_tx,
             #[cfg(target_arch = "wasm32")]
@@ -230,21 +260,27 @@ impl App {
         self.active_worksheet = active_worksheet.min(self.worksheets.len().saturating_sub(1));
     }
 
+    fn restore_workspace_when_ready(&mut self, workspace: crate::workspace::WorkspaceFile) {
+        if self.shared.are_math_channels_settled() {
+            self.apply_workspace_snapshot(workspace);
+        } else {
+            self.pending_workspace_restore = Some(workspace);
+        }
+    }
+
+    fn maybe_apply_pending_workspace_restore(&mut self) {
+        if self.shared.are_math_channels_settled()
+            && let Some(workspace) = self.pending_workspace_restore.take()
+        {
+            self.apply_workspace_snapshot(workspace);
+        }
+    }
+
     pub fn open_file(&mut self, path: PathBuf) {
         let workspace_snapshot = self.workspace_snapshot_for_session_reload();
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let ldx = find_ldx_for_ld(&path);
-        match LdFile::open(&path) {
-            Ok(ld) => {
-                self.load_session(ld, file_name, Some(path), ldx);
-                if let Some(workspace) = workspace_snapshot {
-                    self.apply_workspace_snapshot(workspace);
-                }
-            }
-            Err(e) => self.load_error = Some(format!("Failed to open file: {e}")),
+        match load_session_from_path(path) {
+            Ok(loaded) => self.install_loaded_session(loaded, workspace_snapshot),
+            Err(err) => self.load_error = Some(format!("Failed to open file: {err}")),
         }
     }
 
@@ -255,35 +291,33 @@ impl App {
         ldx: Option<LdxFile>,
     ) -> Result<(), String> {
         let workspace_snapshot = self.workspace_snapshot_for_session_reload();
-        let ld = LdFile::from_bytes(bytes)?;
-        self.load_session(ld, file_name, None, ldx);
-        if let Some(workspace) = workspace_snapshot {
-            self.apply_workspace_snapshot(workspace);
-        }
+        let loaded = load_session_from_bytes(file_name, bytes, ldx)?;
+        self.install_loaded_session(loaded, workspace_snapshot);
         Ok(())
     }
 
-    fn load_session(
+    fn install_loaded_session(
         &mut self,
-        ld: LdFile,
-        file_name: String,
-        ld_path: Option<PathBuf>,
-        ldx: Option<LdxFile>,
+        loaded: LoadedSession,
+        workspace_snapshot: Option<crate::workspace::WorkspaceFile>,
     ) {
         self.load_error = None;
-        self.shared.file_name = file_name;
-        self.shared.ldx = ldx;
+        self.pending_session_load = None;
+        self.pending_workspace_restore = None;
+        self.shared.session_id = self.next_session_id;
+        self.next_session_id += 1;
+        self.shared.file_name = loaded.file_name;
+        self.shared.ldx = loaded.ldx;
 
-        let ld = Arc::new(ld);
-        self.shared.laps = detect_laps(&ld);
-        let data_duration = ld.duration_secs();
-        self.shared.data_duration = Some(data_duration);
+        let ld = Arc::new(loaded.ld);
+        self.shared.laps = loaded.laps;
+        self.shared.data_duration = Some(loaded.data_duration);
         self.shared.ld_file = Some(ld);
-        self.shared.ld_path = ld_path;
+        self.shared.ld_path = loaded.ld_path;
         self.shared.selected_lap = None;
         self.shared.cursor_time = None;
-        self.shared.zoom_range = Some((0.0, data_duration));
-        self.shared.invalidate_derived_caches();
+        self.shared.zoom_range = Some((0.0, loaded.data_duration));
+        self.shared.invalidate_session_caches();
 
         // Clear all panels' channels and caches across all worksheets
         for ws in &mut self.worksheets {
@@ -312,8 +346,10 @@ impl App {
 
         if is_empty_default {
             let ld_ref = self.shared.ld_file.clone().unwrap();
-            let defaults =
-                crate::default_layouts::create_default_worksheets(&ld_ref, &mut self.shared);
+            let defaults = {
+                let _perf = crate::perf_metrics::scope("default layout creation");
+                crate::default_layouts::create_default_worksheets(&ld_ref, &mut self.shared)
+            };
             if !defaults.is_empty() {
                 self.worksheets = defaults
                     .into_iter()
@@ -323,9 +359,65 @@ impl App {
             }
         }
 
+        if let Some(workspace) = workspace_snapshot {
+            self.restore_workspace_when_ready(workspace);
+        }
+
         if let Some(path) = self.shared.ld_path.clone() {
             self.register_project_session(&path);
         }
+    }
+
+    fn submit_load_session(
+        &mut self,
+        source: LoadSessionSource,
+        file_label: String,
+        ctx: &egui::Context,
+    ) {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        self.load_error = None;
+        self.pending_workspace_restore = None;
+        self.pending_session_load = Some(PendingSessionLoad {
+            request_id,
+            workspace_snapshot: self.workspace_snapshot_for_session_reload(),
+            file_label,
+        });
+
+        if let Err(err) = self
+            .background_jobs
+            .submit(JobRequest::LoadSession { request_id, source }, ctx)
+        {
+            self.pending_session_load = None;
+            self.load_error = Some(err);
+        }
+    }
+
+    fn open_file_async(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let file_label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        self.submit_load_session(LoadSessionSource::Path(path), file_label, ctx);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn open_bytes_async(
+        &mut self,
+        file_name: String,
+        bytes: Vec<u8>,
+        ldx: Option<LdxFile>,
+        ctx: &egui::Context,
+    ) {
+        self.submit_load_session(
+            LoadSessionSource::Bytes {
+                file_name: file_name.clone(),
+                bytes,
+                ldx,
+            },
+            file_name,
+            ctx,
+        );
     }
 
     fn start_open_session(&mut self, ctx: &egui::Context) {
@@ -336,13 +428,20 @@ impl App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            if let Some(path) = crate::platform::begin_pick_session(ctx) {
-                self.open_file(path);
-            }
+            crate::platform::begin_pick_session(self.native_pick_tx.clone(), ctx.clone());
         }
     }
 
-    fn process_platform_events(&mut self, _ctx: &egui::Context) {
+    fn process_platform_events(&mut self, ctx: &egui::Context) {
+        #[cfg(not(target_arch = "wasm32"))]
+        while let Ok(event) = self.native_pick_rx.try_recv() {
+            match event {
+                crate::platform::NativePickEvent::SessionPath(path) => {
+                    self.open_file_async(path, ctx);
+                }
+            }
+        }
+
         #[cfg(target_arch = "wasm32")]
         while let Ok(event) = self.web_load_rx.try_recv() {
             match event {
@@ -365,9 +464,8 @@ impl App {
                         None => None,
                     };
 
-                    if let Err(err) = self.open_bytes(file_name, ld_bytes, ldx) {
-                        self.load_error = Some(format!("Failed to open file: {err}"));
-                    } else if let Some(err) = ignored_ldx_error {
+                    self.open_bytes_async(file_name, ld_bytes, ldx, ctx);
+                    if let Some(err) = ignored_ldx_error {
                         self.load_error = Some(err);
                     }
                 }
@@ -376,9 +474,224 @@ impl App {
                 }
             }
         }
+
+        while let Some(result) = self.background_jobs.try_recv() {
+            match result {
+                JobResult::LoadSession { request_id, result } => {
+                    let Some(pending) = self.pending_session_load.take() else {
+                        continue;
+                    };
+                    if pending.request_id != request_id {
+                        self.pending_session_load = Some(pending);
+                        continue;
+                    }
+
+                    match *result {
+                        Ok(loaded) => {
+                            self.install_loaded_session(loaded, pending.workspace_snapshot);
+                        }
+                        Err(err) => {
+                            self.load_error = Some(format!("Failed to open file: {err}"));
+                        }
+                    }
+                }
+                JobResult::DecodePhysicalChannel {
+                    session_id,
+                    channel_idx,
+                    result,
+                } => {
+                    if self.shared.session_id != session_id {
+                        continue;
+                    }
+
+                    match result {
+                        Ok(decoded) => {
+                            self.shared.store_decoded_physical_channel(
+                                decoded.channel_idx,
+                                decoded.data,
+                                decoded.stats,
+                                decoded.freq,
+                            );
+                            if !self.shared.math_channels.is_empty() {
+                                math_editor::reevaluate_math_channels_waiting_on_inputs(
+                                    &mut self.shared,
+                                );
+                            }
+                            self.maybe_apply_pending_workspace_restore();
+                        }
+                        Err(err) => {
+                            self.shared.cancel_physical_channel_decode(channel_idx);
+                            self.load_error = Some(format!("Failed to decode channel: {err}"));
+                        }
+                    }
+                }
+                JobResult::BuildTrackData {
+                    session_id,
+                    track_data,
+                } => {
+                    if self.shared.session_id != session_id {
+                        continue;
+                    }
+                    self.shared.store_track_data(track_data);
+                }
+                JobResult::EvaluateMathChannel {
+                    session_id,
+                    math_id,
+                    expression,
+                    result,
+                } => {
+                    if self.shared.session_id != session_id {
+                        continue;
+                    }
+                    self.shared.complete_math_channel_evaluation(math_id);
+                    if math_editor::apply_math_evaluation_result(
+                        &mut self.shared,
+                        math_id,
+                        &expression,
+                        result,
+                    ) {
+                        self.shared.invalidate_derived_caches();
+                        if !self.shared.math_channels.is_empty() {
+                            math_editor::reevaluate_math_channels_waiting_on_inputs(
+                                &mut self.shared,
+                            );
+                        }
+                    }
+                    self.maybe_apply_pending_workspace_restore();
+                }
+                JobResult::BuildDownsampledSeries {
+                    session_id,
+                    key,
+                    points,
+                } => {
+                    if self.shared.session_id != session_id {
+                        continue;
+                    }
+                    self.shared.store_downsampled_series(key, points);
+                }
+            }
+        }
+    }
+
+    fn submit_requested_channel_decodes(&mut self, ctx: &egui::Context) {
+        let Some(ld) = self.shared.ld_file.clone() else {
+            return;
+        };
+
+        for channel_idx in self.shared.take_requested_physical_channel_decodes() {
+            let request_id = self.next_request_id;
+            self.next_request_id += 1;
+
+            if let Err(err) = self.background_jobs.submit(
+                JobRequest::DecodePhysicalChannel {
+                    request_id,
+                    session_id: self.shared.session_id,
+                    ld: ld.clone(),
+                    channel_idx,
+                },
+                ctx,
+            ) {
+                self.shared.cancel_physical_channel_decode(channel_idx);
+                self.load_error = Some(err);
+            }
+        }
+    }
+
+    fn submit_requested_math_channel_evaluations(&mut self, ctx: &egui::Context) {
+        let requested = self.shared.take_requested_math_channel_evaluations();
+        if requested.is_empty() {
+            return;
+        }
+
+        let topo_order = math_editor::topological_eval_order(&self.shared);
+        let mut order_pos = HashMap::new();
+        for (position, idx) in topo_order.into_iter().enumerate() {
+            if let Some(math_id) = self.shared.math_channels.get(idx).map(|mc| mc.id) {
+                order_pos.insert(math_id, position);
+            }
+        }
+
+        let mut requested = requested;
+        requested.sort_by_key(|math_id| order_pos.get(math_id).copied().unwrap_or(usize::MAX));
+
+        for math_id in requested {
+            let Some(job) = math_editor::build_math_evaluation_job(&mut self.shared, math_id)
+            else {
+                self.shared.cancel_math_channel_evaluation(math_id);
+                continue;
+            };
+
+            let request_id = self.next_request_id;
+            self.next_request_id += 1;
+
+            if let Err(err) = self.background_jobs.submit(
+                JobRequest::EvaluateMathChannel {
+                    request_id,
+                    session_id: self.shared.session_id,
+                    math_id: job.math_id,
+                    expression: job.expression,
+                    aliases: job.aliases,
+                    channel_data: job.channel_data,
+                },
+                ctx,
+            ) {
+                self.shared.cancel_math_channel_evaluation(math_id);
+                self.load_error = Some(err);
+            }
+        }
+    }
+
+    fn submit_requested_track_data_build(&mut self, ctx: &egui::Context) {
+        let Some(ld) = self.shared.ld_file.clone() else {
+            return;
+        };
+
+        if !self.shared.take_requested_track_data_build() {
+            return;
+        }
+
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        if let Err(err) = self.background_jobs.submit(
+            JobRequest::BuildTrackData {
+                request_id,
+                session_id: self.shared.session_id,
+                ld,
+            },
+            ctx,
+        ) {
+            self.shared.cancel_track_data_build();
+            self.load_error = Some(err);
+        }
+    }
+
+    fn submit_requested_downsampled_series(&mut self, ctx: &egui::Context) {
+        for request in self.shared.take_requested_downsampled_series() {
+            let request_id = self.next_request_id;
+            self.next_request_id += 1;
+
+            if let Err(err) = self.background_jobs.submit(
+                JobRequest::BuildDownsampledSeries {
+                    request_id,
+                    session_id: self.shared.session_id,
+                    key: request.key.clone(),
+                    data: request.data,
+                    freq: request.freq,
+                    start_sample: request.start_sample,
+                    end_sample: request.end_sample,
+                    target_width: request.target_width,
+                },
+                ctx,
+            ) {
+                self.shared.cancel_downsampled_series(&request.key);
+                self.load_error = Some(err);
+            }
+        }
     }
 
     fn clear_loaded_session(&mut self) {
+        self.pending_workspace_restore = None;
         self.shared.ld_file = None;
         self.shared.ld_path = None;
         self.shared.file_name.clear();
@@ -388,7 +701,7 @@ impl App {
         self.shared.cursor_time = None;
         self.shared.zoom_range = None;
         self.shared.data_duration = None;
-        self.shared.invalidate_derived_caches();
+        self.shared.invalidate_session_caches();
 
         for ws in &mut self.worksheets {
             for (_path, tab) in ws.dock_state.iter_all_tabs_mut() {
@@ -614,14 +927,13 @@ impl App {
                     // Load math channels from project workspace.
                     self.shared.math_channels.clear();
                     for config in &project.workspace.math_channels {
-                        self.shared
-                            .math_channels
-                            .push(crate::state::MathChannelDef::new(
-                                config.name.clone(),
-                                config.expression.clone(),
-                                config.unit.clone(),
-                                config.dec_places,
-                            ));
+                        let math_channel = self.shared.create_math_channel_def(
+                            config.name.clone(),
+                            config.expression.clone(),
+                            config.unit.clone(),
+                            config.dec_places,
+                        );
+                        self.shared.math_channels.push(math_channel);
                     }
                     math_editor::evaluate_all_math_channels(&mut self.shared);
                     self.shared.invalidate_derived_caches();
@@ -630,7 +942,8 @@ impl App {
 
                     let workspace = project.workspace;
                     self.sync_project_sessions_from_workspace(&workspace);
-                    self.apply_workspace_snapshot(workspace);
+                    self.pending_workspace_restore = None;
+                    self.restore_workspace_when_ready(workspace);
                 }
                 Err(e) => eprintln!("Failed to parse project: {}", e),
             },
@@ -1171,14 +1484,13 @@ impl App {
                         // Load math channels from workspace
                         self.shared.math_channels.clear();
                         for config in &workspace.math_channels {
-                            self.shared
-                                .math_channels
-                                .push(crate::state::MathChannelDef::new(
-                                    config.name.clone(),
-                                    config.expression.clone(),
-                                    config.unit.clone(),
-                                    config.dec_places,
-                                ));
+                            let math_channel = self.shared.create_math_channel_def(
+                                config.name.clone(),
+                                config.expression.clone(),
+                                config.unit.clone(),
+                                config.dec_places,
+                            );
+                            self.shared.math_channels.push(math_channel);
                         }
                         math_editor::evaluate_all_math_channels(&mut self.shared);
                         self.shared.invalidate_derived_caches();
@@ -1187,7 +1499,8 @@ impl App {
                         self.shared.reference_lap = workspace.reference_lap;
 
                         self.sync_project_sessions_from_workspace(&workspace);
-                        self.apply_workspace_snapshot(workspace);
+                        self.pending_workspace_restore = None;
+                        self.restore_workspace_when_ready(workspace);
                     }
                     Err(e) => eprintln!("Failed to parse workspace: {}", e),
                 },
@@ -1500,7 +1813,12 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        crate::perf_metrics::maybe_log_summary();
         self.process_platform_events(ui.ctx());
+        self.submit_requested_channel_decodes(ui.ctx());
+        self.submit_requested_math_channel_evaluations(ui.ctx());
+        self.submit_requested_track_data_build(ui.ctx());
+        self.submit_requested_downsampled_series(ui.ctx());
         self.handle_shortcuts(ui.ctx());
 
         // Handle file drops
@@ -1516,7 +1834,7 @@ impl eframe::App for App {
             })
         });
         if let Some(path) = dropped_path {
-            self.open_file(path);
+            self.open_file_async(path, ui.ctx());
         }
 
         // Swap channel registries: move current frame's data to display buffer,
@@ -1551,6 +1869,15 @@ impl eframe::App for App {
         }
         if dismiss_load_error {
             self.load_error = None;
+        }
+
+        if let Some(pending) = &self.pending_session_load {
+            egui::Panel::top("load_status").show_inside(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Loading {}…", pending.file_label));
+                });
+            });
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -1744,6 +2071,10 @@ impl eframe::App for App {
 
         self.show_channel_preferences_window(ui.ctx());
         self.show_session_details_window(ui.ctx());
+        self.submit_requested_channel_decodes(ui.ctx());
+        self.submit_requested_math_channel_evaluations(ui.ctx());
+        self.submit_requested_track_data_build(ui.ctx());
+        self.submit_requested_downsampled_series(ui.ctx());
 
         // Clear per-frame flags
         self.shared.zoom_from_timeline = false;
@@ -1759,7 +2090,7 @@ impl eframe::App for App {
 mod tests {
     use super::*;
     use crate::panels::histogram::HistogramPanel;
-    use crate::state::{ChannelId, PlottedChannel, YAxis};
+    use crate::state::{ChannelId, MathEvaluationState, PlottedChannel, YAxis};
 
     const TEST_LD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/VIR_LAP.ld");
 
@@ -1771,6 +2102,8 @@ mod tests {
     }
 
     fn test_app(shared: SharedState, worksheets: Vec<Worksheet>) -> App {
+        #[cfg(not(target_arch = "wasm32"))]
+        let (native_pick_tx, native_pick_rx) = crate::platform::native_pick_channel();
         App {
             shared,
             worksheets,
@@ -1790,6 +2123,15 @@ mod tests {
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,
+            background_jobs: BackgroundJobs::new(),
+            pending_session_load: None,
+            pending_workspace_restore: None,
+            next_session_id: 1,
+            next_request_id: 1,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_pick_tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_pick_rx,
             #[cfg(target_arch = "wasm32")]
             web_load_tx: crate::platform::web_load_channel().0,
             #[cfg(target_arch = "wasm32")]
@@ -1818,7 +2160,7 @@ mod tests {
         graph.plotted_channels.push(PlottedChannel {
             channel_id: ChannelId::Physical(0),
             color: egui::Color32::WHITE,
-            data: Arc::new(vec![1.0]),
+            data: Arc::from(vec![1.0]),
             tile_group: 0,
             y_axis: YAxis::Left,
             display_scale: 1.0,
@@ -1842,7 +2184,7 @@ mod tests {
         graph.plotted_channels.push(PlottedChannel {
             channel_id: ChannelId::Physical(0),
             color: egui::Color32::WHITE,
-            data: Arc::new(vec![1.0]),
+            data: Arc::from(vec![1.0]),
             tile_group: 0,
             y_axis: YAxis::Left,
             display_scale: 1.0,
@@ -1925,5 +2267,79 @@ mod tests {
 
         assert_eq!(docked_track_maps, 0);
         assert_eq!(app.popped_out_track_maps.len(), 1);
+    }
+
+    #[test]
+    fn workspace_restore_waits_for_math_channels_to_finish() {
+        let mut shared = SharedState::new();
+        let mut math_channel =
+            shared.create_math_channel_def("Derived".into(), "1".into(), String::new(), 2);
+        math_channel.data = Some(Arc::from(vec![1.0]));
+        math_channel.freq = 1;
+        math_channel.evaluation_state = MathEvaluationState::Ready;
+        shared.math_channels.push(math_channel);
+
+        let mut graph = GraphPanel::new(1, "Graph");
+        graph.plotted_channels.push(PlottedChannel {
+            channel_id: ChannelId::Math(0),
+            color: egui::Color32::WHITE,
+            data: Arc::from(vec![1.0]),
+            tile_group: 0,
+            y_axis: YAxis::Left,
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
+            cached_min: 1.0,
+            cached_max: 1.0,
+            cached_avg: 1.0,
+        });
+
+        let worksheet = worksheet_with_tabs(vec![PanelTab::Graph(graph)]);
+        let mut app = test_app(shared, vec![worksheet]);
+        let workspace = app
+            .workspace_snapshot_for_session_reload()
+            .expect("custom layout should snapshot");
+
+        app.worksheets = vec![worksheet_with_tabs(vec![PanelTab::Graph(GraphPanel::new(
+            2, "Empty",
+        ))])];
+        app.shared.math_channels[0].data = None;
+        app.shared.math_channels[0].error = Some("Waiting for source channels...".into());
+        app.shared.math_channels[0].evaluation_state = MathEvaluationState::WaitingForInputs;
+
+        app.restore_workspace_when_ready(workspace);
+
+        assert!(app.pending_workspace_restore.is_some());
+        let pending_graph = app.worksheets[0]
+            .dock_state
+            .iter_all_tabs()
+            .find_map(|(_, tab)| match tab {
+                PanelTab::Graph(graph) => Some(graph),
+                _ => None,
+            })
+            .expect("graph tab should exist");
+        assert!(pending_graph.plotted_channels.is_empty());
+
+        app.shared.math_channels[0].data = Some(Arc::from(vec![2.0]));
+        app.shared.math_channels[0].freq = 1;
+        app.shared.math_channels[0].error = None;
+        app.shared.math_channels[0].evaluation_state = MathEvaluationState::Ready;
+
+        app.maybe_apply_pending_workspace_restore();
+
+        assert!(app.pending_workspace_restore.is_none());
+        let restored_graph = app.worksheets[0]
+            .dock_state
+            .iter_all_tabs()
+            .find_map(|(_, tab)| match tab {
+                PanelTab::Graph(graph) => Some(graph),
+                _ => None,
+            })
+            .expect("graph tab should exist");
+        assert_eq!(restored_graph.plotted_channels.len(), 1);
+        assert!(matches!(
+            restored_graph.plotted_channels[0].channel_id,
+            ChannelId::Math(0)
+        ));
     }
 }

@@ -1,8 +1,10 @@
 //! Shared library entry points for the native and web i3rs app.
 
 mod app;
+mod background_jobs;
 mod default_layouts;
 mod panels;
+mod perf_metrics;
 mod platform;
 mod preferences;
 mod project;

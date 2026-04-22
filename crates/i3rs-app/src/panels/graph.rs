@@ -11,15 +11,17 @@ use i3rs_core::{
 };
 
 use crate::state::{
-    CHANNEL_COLORS, ChannelId, ChannelPreference, DistanceAxisCache, GraphMode, GraphXAxis,
-    PlottedChannel, SharedState, YAxis, channel_preference_key,
+    CHANNEL_COLORS, ChannelId, ChannelPreference, DistanceAxisCache, DownsampleSeriesKey,
+    DownsampleSeriesRequest, GraphMode, GraphXAxis, PlottedChannel, SharedState, YAxis,
+    channel_preference_key,
 };
 
 use super::gauge::{
     GaugeChannel, GaugeDrawContext, GaugeStyle, default_style_for_name, draw_gauge,
 };
 use super::utils::{
-    ChannelDisplayMeta, build_plotted_channel_info, create_plotted_channel, interp_at_time,
+    ChannelDisplayMeta, DisplayTransformFingerprint, build_plotted_channel_info,
+    create_plotted_channel, display_transform_fingerprint, interp_at_time, refresh_plotted_channel,
     resolve_channel_meta, resolve_plotted_channel_display_meta,
 };
 
@@ -134,13 +136,13 @@ fn transformed_value_for_display(
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum OverlaySource {
     MainSession,
     External(usize),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct LapOverlay {
     pub source: OverlaySource,
     pub lap_idx: usize,
@@ -149,7 +151,7 @@ pub struct LapOverlay {
 }
 
 pub struct OverlayChannelCacheEntry {
-    pub data: Arc<Vec<f64>>,
+    pub data: Arc<[f64]>,
     pub freq: u16,
 }
 
@@ -160,6 +162,59 @@ pub struct OverlaySession {
     pub laps: Vec<Lap>,
     pub distance_axis_cache: Option<DistanceAxisCache>,
     pub channel_cache: HashMap<String, OverlayChannelCacheEntry>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum GraphAxisFingerprint {
+    Time,
+    Distance {
+        data_ptr: usize,
+        data_len: usize,
+        freq: u16,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct GraphRenderFingerprint {
+    data_ptr: usize,
+    data_len: usize,
+    x_bounds: (u64, u64),
+    axis: GraphAxisFingerprint,
+    transform: DisplayTransformFingerprint,
+    target_width: usize,
+}
+
+struct GraphRenderCacheEntry {
+    fingerprint: GraphRenderFingerprint,
+    plot_points: Vec<egui_plot::PlotPoint>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum LapRenderCacheKey {
+    Reference(ChannelId),
+    Overlay {
+        channel_id: ChannelId,
+        overlay_idx: usize,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct LapRenderFingerprint {
+    data_ptr: usize,
+    data_len: usize,
+    lap_bounds: (u64, u64),
+    x_bounds: (u64, u64),
+    axis: GraphAxisFingerprint,
+    origin_axis_bits: u64,
+    x_scale_bits: u64,
+    x_offset_bits: u64,
+    transform: DisplayTransformFingerprint,
+    target_width: usize,
+}
+
+struct LapRenderCacheEntry {
+    fingerprint: LapRenderFingerprint,
+    plot_points: Vec<egui_plot::PlotPoint>,
 }
 
 /// A single graph panel with its own set of plotted channels.
@@ -176,6 +231,8 @@ pub struct GraphPanel {
     pub overlay_sessions: Vec<OverlaySession>,
     /// Set when the first channel is added; consumed on next render to reset zoom.
     needs_zoom_reset: bool,
+    render_cache: HashMap<ChannelId, GraphRenderCacheEntry>,
+    lap_render_cache: HashMap<LapRenderCacheKey, LapRenderCacheEntry>,
 }
 
 impl GraphPanel {
@@ -212,6 +269,8 @@ impl GraphPanel {
             lap_overlays: Vec::new(),
             overlay_sessions: Vec::new(),
             needs_zoom_reset: false,
+            render_cache: HashMap::new(),
+            lap_render_cache: HashMap::new(),
         }
     }
 
@@ -222,6 +281,8 @@ impl GraphPanel {
         self.lap_overlays.clear();
         self.overlay_sessions.clear();
         self.needs_zoom_reset = false;
+        self.render_cache.clear();
+        self.lap_render_cache.clear();
     }
 
     pub fn add_channel(&mut self, channel_id: ChannelId, shared: &SharedState) {
@@ -241,6 +302,15 @@ impl GraphPanel {
     pub fn remove_channel(&mut self, channel_id: ChannelId) {
         self.plotted_channels
             .retain(|pc| pc.channel_id != channel_id);
+        self.render_cache.remove(&channel_id);
+        self.lap_render_cache.retain(|key, _| {
+            !matches!(
+                key,
+                LapRenderCacheKey::Reference(id)
+                    | LapRenderCacheKey::Overlay { channel_id: id, .. }
+                    if *id == channel_id
+            )
+        });
     }
 
     pub fn add_embedded_gauge(&mut self, channel_id: ChannelId, shared: &SharedState) {
@@ -301,7 +371,7 @@ impl GraphPanel {
             laps,
             distance_axis_cache: derive_distance_axis_cache_for_ld(&ld_file).map(|cache| {
                 DistanceAxisCache {
-                    data: Arc::new(cache.data),
+                    data: Arc::from(cache.data),
                     freq: cache.freq,
                 }
             }),
@@ -326,6 +396,8 @@ impl GraphPanel {
 
     /// Render the graph panel UI.
     pub fn ui(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
+        let _perf = crate::perf_metrics::scope("graph draw");
+
         // Handle pending channel toggle from browser
         if let Some(ch_id) = shared.pending_toggle_channel.take() {
             let was_empty = self.plotted_channels.is_empty();
@@ -346,6 +418,13 @@ impl GraphPanel {
             if was_empty && !self.plotted_channels.is_empty() {
                 self.needs_zoom_reset = true;
             }
+        }
+
+        for channel in &mut self.plotted_channels {
+            refresh_plotted_channel(channel, shared);
+        }
+        for gauge in &mut self.embedded_gauges {
+            refresh_plotted_channel(&mut gauge.channel, shared);
         }
 
         if self.plotted_channels.is_empty() {
@@ -463,6 +542,7 @@ impl GraphPanel {
                     manual_offset: 0.0,
                     stretch_to_reference: false,
                 });
+                self.lap_render_cache.clear();
                 self.needs_zoom_reset = true;
             }
 
@@ -474,6 +554,7 @@ impl GraphPanel {
                 .clicked()
             {
                 self.load_external_overlay();
+                self.lap_render_cache.clear();
                 self.needs_zoom_reset = true;
             }
 
@@ -486,6 +567,7 @@ impl GraphPanel {
             {
                 self.lap_overlays.clear();
                 self.overlay_sessions.clear();
+                self.lap_render_cache.clear();
                 self.needs_zoom_reset = true;
             }
 
@@ -533,6 +615,7 @@ impl GraphPanel {
             } else {
                 self.lap_overlays.clear();
             }
+            self.lap_render_cache.clear();
             self.needs_zoom_reset = true;
         }
 
@@ -602,6 +685,7 @@ impl GraphPanel {
 
                     if let Some(idx) = remove_idx {
                         self.lap_overlays.remove(idx);
+                        self.lap_render_cache.clear();
                     }
                 });
         }
@@ -775,10 +859,15 @@ impl GraphPanel {
                 .auto_bounds(egui::Vec2b::new(true, true));
         }
 
-        let laps = shared.laps.clone();
+        let laps = shared.laps.as_slice();
         let show_markers = shared.show_lap_markers;
         let cursor_time = shared.cursor_time;
         let plotted: Vec<&PlottedChannel> = self.plotted_channels.iter().collect();
+        let channel_meta: Vec<ChannelDisplayMeta> = self
+            .plotted_channels
+            .iter()
+            .map(|pc| resolve_plotted_channel_display_meta(pc, shared))
+            .collect();
 
         let mut new_cursor_time = None;
         let zoom_from_timeline = shared.zoom_from_timeline;
@@ -786,6 +875,7 @@ impl GraphPanel {
 
         let y_range = Self::compute_y_range(&plotted);
         let freq_map = build_freq_map(&plotted, shared);
+        let render_cache = &mut self.render_cache;
 
         let response = plot.show(ui, |plot_ui| {
             if needs_zoom_reset {
@@ -804,10 +894,10 @@ impl GraphPanel {
                 plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
             }
 
-            Self::draw_channels(plot_ui, &plotted, &freq_map, x_axis);
+            Self::draw_channels(plot_ui, &plotted, &freq_map, x_axis, shared, render_cache);
 
             if show_markers {
-                Self::draw_lap_markers(plot_ui, &laps, x_axis);
+                Self::draw_lap_markers(plot_ui, laps, x_axis);
             }
 
             if let Some(t) = cursor_time {
@@ -829,7 +919,7 @@ impl GraphPanel {
             ui,
             response.response.rect,
             &plotted,
-            shared,
+            &channel_meta,
             shared.cursor_time,
         );
 
@@ -856,7 +946,7 @@ impl GraphPanel {
         x_axis: &ActiveGraphXAxis,
     ) {
         let cursor_group = egui::Id::new("global_cursor_link");
-        let laps = shared.laps.clone();
+        let laps = shared.laps.as_slice();
         let show_markers = shared.show_lap_markers;
         let cursor_time = shared.cursor_time;
         let zoom_from_timeline = shared.zoom_from_timeline;
@@ -882,13 +972,12 @@ impl GraphPanel {
         let mut any_hovered_cursor: Option<f64> = None;
         let mut hovered_x_bounds: Option<(f64, f64)> = None;
         let mut first_x_bounds: Option<(f64, f64)> = None;
+        let mut responses = Vec::new();
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
             .show(ui, |ui| {
-                let mut responses = Vec::new();
-
                 for (tile_idx, group) in tile_groups.iter().enumerate() {
                     let plot_id = format!("tile_{}_{}", self.id, tile_idx);
 
@@ -938,10 +1027,17 @@ impl GraphPanel {
                             plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
                         }
 
-                        Self::draw_channels(plot_ui, &grouped, &freq_map, x_axis);
+                        Self::draw_channels(
+                            plot_ui,
+                            &grouped,
+                            &freq_map,
+                            x_axis,
+                            shared,
+                            &mut self.render_cache,
+                        );
 
                         if show_markers {
-                            Self::draw_lap_markers(plot_ui, &laps, x_axis);
+                            Self::draw_lap_markers(plot_ui, laps, x_axis);
                         }
 
                         if let Some(t) = cursor_time {
@@ -978,11 +1074,11 @@ impl GraphPanel {
 
                     responses.push((group.clone(), resp.response));
                 }
-
-                for (group, resp) in &responses {
-                    self.handle_tile_group_context_menu(resp, group, &channel_meta, shared);
-                }
             });
+
+        for (group, resp) in &responses {
+            self.handle_tile_group_context_menu(resp, group, &channel_meta, shared);
+        }
 
         if let Some(t) = any_hovered_cursor {
             shared.cursor_time = Some(t);
@@ -1049,6 +1145,11 @@ impl GraphPanel {
             shared.data_duration.unwrap_or_default(),
         );
         let plotted: Vec<&PlottedChannel> = self.plotted_channels.iter().collect();
+        let channel_meta: Vec<ChannelDisplayMeta> = self
+            .plotted_channels
+            .iter()
+            .map(|pc| resolve_plotted_channel_display_meta(pc, shared))
+            .collect();
         let freq_map = build_freq_map(&plotted, shared);
         let y_range = Self::compute_y_range(&plotted);
         let cursor_time = shared.cursor_time;
@@ -1057,6 +1158,7 @@ impl GraphPanel {
 
         let mut new_cursor_time = None;
         let response = plot.show(ui, |plot_ui| {
+            let mut draw_specs = Vec::new();
             let (x_min, x_max) = if needs_zoom_reset {
                 viewport.full_range()
             } else if let Some((z_min, z_max)) = zoom_range {
@@ -1076,10 +1178,15 @@ impl GraphPanel {
             }
 
             let target_width = plot_ui.response().rect.width().max(100.0) as usize;
+            let lap_render_cache = &mut self.lap_render_cache;
             for pc in &plotted {
                 let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
-                draw_lap_series(
+                let reference_key = LapRenderCacheKey::Reference(pc.channel_id);
+                ensure_lap_series_cache(
                     plot_ui,
+                    shared,
+                    lap_render_cache,
+                    reference_key,
                     &pc.data,
                     freq,
                     &viewport.reference_lap,
@@ -1089,14 +1196,20 @@ impl GraphPanel {
                     0.0,
                     pc.display_scale,
                     pc.display_offset,
-                    pc.color,
-                    2.0,
                     target_width,
                 );
+                draw_specs.push((reference_key, pc.color, 2.0));
 
                 for prepared in prepared_overlays.get(&pc.channel_id).into_iter().flatten() {
-                    draw_lap_series(
+                    let overlay_key = LapRenderCacheKey::Overlay {
+                        channel_id: pc.channel_id,
+                        overlay_idx: prepared.overlay_idx,
+                    };
+                    ensure_lap_series_cache(
                         plot_ui,
+                        shared,
+                        lap_render_cache,
+                        overlay_key,
                         &prepared.data,
                         prepared.freq,
                         &prepared.lap,
@@ -1106,11 +1219,15 @@ impl GraphPanel {
                         prepared.offset,
                         pc.display_scale,
                         pc.display_offset,
-                        prepared.color,
-                        prepared.width,
                         target_width,
                     );
+                    draw_specs.push((overlay_key, prepared.color, prepared.width));
                 }
+            }
+
+            let lap_render_cache = &self.lap_render_cache;
+            for (cache_key, color, width) in draw_specs {
+                draw_cached_lap_series(plot_ui, lap_render_cache, &cache_key, color, width);
             }
 
             if let Some(cursor_time) = cursor_time {
@@ -1139,7 +1256,7 @@ impl GraphPanel {
             ui,
             response.response.rect,
             &plotted,
-            shared,
+            &channel_meta,
             shared.cursor_time,
         );
 
@@ -1228,6 +1345,7 @@ impl GraphPanel {
                     let y_range = Self::compute_y_range(&grouped);
                     let mut tile_cursor = None;
                     let resp = plot.show(ui, |plot_ui| {
+                        let mut draw_specs = Vec::new();
                         let (x_min, x_max) = if needs_zoom_reset {
                             viewport.full_range()
                         } else if let Some((z_min, z_max)) = zoom_range {
@@ -1247,10 +1365,15 @@ impl GraphPanel {
                         }
 
                         let target_width = plot_ui.response().rect.width().max(100.0) as usize;
+                        let lap_render_cache = &mut self.lap_render_cache;
                         for pc in &grouped {
                             let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
-                            draw_lap_series(
+                            let reference_key = LapRenderCacheKey::Reference(pc.channel_id);
+                            ensure_lap_series_cache(
                                 plot_ui,
+                                shared,
+                                lap_render_cache,
+                                reference_key,
                                 &pc.data,
                                 freq,
                                 &viewport.reference_lap,
@@ -1260,16 +1383,22 @@ impl GraphPanel {
                                 0.0,
                                 pc.display_scale,
                                 pc.display_offset,
-                                pc.color,
-                                2.0,
                                 target_width,
                             );
+                            draw_specs.push((reference_key, pc.color, 2.0));
 
                             for prepared in
                                 prepared_overlays.get(&pc.channel_id).into_iter().flatten()
                             {
-                                draw_lap_series(
+                                let overlay_key = LapRenderCacheKey::Overlay {
+                                    channel_id: pc.channel_id,
+                                    overlay_idx: prepared.overlay_idx,
+                                };
+                                ensure_lap_series_cache(
                                     plot_ui,
+                                    shared,
+                                    lap_render_cache,
+                                    overlay_key,
                                     &prepared.data,
                                     prepared.freq,
                                     &prepared.lap,
@@ -1279,11 +1408,21 @@ impl GraphPanel {
                                     prepared.offset,
                                     pc.display_scale,
                                     pc.display_offset,
-                                    prepared.color,
-                                    prepared.width,
                                     target_width,
                                 );
+                                draw_specs.push((overlay_key, prepared.color, prepared.width));
                             }
+                        }
+
+                        let lap_render_cache = &self.lap_render_cache;
+                        for (cache_key, color, width) in draw_specs {
+                            draw_cached_lap_series(
+                                plot_ui,
+                                lap_render_cache,
+                                &cache_key,
+                                color,
+                                width,
+                            );
                         }
 
                         if let Some(cursor_time) = cursor_time {
@@ -1385,17 +1524,27 @@ impl GraphPanel {
         }
     }
 
-    fn draw_channels(
-        plot_ui: &mut egui_plot::PlotUi,
+    fn draw_channels<'a>(
+        plot_ui: &mut egui_plot::PlotUi<'a>,
         channels: &[&PlottedChannel],
         freq_map: &HashMap<ChannelId, u16>,
         x_axis: &ActiveGraphXAxis,
+        shared: &SharedState,
+        render_cache: &'a mut HashMap<ChannelId, GraphRenderCacheEntry>,
     ) {
         let bounds = plot_ui.plot_bounds();
         let x_min = bounds.min()[0];
         let x_max = bounds.max()[0];
         let pixels_wide = plot_ui.response().rect.width() as usize;
         let target_width = pixels_wide.max(100);
+        let axis_fingerprint = match x_axis {
+            ActiveGraphXAxis::Time => GraphAxisFingerprint::Time,
+            ActiveGraphXAxis::Distance { data, freq } => GraphAxisFingerprint::Distance {
+                data_ptr: data.as_ptr() as usize,
+                data_len: data.len(),
+                freq: *freq,
+            },
+        };
 
         for pc in channels {
             let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
@@ -1432,20 +1581,154 @@ impl GraphPanel {
                 continue;
             }
 
-            let visible_data = &pc.data[start_sample..end_sample];
-            let downsampled = downsample_minmax(visible_data, freq, start_sample, target_width);
+            let fingerprint = GraphRenderFingerprint {
+                data_ptr: pc.data.as_ptr() as usize,
+                data_len: pc.data.len(),
+                x_bounds: (x_min.to_bits(), x_max.to_bits()),
+                axis: axis_fingerprint.clone(),
+                transform: display_transform_fingerprint(pc),
+                target_width,
+            };
 
-            let points: Vec<[f64; 2]> = downsampled
-                .iter()
-                .map(|p| {
-                    [
-                        x_axis.axis_value_at_time(p.time),
-                        ((p.min + p.max) / 2.0) * pc.display_scale + pc.display_offset,
-                    ]
-                })
-                .filter(|[x, _]| *x >= x_min && *x <= x_max)
-                .collect();
-            let line = Line::new("", PlotPoints::new(points))
+            let cache_entry =
+                render_cache
+                    .entry(pc.channel_id)
+                    .or_insert_with(|| GraphRenderCacheEntry {
+                        fingerprint: fingerprint.clone(),
+                        plot_points: Vec::new(),
+                    });
+
+            if cache_entry.fingerprint != fingerprint {
+                cache_entry.fingerprint = fingerprint.clone();
+                cache_entry.plot_points.clear();
+            }
+
+            if cache_entry.plot_points.is_empty() {
+                let visible_sample_count = end_sample - start_sample;
+                let should_background_downsample =
+                    visible_sample_count > target_width.saturating_mul(4);
+                let downsampled = match pc.channel_id {
+                    ChannelId::Physical(channel_idx) => {
+                        if let Some(decoded) = shared.decoded_physical_channel_if_ready(channel_idx)
+                        {
+                            decoded
+                                .best_lod_level_for_view(visible_sample_count, target_width)
+                                .map(|level| {
+                                    level
+                                        .points
+                                        .iter()
+                                        .copied()
+                                        .filter(|point| {
+                                            let point_time = point.time;
+                                            point_time >= visible_t_min
+                                                && point_time <= visible_t_max
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .filter(|points| !points.is_empty())
+                                .or_else(|| {
+                                    if should_background_downsample {
+                                        let key = DownsampleSeriesKey {
+                                            data_ptr: pc.data.as_ptr() as usize,
+                                            data_len: pc.data.len(),
+                                            freq,
+                                            start_sample,
+                                            end_sample,
+                                            target_width,
+                                        };
+                                        if let Some(points) =
+                                            shared.downsampled_series_if_ready(&key)
+                                        {
+                                            Some(points.iter().copied().collect())
+                                        } else {
+                                            shared.request_downsampled_series(
+                                                DownsampleSeriesRequest {
+                                                    key,
+                                                    data: Arc::clone(&pc.data),
+                                                    freq,
+                                                    start_sample,
+                                                    end_sample,
+                                                    target_width,
+                                                },
+                                            );
+                                            None
+                                        }
+                                    } else {
+                                        let visible_data = &pc.data[start_sample..end_sample];
+                                        Some(downsample_minmax(
+                                            visible_data,
+                                            freq,
+                                            start_sample,
+                                            target_width,
+                                        ))
+                                    }
+                                })
+                        } else {
+                            shared.request_physical_channel_decode(channel_idx);
+                            None
+                        }
+                    }
+                    ChannelId::Math(_) => {
+                        if should_background_downsample {
+                            let key = DownsampleSeriesKey {
+                                data_ptr: pc.data.as_ptr() as usize,
+                                data_len: pc.data.len(),
+                                freq,
+                                start_sample,
+                                end_sample,
+                                target_width,
+                            };
+                            if let Some(points) = shared.downsampled_series_if_ready(&key) {
+                                Some(points.iter().copied().collect())
+                            } else {
+                                shared.request_downsampled_series(DownsampleSeriesRequest {
+                                    key,
+                                    data: Arc::clone(&pc.data),
+                                    freq,
+                                    start_sample,
+                                    end_sample,
+                                    target_width,
+                                });
+                                None
+                            }
+                        } else {
+                            let visible_data = &pc.data[start_sample..end_sample];
+                            Some(downsample_minmax(
+                                visible_data,
+                                freq,
+                                start_sample,
+                                target_width,
+                            ))
+                        }
+                    }
+                };
+
+                if let Some(downsampled) = downsampled {
+                    cache_entry.plot_points = downsampled
+                        .iter()
+                        .map(|point| {
+                            egui_plot::PlotPoint::new(
+                                x_axis.axis_value_at_time(point.time),
+                                ((point.min + point.max) / 2.0) * pc.display_scale
+                                    + pc.display_offset,
+                            )
+                        })
+                        .filter(|point| point.x >= x_min && point.x <= x_max)
+                        .collect();
+                }
+            }
+        }
+
+        let render_cache = &*render_cache;
+        for pc in channels {
+            let Some(cache_entry) = render_cache.get(&pc.channel_id) else {
+                continue;
+            };
+            if cache_entry.plot_points.is_empty() {
+                continue;
+            }
+
+            let line = Line::new("", PlotPoints::Borrowed(cache_entry.plot_points.as_slice()))
                 .color(pc.color)
                 .width(1.5);
             plot_ui.line(line);
@@ -1456,15 +1739,16 @@ impl GraphPanel {
         ui: &egui::Ui,
         plot_rect: egui::Rect,
         channels: &[&PlottedChannel],
-        shared: &SharedState,
+        channel_meta: &[ChannelDisplayMeta],
         cursor_time: Option<f64>,
     ) {
         let line_height = 15.0;
         let pad = 4.0;
         for (i, pc) in channels.iter().enumerate() {
-            let meta = resolve_plotted_channel_display_meta(pc, shared);
-            let y = plot_rect.top() + pad + i as f32 * line_height;
-            Self::draw_legend_entry(ui, plot_rect, pc, &meta, cursor_time, y);
+            if let Some(meta) = channel_meta.get(i) {
+                let y = plot_rect.top() + pad + i as f32 * line_height;
+                Self::draw_legend_entry(ui, plot_rect, pc, meta, cursor_time, y);
+            }
         }
     }
 
@@ -1949,7 +2233,8 @@ impl GraphPanel {
             );
         }
 
-        if let Some(cache) = derive_distance_axis_cache(shared) {
+        let (derived_cache, waiting_on_sources) = derive_distance_axis_cache(shared);
+        if let Some(cache) = derived_cache {
             shared.distance_axis_cache = Some(cache.clone());
             return (
                 ActiveGraphXAxis::Distance {
@@ -1962,7 +2247,14 @@ impl GraphPanel {
 
         (
             ActiveGraphXAxis::Time,
-            Some("Distance X-axis unavailable for this session; falling back to time.".into()),
+            Some(
+                if waiting_on_sources {
+                    "Distance X-axis is still loading source channels; falling back to time."
+                } else {
+                    "Distance X-axis unavailable for this session; falling back to time."
+                }
+                .into(),
+            ),
         )
     }
 
@@ -2022,15 +2314,15 @@ impl GraphPanel {
             .iter()
             .map(|pc| pc.channel_id)
             .collect();
-        let overlay_specs = self.lap_overlays.clone();
 
         for channel_id in channel_ids {
             let mut series = Vec::new();
-            for (overlay_idx, overlay) in overlay_specs.iter().enumerate() {
+            for overlay_idx in 0..self.lap_overlays.len() {
+                let overlay = self.lap_overlays[overlay_idx];
                 if let Some(rendered) =
-                    self.resolve_overlay_render_data(shared, overlay, channel_id)
+                    self.resolve_overlay_render_data(shared, &overlay, channel_id)
                     && let Some(source_axis) =
-                        self.overlay_axis_for_source(overlay, x_axis, main_session_duration)
+                        self.overlay_axis_for_source(&overlay, x_axis, main_session_duration)
                     && let Some(raw_len) = lap_axis_length(
                         &source_axis.axis,
                         &rendered.lap,
@@ -2066,6 +2358,7 @@ impl GraphPanel {
                         offset: axis_offset,
                         color: tint_color(base_color, overlay_idx + 1),
                         width: 1.35,
+                        overlay_idx,
                     });
                 }
             }
@@ -2178,13 +2471,13 @@ struct OverlayAxisHandle {
 }
 
 struct ResolvedOverlayRenderData {
-    data: Arc<Vec<f64>>,
+    data: Arc<[f64]>,
     freq: u16,
     lap: Lap,
 }
 
 struct PreparedLapOverlay {
-    data: Arc<Vec<f64>>,
+    data: Arc<[f64]>,
     freq: u16,
     lap: Lap,
     axis: ActiveGraphXAxis,
@@ -2193,12 +2486,13 @@ struct PreparedLapOverlay {
     offset: f64,
     color: egui::Color32,
     width: f32,
+    overlay_idx: usize,
 }
 
 #[derive(Clone)]
 enum ActiveGraphXAxis {
     Time,
-    Distance { data: Arc<Vec<f64>>, freq: u16 },
+    Distance { data: Arc<[f64]>, freq: u16 },
 }
 
 impl ActiveGraphXAxis {
@@ -2308,10 +2602,24 @@ impl OverlayViewport {
     }
 }
 
+fn graph_axis_fingerprint(x_axis: &ActiveGraphXAxis) -> GraphAxisFingerprint {
+    match x_axis {
+        ActiveGraphXAxis::Time => GraphAxisFingerprint::Time,
+        ActiveGraphXAxis::Distance { data, freq } => GraphAxisFingerprint::Distance {
+            data_ptr: data.as_ptr() as usize,
+            data_len: data.len(),
+            freq: *freq,
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn draw_lap_series(
-    plot_ui: &mut egui_plot::PlotUi,
-    data: &[f64],
+fn ensure_lap_series_cache(
+    plot_ui: &egui_plot::PlotUi,
+    shared: &SharedState,
+    render_cache: &mut HashMap<LapRenderCacheKey, LapRenderCacheEntry>,
+    cache_key: LapRenderCacheKey,
+    data: &Arc<[f64]>,
     freq: u16,
     lap: &Lap,
     axis: &ActiveGraphXAxis,
@@ -2320,8 +2628,6 @@ fn draw_lap_series(
     x_offset: f64,
     y_scale: f64,
     y_offset: f64,
-    color: egui::Color32,
-    width: f32,
     target_width: usize,
 ) {
     if freq == 0 || data.is_empty() {
@@ -2337,27 +2643,99 @@ fn draw_lap_series(
     let bounds = plot_ui.plot_bounds();
     let x_min = bounds.min()[0];
     let x_max = bounds.max()[0];
-    let lap_data = &data[start_sample..end_sample];
-    let downsampled = downsample_minmax(lap_data, freq, start_sample, target_width);
-    let points: Vec<[f64; 2]> = downsampled
-        .iter()
-        .map(|point| {
-            let transformed_x =
-                (axis.axis_value_at_time(point.time) - origin_axis) * x_scale + x_offset;
-            [
-                transformed_x,
-                ((point.min + point.max) / 2.0) * y_scale + y_offset,
-            ]
-        })
-        .filter(|[x, _]| *x >= x_min && *x <= x_max)
-        .collect();
+    let fingerprint = LapRenderFingerprint {
+        data_ptr: data.as_ptr() as usize,
+        data_len: data.len(),
+        lap_bounds: (lap.start_time.to_bits(), lap.end_time.to_bits()),
+        x_bounds: (x_min.to_bits(), x_max.to_bits()),
+        axis: graph_axis_fingerprint(axis),
+        origin_axis_bits: origin_axis.to_bits(),
+        x_scale_bits: x_scale.to_bits(),
+        x_offset_bits: x_offset.to_bits(),
+        transform: DisplayTransformFingerprint {
+            scale_bits: y_scale.to_bits(),
+            offset_bits: y_offset.to_bits(),
+            unit: None,
+        },
+        target_width,
+    };
 
-    if points.is_empty() {
+    let cache_entry = render_cache
+        .entry(cache_key)
+        .or_insert_with(|| LapRenderCacheEntry {
+            fingerprint: fingerprint.clone(),
+            plot_points: Vec::new(),
+        });
+
+    if cache_entry.fingerprint != fingerprint || cache_entry.plot_points.is_empty() {
+        let visible_sample_count = end_sample - start_sample;
+        let should_background_downsample = visible_sample_count > target_width.saturating_mul(4);
+        let downsampled: Option<Arc<[i3rs_core::DownsampledPoint]>> =
+            if should_background_downsample {
+                let key = DownsampleSeriesKey {
+                    data_ptr: data.as_ptr() as usize,
+                    data_len: data.len(),
+                    freq,
+                    start_sample,
+                    end_sample,
+                    target_width,
+                };
+                if let Some(points) = shared.downsampled_series_if_ready(&key) {
+                    Some(points)
+                } else {
+                    shared.request_downsampled_series(DownsampleSeriesRequest {
+                        key,
+                        data: Arc::clone(data),
+                        freq,
+                        start_sample,
+                        end_sample,
+                        target_width,
+                    });
+                    None
+                }
+            } else {
+                Some(Arc::from(downsample_minmax(
+                    &data[start_sample..end_sample],
+                    freq,
+                    start_sample,
+                    target_width,
+                )))
+            };
+
+        if let Some(downsampled) = downsampled {
+            cache_entry.fingerprint = fingerprint;
+            cache_entry.plot_points = downsampled
+                .iter()
+                .map(|point| {
+                    let transformed_x =
+                        (axis.axis_value_at_time(point.time) - origin_axis) * x_scale + x_offset;
+                    egui_plot::PlotPoint::new(
+                        transformed_x,
+                        ((point.min + point.max) / 2.0) * y_scale + y_offset,
+                    )
+                })
+                .filter(|point| point.x >= x_min && point.x <= x_max)
+                .collect();
+        }
+    }
+}
+
+fn draw_cached_lap_series<'a>(
+    plot_ui: &mut egui_plot::PlotUi<'a>,
+    render_cache: &'a HashMap<LapRenderCacheKey, LapRenderCacheEntry>,
+    cache_key: &LapRenderCacheKey,
+    color: egui::Color32,
+    width: f32,
+) {
+    let Some(cache_entry) = render_cache.get(cache_key) else {
+        return;
+    };
+    if cache_entry.plot_points.is_empty() {
         return;
     }
 
     plot_ui.line(
-        Line::new("", PlotPoints::new(points))
+        Line::new("", PlotPoints::Borrowed(cache_entry.plot_points.as_slice()))
             .color(color)
             .width(width),
     );
@@ -2398,18 +2776,14 @@ fn tint_color(color: egui::Color32, offset: usize) -> egui::Color32 {
 fn resolve_overlay_channel_data(
     session: &mut OverlaySession,
     requested_name: &str,
-) -> Option<(Arc<Vec<f64>>, u16)> {
+) -> Option<(Arc<[f64]>, u16)> {
     let normalized_requested = normalized_name(requested_name);
     if let Some(cached) = session.channel_cache.get(&normalized_requested) {
         return Some((Arc::clone(&cached.data), cached.freq));
     }
 
-    let channel = session
-        .ld_file
-        .channels
-        .iter()
-        .find(|channel| normalized_name(&channel.name) == normalized_requested)?;
-    let data = Arc::new(session.ld_file.read_channel_data(channel)?);
+    let channel = session.ld_file.find_channel_by_name(requested_name)?;
+    let data = Arc::from(session.ld_file.read_channel_data(channel)?);
     session.channel_cache.insert(
         normalized_requested,
         OverlayChannelCacheEntry {
@@ -2429,18 +2803,26 @@ fn default_overlay_lap_index(laps: &[Lap]) -> Option<usize> {
         .or_else(|| (!laps.is_empty()).then_some(0))
 }
 
-fn derive_distance_axis_cache(shared: &SharedState) -> Option<DistanceAxisCache> {
-    if let Some(cache) = find_distance_channel(shared) {
-        return Some(cache);
+fn derive_distance_axis_cache(shared: &SharedState) -> (Option<DistanceAxisCache>, bool) {
+    let (distance_cache, waiting_on_distance) = find_distance_channel(shared);
+    if let Some(cache) = distance_cache {
+        return (Some(cache), false);
     }
 
-    let speed_series = find_speed_channel(shared)?;
-    integrate_speed_series(&speed_series.0, speed_series.1, &speed_series.2).map(|data| {
-        DistanceAxisCache {
-            data: Arc::new(data),
-            freq: speed_series.1,
-        }
-    })
+    let (speed_series, waiting_on_speed) = find_speed_channel(shared);
+    let Some(speed_series) = speed_series else {
+        return (None, waiting_on_distance || waiting_on_speed);
+    };
+
+    (
+        integrate_speed_series(&speed_series.0, speed_series.1, &speed_series.2).map(|data| {
+            DistanceAxisCache {
+                data: Arc::from(data),
+                freq: speed_series.1,
+            }
+        }),
+        waiting_on_distance || waiting_on_speed,
+    )
 }
 
 struct OwnedDistanceAxisCache {
@@ -2460,8 +2842,9 @@ fn derive_distance_axis_cache_for_ld(ld: &LdFile) -> Option<OwnedDistanceAxisCac
     })
 }
 
-fn find_distance_channel(shared: &SharedState) -> Option<DistanceAxisCache> {
+fn find_distance_channel(shared: &SharedState) -> (Option<DistanceAxisCache>, bool) {
     let distance_names = ["distance", "lap distance", "distance driven"];
+    let mut waiting_on_sources = false;
 
     for mc in &shared.math_channels {
         if normalized_name(&mc.name).as_str().eq_any(&distance_names)
@@ -2469,27 +2852,41 @@ fn find_distance_channel(shared: &SharedState) -> Option<DistanceAxisCache> {
             && mc.freq > 0
             && is_monotonic_non_decreasing(data)
         {
-            return Some(DistanceAxisCache {
-                data: Arc::clone(data),
-                freq: mc.freq,
-            });
+            return (
+                Some(DistanceAxisCache {
+                    data: Arc::clone(data),
+                    freq: mc.freq,
+                }),
+                false,
+            );
+        } else if normalized_name(&mc.name).as_str().eq_any(&distance_names) && mc.error.is_none() {
+            waiting_on_sources = true;
         }
     }
 
-    let ld = shared.ld_file.as_ref()?;
+    let Some(ld) = shared.ld_file.as_ref() else {
+        return (None, waiting_on_sources);
+    };
     for ch in &ld.channels {
-        if normalized_name(&ch.name).as_str().eq_any(&distance_names)
-            && let Some(data) = ld.read_channel_data(ch)
-            && is_monotonic_non_decreasing(&data)
-        {
-            return Some(DistanceAxisCache {
-                data: Arc::new(data),
-                freq: ch.freq,
-            });
+        if normalized_name(&ch.name).as_str().eq_any(&distance_names) {
+            if let Some(decoded) = shared.decoded_physical_channel_if_ready(ch.index) {
+                if is_monotonic_non_decreasing(&decoded.data) {
+                    return (
+                        Some(DistanceAxisCache {
+                            data: Arc::clone(&decoded.data),
+                            freq: ch.freq,
+                        }),
+                        false,
+                    );
+                }
+            } else {
+                shared.request_physical_channel_decode(ch.index);
+                waiting_on_sources = true;
+            }
         }
     }
 
-    None
+    (None, waiting_on_sources)
 }
 
 fn find_distance_channel_in_ld(ld: &LdFile) -> Option<OwnedDistanceAxisCache> {
@@ -2510,7 +2907,9 @@ fn find_distance_channel_in_ld(ld: &LdFile) -> Option<OwnedDistanceAxisCache> {
     None
 }
 
-fn find_speed_channel(shared: &SharedState) -> Option<(Arc<Vec<f64>>, u16, String)> {
+type SpeedChannelLookup = Option<(Arc<[f64]>, u16, String)>;
+
+fn find_speed_channel(shared: &SharedState) -> (SpeedChannelLookup, bool) {
     let speed_names = [
         "gps speed",
         "vehicle speed",
@@ -2518,26 +2917,36 @@ fn find_speed_channel(shared: &SharedState) -> Option<(Arc<Vec<f64>>, u16, Strin
         "ground speed",
         "speed",
     ];
+    let mut waiting_on_sources = false;
 
     for mc in &shared.math_channels {
         if normalized_name(&mc.name).as_str().eq_any(&speed_names)
             && let Some(data) = &mc.data
             && mc.freq > 0
         {
-            return Some((Arc::clone(data), mc.freq, mc.unit.clone()));
+            return (Some((Arc::clone(data), mc.freq, mc.unit.clone())), false);
+        } else if normalized_name(&mc.name).as_str().eq_any(&speed_names) && mc.error.is_none() {
+            waiting_on_sources = true;
         }
     }
 
-    let ld = shared.ld_file.as_ref()?;
+    let Some(ld) = shared.ld_file.as_ref() else {
+        return (None, waiting_on_sources);
+    };
     for ch in &ld.channels {
-        if normalized_name(&ch.name).as_str().eq_any(&speed_names)
-            && let Some(data) = ld.read_channel_data(ch)
-        {
-            return Some((Arc::new(data), ch.freq, ch.unit.clone()));
+        if normalized_name(&ch.name).as_str().eq_any(&speed_names) {
+            if let Some(decoded) = shared.decoded_physical_channel_if_ready(ch.index) {
+                return (
+                    Some((Arc::clone(&decoded.data), ch.freq, ch.unit.clone())),
+                    false,
+                );
+            }
+            shared.request_physical_channel_decode(ch.index);
+            waiting_on_sources = true;
         }
     }
 
-    None
+    (None, waiting_on_sources)
 }
 
 fn find_speed_channel_in_ld(ld: &LdFile) -> Option<(Vec<f64>, u16, String)> {
@@ -2597,8 +3006,8 @@ fn speed_unit_to_mps(unit: &str) -> Option<f64> {
 }
 
 fn normalized_name(name: &str) -> String {
-    name.to_ascii_lowercase()
-        .replace(['.', '_', '-'], " ")
+    i3rs_core::normalize_channel_name(name)
+        .replace('-', " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -2656,9 +3065,11 @@ impl NormalizedNameExt for str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveGraphXAxis, integrate_speed_series, is_monotonic_non_decreasing, overlay_axis_offset,
-        time_from_monotonic_axis,
+        ActiveGraphXAxis, GraphAxisFingerprint, GraphPanel, GraphRenderFingerprint,
+        LapRenderFingerprint, OverlaySource, display_transform_fingerprint, integrate_speed_series,
+        is_monotonic_non_decreasing, overlay_axis_offset, time_from_monotonic_axis,
     };
+    use crate::state::{ChannelId, PlottedChannel, YAxis};
     use i3rs_core::Lap;
     use std::sync::Arc;
 
@@ -2692,11 +3103,153 @@ mod tests {
             end_time: 8.0,
         };
         let axis = ActiveGraphXAxis::Distance {
-            data: Arc::new(vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]),
+            data: Arc::from(vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]),
             freq: 1,
         };
 
         assert!((overlay_axis_offset(&axis, &lap, 8.0, 1.0) - 10.0).abs() < 1e-6);
         assert!((overlay_axis_offset(&axis, &lap, 8.0, -1.0) + 10.0).abs() < 1e-6);
+    }
+
+    fn sample_channel(data: Arc<[f64]>) -> PlottedChannel {
+        PlottedChannel {
+            channel_id: ChannelId::Physical(0),
+            color: egui::Color32::WHITE,
+            data,
+            tile_group: 0,
+            y_axis: YAxis::Left,
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
+            cached_min: 0.0,
+            cached_max: 1.0,
+            cached_avg: 0.5,
+        }
+    }
+
+    #[test]
+    fn graph_render_fingerprint_invalidates_for_zoom_transform_and_data_replacement() {
+        let channel = sample_channel(Arc::from(vec![0.0, 1.0, 2.0]));
+        let base = GraphRenderFingerprint {
+            data_ptr: channel.data.as_ptr() as usize,
+            data_len: channel.data.len(),
+            x_bounds: (0.0f64.to_bits(), 5.0f64.to_bits()),
+            axis: GraphAxisFingerprint::Time,
+            transform: display_transform_fingerprint(&channel),
+            target_width: 320,
+        };
+
+        let zoom_changed = GraphRenderFingerprint {
+            x_bounds: (1.0f64.to_bits(), 6.0f64.to_bits()),
+            ..base.clone()
+        };
+        assert!(base != zoom_changed);
+
+        let mut transformed_channel = sample_channel(Arc::from(vec![0.0, 1.0, 2.0]));
+        transformed_channel.display_scale = 2.0;
+        let transform_changed = GraphRenderFingerprint {
+            transform: display_transform_fingerprint(&transformed_channel),
+            ..base.clone()
+        };
+        assert!(base != transform_changed);
+
+        let replaced_channel = sample_channel(Arc::from(vec![0.0, 1.0, 2.0]));
+        let replacement_changed = GraphRenderFingerprint {
+            data_ptr: replaced_channel.data.as_ptr() as usize,
+            ..base
+        };
+        assert!(transform_changed != replacement_changed);
+    }
+
+    #[test]
+    fn lap_render_fingerprint_invalidates_for_zoom_and_overlay_offset() {
+        let base = LapRenderFingerprint {
+            data_ptr: 11,
+            data_len: 64,
+            lap_bounds: (1.0f64.to_bits(), 2.0f64.to_bits()),
+            x_bounds: (0.0f64.to_bits(), 10.0f64.to_bits()),
+            axis: GraphAxisFingerprint::Time,
+            origin_axis_bits: 0.0f64.to_bits(),
+            x_scale_bits: 1.0f64.to_bits(),
+            x_offset_bits: 0.0f64.to_bits(),
+            transform: super::DisplayTransformFingerprint {
+                scale_bits: 1.0f64.to_bits(),
+                offset_bits: 0.0f64.to_bits(),
+                unit: None,
+            },
+            target_width: 400,
+        };
+
+        let zoom_changed = LapRenderFingerprint {
+            x_bounds: (2.0f64.to_bits(), 12.0f64.to_bits()),
+            ..base.clone()
+        };
+        let offset_changed = LapRenderFingerprint {
+            x_offset_bits: 5.0f64.to_bits(),
+            ..base.clone()
+        };
+
+        assert!(base != zoom_changed);
+        assert!(base != offset_changed);
+    }
+
+    #[test]
+    fn reset_for_new_session_clears_all_render_caches() {
+        let mut panel = GraphPanel::new(7, "Graph");
+        panel.render_cache.insert(
+            ChannelId::Physical(0),
+            super::GraphRenderCacheEntry {
+                fingerprint: GraphRenderFingerprint {
+                    data_ptr: 1,
+                    data_len: 2,
+                    x_bounds: (0, 1),
+                    axis: GraphAxisFingerprint::Time,
+                    transform: super::DisplayTransformFingerprint {
+                        scale_bits: 1.0f64.to_bits(),
+                        offset_bits: 0.0f64.to_bits(),
+                        unit: None,
+                    },
+                    target_width: 100,
+                },
+                plot_points: Vec::new(),
+            },
+        );
+        panel.lap_render_cache.insert(
+            super::LapRenderCacheKey::Overlay {
+                channel_id: ChannelId::Physical(0),
+                overlay_idx: 0,
+            },
+            super::LapRenderCacheEntry {
+                fingerprint: LapRenderFingerprint {
+                    data_ptr: 1,
+                    data_len: 2,
+                    lap_bounds: (0, 1),
+                    x_bounds: (0, 1),
+                    axis: GraphAxisFingerprint::Time,
+                    origin_axis_bits: 0,
+                    x_scale_bits: 0,
+                    x_offset_bits: 0,
+                    transform: super::DisplayTransformFingerprint {
+                        scale_bits: 1,
+                        offset_bits: 0,
+                        unit: None,
+                    },
+                    target_width: 10,
+                },
+                plot_points: Vec::new(),
+            },
+        );
+        panel.lap_overlays.push(super::LapOverlay {
+            source: OverlaySource::MainSession,
+            lap_idx: 0,
+            manual_offset: 0.0,
+            stretch_to_reference: false,
+        });
+
+        panel.reset_for_new_main_session();
+
+        assert!(panel.render_cache.is_empty());
+        assert!(panel.lap_render_cache.is_empty());
+        assert!(panel.lap_overlays.is_empty());
     }
 }

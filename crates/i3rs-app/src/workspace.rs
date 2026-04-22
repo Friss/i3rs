@@ -13,7 +13,7 @@ use crate::panels::histogram::HistogramPanel;
 use crate::panels::mixture_map::MixtureMapPanel;
 use crate::panels::scatter::ScatterPanel;
 use crate::panels::track_map::TrackMapPanel;
-use crate::panels::utils::apply_channel_preferences;
+use crate::panels::utils::{apply_channel_preferences, create_plotted_channel};
 use crate::state::{
     CHANNEL_COLORS, ChannelId, GraphMode, GraphXAxis, SharedState, compute_channel_stats,
 };
@@ -258,7 +258,7 @@ fn resolve_saved_plotted_channel(
             .iter()
             .position(|mc| mc.name == channel_name)?;
         let data = shared.math_channels.get(idx)?.data.clone()?;
-        let (cached_min, cached_max, cached_avg, _) = compute_channel_stats(&data);
+        let stats = compute_channel_stats(&data);
         let mut plotted = crate::state::PlottedChannel {
             channel_id: ChannelId::Math(idx),
             color,
@@ -268,33 +268,25 @@ fn resolve_saved_plotted_channel(
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
-            cached_min,
-            cached_max,
-            cached_avg,
+            cached_min: stats.min,
+            cached_max: stats.max,
+            cached_avg: stats.avg,
         };
         apply_channel_preferences(&mut plotted, shared);
         Some(plotted)
     } else {
-        let ld = shared.ld_file.as_ref()?;
-        let channel = ld
+        let channel_idx = shared
+            .ld_file
+            .as_ref()?
             .channels
             .iter()
-            .find(|channel| channel.name == channel_name)?;
-        let data = ld.read_channel_data(channel)?;
-        let (cached_min, cached_max, cached_avg, _) = compute_channel_stats(&data);
-        let mut plotted = crate::state::PlottedChannel {
-            channel_id: ChannelId::Physical(channel.index),
-            color,
-            data: std::sync::Arc::new(data),
-            tile_group,
-            y_axis: crate::state::YAxis::Left,
-            display_scale: 1.0,
-            display_offset: 0.0,
-            display_unit: None,
-            cached_min,
-            cached_max,
-            cached_avg,
-        };
+            .find(|channel| channel.name == channel_name)?
+            .index;
+        let mut plotted =
+            create_plotted_channel(ChannelId::Physical(channel_idx), shared, tile_group)?;
+        plotted.color = color;
+        plotted.tile_group = tile_group;
+        plotted.y_axis = crate::state::YAxis::Left;
         apply_channel_preferences(&mut plotted, shared);
         Some(plotted)
     }
@@ -630,8 +622,7 @@ pub fn load_workspace(
                                     shared.math_channels.iter().position(|mc| mc.name == *name)
                                     && let Some(data) = &shared.math_channels[mc_idx].data
                                 {
-                                    let (cached_min, cached_max, cached_avg, _) =
-                                        compute_channel_stats(data);
+                                    let stats = compute_channel_stats(data);
                                     graph.plotted_channels.push(crate::state::PlottedChannel {
                                         channel_id: ChannelId::Math(mc_idx),
                                         color,
@@ -641,30 +632,26 @@ pub fn load_workspace(
                                         display_scale,
                                         display_offset,
                                         display_unit: display_unit.clone(),
-                                        cached_min,
-                                        cached_max,
-                                        cached_avg,
+                                        cached_min: stats.min,
+                                        cached_max: stats.max,
+                                        cached_avg: stats.avg,
                                     });
                                 }
                             } else if let Some(ld) = &shared.ld_file
                                 && let Some(ch) = ld.channels.iter().find(|c| &c.name == name)
-                                && let Some(data) = ld.read_channel_data(ch)
-                            {
-                                let (cached_min, cached_max, cached_avg, _) =
-                                    compute_channel_stats(&data);
-                                graph.plotted_channels.push(crate::state::PlottedChannel {
-                                    channel_id: ChannelId::Physical(ch.index),
-                                    color,
-                                    data: std::sync::Arc::new(data),
+                                && let Some(mut plotted) = create_plotted_channel(
+                                    ChannelId::Physical(ch.index),
+                                    shared,
                                     tile_group,
-                                    y_axis: crate::state::YAxis::Left,
-                                    display_scale,
-                                    display_offset,
-                                    display_unit: display_unit.clone(),
-                                    cached_min,
-                                    cached_max,
-                                    cached_avg,
-                                });
+                                )
+                            {
+                                plotted.color = color;
+                                plotted.tile_group = tile_group;
+                                plotted.y_axis = crate::state::YAxis::Left;
+                                plotted.display_scale = display_scale;
+                                plotted.display_offset = display_offset;
+                                plotted.display_unit = display_unit.clone();
+                                graph.plotted_channels.push(plotted);
                             }
                         }
 
