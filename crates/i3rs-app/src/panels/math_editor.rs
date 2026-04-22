@@ -484,6 +484,21 @@ pub fn evaluate_all_math_channels(shared: &mut SharedState) {
     shared.invalidate_derived_caches();
 }
 
+pub fn reevaluate_math_channels_waiting_on_inputs(shared: &mut SharedState) {
+    let waiting_ids: Vec<u64> = shared
+        .math_channels
+        .iter()
+        .filter(|mc| mc.evaluation_state == MathEvaluationState::WaitingForInputs)
+        .map(|mc| mc.id)
+        .collect();
+
+    for math_id in waiting_ids {
+        if let Some(idx) = shared.math_channel_index_by_id(math_id) {
+            queue_math_channel_evaluation(shared, idx);
+        }
+    }
+}
+
 /// Compute a topological evaluation order for math channels based on their dependencies.
 /// Falls back to original index order for channels involved in cycles.
 pub fn topological_eval_order(shared: &SharedState) -> Vec<usize> {
@@ -718,8 +733,11 @@ struct EvaluationInputs {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_math_evaluation_job, queue_math_channel_evaluation};
-    use crate::state::SharedState;
+    use super::{
+        build_math_evaluation_job, queue_math_channel_evaluation,
+        reevaluate_math_channels_waiting_on_inputs,
+    };
+    use crate::state::{MathEvaluationState, SharedState};
 
     #[test]
     fn math_jobs_follow_channel_ids_after_list_reordering() {
@@ -742,5 +760,35 @@ mod tests {
             .expect("remaining math channel should still be addressable by id");
         assert_eq!(job.math_id, second_id);
         assert_eq!(shared.math_channels[0].name, "B");
+    }
+
+    #[test]
+    fn reevaluate_only_requeues_math_channels_waiting_on_inputs() {
+        let mut shared = SharedState::new();
+        let waiting =
+            shared.create_math_channel_def("Waiting".into(), "A".into(), String::new(), 2);
+        let waiting_id = waiting.id;
+        let mut ready =
+            shared.create_math_channel_def("Ready".into(), "1".into(), String::new(), 2);
+        ready.evaluation_state = MathEvaluationState::Ready;
+        shared.math_channels.push(waiting);
+        shared.math_channels.push(ready);
+        shared.math_channels[0].evaluation_state = MathEvaluationState::WaitingForInputs;
+        shared.math_channels[0].error = Some("Waiting for source channels...".into());
+
+        reevaluate_math_channels_waiting_on_inputs(&mut shared);
+
+        assert_eq!(
+            shared.take_requested_math_channel_evaluations(),
+            vec![waiting_id]
+        );
+        assert_eq!(
+            shared.math_channels[0].evaluation_state,
+            MathEvaluationState::Queued
+        );
+        assert_eq!(
+            shared.math_channels[1].evaluation_state,
+            MathEvaluationState::Ready
+        );
     }
 }

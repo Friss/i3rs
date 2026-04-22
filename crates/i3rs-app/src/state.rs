@@ -768,3 +768,21 @@ impl SharedState {
             .remove(&channel_idx);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SharedState;
+
+    #[test]
+    fn canceled_channel_decode_can_be_requested_again() {
+        let shared = SharedState::new();
+
+        shared.request_physical_channel_decode(7);
+        assert_eq!(shared.take_requested_physical_channel_decodes(), vec![7]);
+
+        shared.cancel_physical_channel_decode(7);
+        shared.request_physical_channel_decode(7);
+
+        assert_eq!(shared.take_requested_physical_channel_decodes(), vec![7]);
+    }
+}

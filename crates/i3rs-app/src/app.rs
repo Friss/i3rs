@@ -496,7 +496,9 @@ impl App {
                     }
                 }
                 JobResult::DecodePhysicalChannel {
-                    session_id, result, ..
+                    session_id,
+                    channel_idx,
+                    result,
                 } => {
                     if self.shared.session_id != session_id {
                         continue;
@@ -511,11 +513,14 @@ impl App {
                                 decoded.freq,
                             );
                             if !self.shared.math_channels.is_empty() {
-                                math_editor::evaluate_all_math_channels(&mut self.shared);
+                                math_editor::reevaluate_math_channels_waiting_on_inputs(
+                                    &mut self.shared,
+                                );
                             }
                             self.maybe_apply_pending_workspace_restore();
                         }
                         Err(err) => {
+                            self.shared.cancel_physical_channel_decode(channel_idx);
                             self.load_error = Some(format!("Failed to decode channel: {err}"));
                         }
                     }
@@ -547,7 +552,9 @@ impl App {
                     ) {
                         self.shared.invalidate_derived_caches();
                         if !self.shared.math_channels.is_empty() {
-                            math_editor::evaluate_all_math_channels(&mut self.shared);
+                            math_editor::reevaluate_math_channels_waiting_on_inputs(
+                                &mut self.shared,
+                            );
                         }
                     }
                     self.maybe_apply_pending_workspace_restore();

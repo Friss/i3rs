@@ -82,6 +82,7 @@ pub enum JobResult {
     },
     DecodePhysicalChannel {
         session_id: u64,
+        channel_idx: usize,
         result: Result<DecodedPhysicalChannel, String>,
     },
     BuildTrackData {
@@ -393,7 +394,11 @@ async fn run_wasm_job(request: JobRequest) -> JobResult {
             yield_to_browser().await;
             let result = perform_decode_physical_channel(ld, channel_idx);
             yield_to_browser().await;
-            JobResult::DecodePhysicalChannel { session_id, result }
+            JobResult::DecodePhysicalChannel {
+                session_id,
+                channel_idx,
+                result,
+            }
         }
         JobRequest::BuildTrackData {
             request_id: _,
@@ -472,6 +477,7 @@ impl BackgroundJobs {
                         channel_idx,
                     } => JobResult::DecodePhysicalChannel {
                         session_id,
+                        channel_idx,
                         result: perform_decode_physical_channel(ld, channel_idx),
                     },
                     JobRequest::BuildTrackData {
