@@ -1618,7 +1618,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "i3rs-app"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "eframe",
@@ -1640,14 +1640,14 @@ dependencies = [
 
 [[package]]
 name = "i3rs-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "i3rs-core",
 ]
 
 [[package]]
 name = "i3rs-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "half",
