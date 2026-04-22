@@ -736,15 +736,14 @@ impl CachedSectorMarkers {
         let markers = sectors
             .iter()
             .enumerate()
-            .filter_map(|(idx, sector)| {
-                (sector.start_index < track.x.len()).then(|| CachedSectorMarker {
-                    name: format!("{} start", sector.name),
-                    color: CHANNEL_COLORS[idx % CHANNEL_COLORS.len()],
-                    points: [PlotPoint::new(
-                        track.x[sector.start_index],
-                        track.y[sector.start_index],
-                    )],
-                })
+            .filter(|(_, sector)| sector.start_index < track.x.len())
+            .map(|(idx, sector)| CachedSectorMarker {
+                name: format!("{} start", sector.name),
+                color: CHANNEL_COLORS[idx % CHANNEL_COLORS.len()],
+                points: [PlotPoint::new(
+                    track.x[sector.start_index],
+                    track.y[sector.start_index],
+                )],
             })
             .collect();
 
@@ -752,6 +751,16 @@ impl CachedSectorMarkers {
             fingerprint,
             markers,
         }
+    }
+}
+
+fn delta_color(delta: f64) -> egui::Color32 {
+    if delta < -0.01 {
+        egui::Color32::from_rgb(100, 255, 100) // green = faster
+    } else if delta > 0.01 {
+        egui::Color32::from_rgb(255, 100, 100) // red = slower
+    } else {
+        egui::Color32::from_gray(200)
     }
 }
 
@@ -826,15 +835,5 @@ mod tests {
 
         assert!(panel.track_line_cache.is_none());
         assert!(panel.cursor_marker_cache.is_some());
-    }
-}
-
-fn delta_color(delta: f64) -> egui::Color32 {
-    if delta < -0.01 {
-        egui::Color32::from_rgb(100, 255, 100) // green = faster
-    } else if delta > 0.01 {
-        egui::Color32::from_rgb(255, 100, 100) // red = slower
-    } else {
-        egui::Color32::from_gray(200)
     }
 }

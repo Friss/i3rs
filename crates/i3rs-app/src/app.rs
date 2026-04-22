@@ -486,7 +486,7 @@ impl App {
                         continue;
                     }
 
-                    match result {
+                    match *result {
                         Ok(loaded) => {
                             self.install_loaded_session(loaded, pending.workspace_snapshot);
                         }

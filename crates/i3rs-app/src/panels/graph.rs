@@ -897,7 +897,7 @@ impl GraphPanel {
             Self::draw_channels(plot_ui, &plotted, &freq_map, x_axis, shared, render_cache);
 
             if show_markers {
-                Self::draw_lap_markers(plot_ui, &laps, x_axis);
+                Self::draw_lap_markers(plot_ui, laps, x_axis);
             }
 
             if let Some(t) = cursor_time {
@@ -1037,7 +1037,7 @@ impl GraphPanel {
                         );
 
                         if show_markers {
-                            Self::draw_lap_markers(plot_ui, &laps, x_axis);
+                            Self::draw_lap_markers(plot_ui, laps, x_axis);
                         }
 
                         if let Some(t) = cursor_time {
@@ -2907,7 +2907,9 @@ fn find_distance_channel_in_ld(ld: &LdFile) -> Option<OwnedDistanceAxisCache> {
     None
 }
 
-fn find_speed_channel(shared: &SharedState) -> (Option<(Arc<[f64]>, u16, String)>, bool) {
+type SpeedChannelLookup = Option<(Arc<[f64]>, u16, String)>;
+
+fn find_speed_channel(shared: &SharedState) -> (SpeedChannelLookup, bool) {
     let speed_names = [
         "gps speed",
         "vehicle speed",

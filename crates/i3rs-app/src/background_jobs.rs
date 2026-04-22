@@ -78,7 +78,7 @@ pub struct EvaluatedMathChannel {
 pub enum JobResult {
     LoadSession {
         request_id: u64,
-        result: Result<LoadedSession, String>,
+        result: Box<Result<LoadedSession, String>>,
     },
     DecodePhysicalChannel {
         session_id: u64,
@@ -381,7 +381,7 @@ async fn run_wasm_job(request: JobRequest) -> JobResult {
     match request {
         JobRequest::LoadSession { request_id, source } => {
             yield_to_browser().await;
-            let result = perform_load_session(source);
+            let result = Box::new(perform_load_session(source));
             yield_to_browser().await;
             JobResult::LoadSession { request_id, result }
         }
@@ -468,7 +468,7 @@ impl BackgroundJobs {
                 let result = match request {
                     JobRequest::LoadSession { request_id, source } => JobResult::LoadSession {
                         request_id,
-                        result: perform_load_session(source),
+                        result: Box::new(perform_load_session(source)),
                     },
                     JobRequest::DecodePhysicalChannel {
                         request_id: _,
