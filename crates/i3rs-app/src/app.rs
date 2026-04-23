@@ -228,7 +228,9 @@ impl App {
                         .as_ref()
                         .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
                 });
-                let worksheet_idx = tm.home_worksheet.min(workspace.worksheets.len().saturating_sub(1));
+                let worksheet_idx = tm
+                    .home_worksheet
+                    .min(workspace.worksheets.len().saturating_sub(1));
                 if let Some(ws) = workspace.worksheets.get_mut(worksheet_idx) {
                     ws.panels.push(crate::workspace::PanelConfig::TrackMap(
                         crate::workspace::TrackMapPanelConfig {
@@ -1391,6 +1393,7 @@ impl App {
         self.shared.next_panel_id += 1;
         let mut track_map = TrackMapPanel::new(id, format!("Track Map {}", id));
         track_map.home_worksheet = self.active_worksheet;
+        track_map.pop_out_requested = true;
         self.worksheets[self.active_worksheet]
             .dock_state
             .push_to_focused_leaf(PanelTab::TrackMap(track_map));
@@ -2118,7 +2121,9 @@ impl eframe::App for App {
             for mut tm in to_dock {
                 tm.dock_requested = false;
                 tm.is_popped_out = false;
-                let worksheet_idx = tm.home_worksheet.min(self.worksheets.len().saturating_sub(1));
+                let worksheet_idx = tm
+                    .home_worksheet
+                    .min(self.worksheets.len().saturating_sub(1));
                 self.worksheets[worksheet_idx]
                     .dock_state
                     .push_to_focused_leaf(PanelTab::TrackMap(tm));

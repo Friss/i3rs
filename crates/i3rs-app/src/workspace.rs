@@ -615,7 +615,8 @@ pub fn load_workspace(
     workspace
         .worksheets
         .iter()
-        .map(|ws_config| {
+        .enumerate()
+        .map(|(worksheet_idx, ws_config)| {
             let tabs: Vec<PanelTab> = ws_config
                 .panels
                 .iter()
@@ -741,6 +742,7 @@ pub fn load_workspace(
                     }
                     PanelConfig::TrackMap(tc) => {
                         let mut track_map = TrackMapPanel::new(tc.id, &tc.title);
+                        track_map.home_worksheet = worksheet_idx;
                         // Resolve color channel by name
                         if let Some(ref color_name) = tc.color_channel_name
                             && let Some(ld) = &shared.ld_file

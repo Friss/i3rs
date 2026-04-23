@@ -2572,7 +2572,10 @@ impl GraphPanel {
                 self.manage_channels_selection = None;
             }
             Some(ManageChannelsSelection::Group(group))
-                if !self.plotted_channels.iter().any(|pc| pc.tile_group == group) =>
+                if !self
+                    .plotted_channels
+                    .iter()
+                    .any(|pc| pc.tile_group == group) =>
             {
                 self.manage_channels_selection = None;
             }
@@ -2968,6 +2971,7 @@ impl GraphPanel {
         };
 
         let mut open = self.show_add_channel_picker;
+        let mut close_picker = false;
         let title = match target {
             AddChannelPickerTarget::ExistingGroup(group) => {
                 let visual_idx = self
@@ -3022,11 +3026,12 @@ impl GraphPanel {
                                             );
                                         }
                                         AddChannelPickerTarget::NewGraph => {
-                                            pending_actions
-                                                .push(ManageChannelsAction::AddToNewGraph(channel_id));
+                                            pending_actions.push(
+                                                ManageChannelsAction::AddToNewGraph(channel_id),
+                                            );
                                         }
                                     }
-                                    self.show_add_channel_picker = false;
+                                    close_picker = true;
                                 }
                                 if already_plotted {
                                     ui.weak("Already plotted");
@@ -3050,25 +3055,26 @@ impl GraphPanel {
                     {
                         match target {
                             AddChannelPickerTarget::ExistingGroup(group) => {
-                                pending_actions.push(ManageChannelsAction::AddToGroup {
-                                    channel_id,
-                                    group,
-                                });
+                                pending_actions
+                                    .push(ManageChannelsAction::AddToGroup { channel_id, group });
                             }
                             AddChannelPickerTarget::NewGraph => {
                                 pending_actions
                                     .push(ManageChannelsAction::AddToNewGraph(channel_id));
                             }
                         }
-                        self.show_add_channel_picker = false;
+                        close_picker = true;
                     }
 
                     if ui.button("Cancel").clicked() {
-                        self.show_add_channel_picker = false;
+                        close_picker = true;
                     }
                 });
             });
 
+        if close_picker {
+            open = false;
+        }
         self.show_add_channel_picker = open;
         if !self.show_add_channel_picker {
             self.add_channel_target = None;

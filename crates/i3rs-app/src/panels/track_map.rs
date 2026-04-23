@@ -115,7 +115,7 @@ impl TrackMapPanel {
             sector_marker_cache: None,
             color_filter: String::new(),
             is_popped_out: false,
-            pop_out_requested: true,
+            pop_out_requested: false,
             dock_requested: false,
             home_worksheet: 0,
         }
