@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use crate::state::{ChannelStats, DownsampleSeriesKey, compute_channel_stats};
 use i3rs_core::{
-    ChannelData, DownsampledPoint, Lap, LdFile, LdxFile, TrackData, detect_laps, downsample_minmax,
-    evaluate_expression_with_aliases, extract_gps_track, find_ldx_for_ld,
+    ChannelData, DownsampledPoint, Lap, LdFile, LdxFile, TrackData, detect_laps,
+    evaluate_expression_with_aliases, find_ldx_for_ld,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use i3rs_core::{downsample_minmax, extract_gps_track};
 
 pub struct LoadedSession {
     pub file_name: String,
@@ -180,6 +182,7 @@ fn perform_decode_physical_channel(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn perform_build_track_data(ld: Arc<LdFile>) -> Option<TrackData> {
     let _perf = crate::perf_metrics::scope("track-map draw");
     extract_gps_track(&ld)
@@ -201,6 +204,7 @@ fn perform_evaluate_math_channel(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn perform_build_downsampled_series(
     data: Arc<[f64]>,
     freq: u16,
