@@ -127,6 +127,7 @@ jobs:
             local crate_name="$1"
             local response
             response=$(curl -fsSL "https://crates.io/api/v1/crates/${crate_name}")
+            echo "$response"
 
             if CRATE_NAME="$crate_name" VERSION="$VERSION" RESPONSE="$response" python3 -c "import json, os, sys; crate_name = os.environ['CRATE_NAME']; version = os.environ['VERSION']; response = json.loads(os.environ['RESPONSE']); published_versions = {entry['num'] for entry in response.get('versions', [])}; already_published = version in published_versions; print(f'{crate_name} {version} already exists on crates.io' if already_published else f'{crate_name} {version} is not published yet'); sys.exit(0 if already_published else 1)"
             then
