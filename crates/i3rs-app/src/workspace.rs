@@ -80,15 +80,23 @@ pub struct GraphPanelConfig {
     pub overlays: Vec<GraphOverlayConfig>,
     #[serde(default)]
     pub embedded_gauges: Vec<GraphGaugeConfig>,
+    #[serde(default = "default_graph_embedded_gauge_height")]
+    pub embedded_gauge_height: f32,
     /// Whether each channel is a math channel (true) or physical (false).
     #[serde(default)]
     pub is_math: Vec<bool>,
     #[serde(default)]
     pub display_transforms: Vec<GraphDisplayTransformConfig>,
+    #[serde(default)]
+    pub tile_heights: Vec<f32>,
 }
 
 fn default_graph_x_axis_mode() -> String {
     "Time".into()
+}
+
+fn default_graph_embedded_gauge_height() -> f32 {
+    176.0
 }
 
 fn gauge_style_to_string(style: GaugeStyle) -> &'static str {
@@ -166,6 +174,8 @@ pub struct HistogramPanelConfig {
     pub channel_names: Vec<String>,
     #[serde(default)]
     pub is_math: Vec<bool>,
+    #[serde(default)]
+    pub colors: Vec<[u8; 3]>,
 }
 
 fn default_histogram_y_headroom_pct() -> f64 {
@@ -184,6 +194,10 @@ pub struct ScatterPanelConfig {
     pub x_is_math: bool,
     #[serde(default)]
     pub y_is_math: bool,
+    #[serde(default)]
+    pub x_color: Option<[u8; 3]>,
+    #[serde(default)]
+    pub y_color: Option<[u8; 3]>,
     #[serde(default = "default_scatter_point_size")]
     pub point_size: f32,
     #[serde(default)]
@@ -400,8 +414,10 @@ pub fn save_workspace(
                             reference_lap: g.reference_lap,
                             overlays,
                             embedded_gauges,
+                            embedded_gauge_height: g.embedded_gauge_height,
                             is_math,
                             display_transforms,
+                            tile_heights: g.tile_heights.clone(),
                         })
                     }
                     PanelTab::TrackMap(t) => {
@@ -449,6 +465,14 @@ pub fn save_workspace(
                                     .map(|(_, is_math)| is_math)
                             })
                             .collect(),
+                        colors: h
+                            .channels
+                            .iter()
+                            .map(|pc| {
+                                let c = pc.color;
+                                [c.r(), c.g(), c.b()]
+                            })
+                            .collect(),
                     }),
                     PanelTab::Scatter(s) => PanelConfig::Scatter(ScatterPanelConfig {
                         id: s.id,
@@ -475,6 +499,14 @@ pub fn save_workspace(
                                     .map(|(_, is_math)| is_math)
                             })
                             .unwrap_or(false),
+                        x_color: s.x_channel.as_ref().map(|pc| {
+                            let c = pc.color;
+                            [c.r(), c.g(), c.b()]
+                        }),
+                        y_color: s.y_channel.as_ref().map(|pc| {
+                            let c = pc.color;
+                            [c.r(), c.g(), c.b()]
+                        }),
                         point_size: s.point_size,
                         bounds_padding_frac: s.bounds_padding_frac,
                         lock_bounds: s.lock_bounds,
@@ -583,7 +615,8 @@ pub fn load_workspace(
     workspace
         .worksheets
         .iter()
-        .map(|ws_config| {
+        .enumerate()
+        .map(|(worksheet_idx, ws_config)| {
             let tabs: Vec<PanelTab> = ws_config
                 .panels
                 .iter()
@@ -599,6 +632,8 @@ pub fn load_workspace(
                             _ => GraphXAxis::Time,
                         };
                         graph.reference_lap = gc.reference_lap;
+                        graph.embedded_gauge_height = gc.embedded_gauge_height;
+                        graph.tile_heights = gc.tile_heights.clone();
 
                         // Resolve channels by name
                         for (i, name) in gc.channel_names.iter().enumerate() {
@@ -707,6 +742,7 @@ pub fn load_workspace(
                     }
                     PanelConfig::TrackMap(tc) => {
                         let mut track_map = TrackMapPanel::new(tc.id, &tc.title);
+                        track_map.home_worksheet = worksheet_idx;
                         // Resolve color channel by name
                         if let Some(ref color_name) = tc.color_channel_name
                             && let Some(ld) = &shared.ld_file
@@ -745,7 +781,10 @@ pub fn load_workspace(
                                 shared,
                                 channel_name,
                                 is_math,
-                                CHANNEL_COLORS[i % CHANNEL_COLORS.len()],
+                                hc.colors
+                                    .get(i)
+                                    .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                    .unwrap_or(CHANNEL_COLORS[i % CHANNEL_COLORS.len()]),
                                 i,
                             ) {
                                 histogram.channels.push(pc);
@@ -766,7 +805,9 @@ pub fn load_workspace(
                                 shared,
                                 channel_name,
                                 sc.x_is_math,
-                                CHANNEL_COLORS[0],
+                                sc.x_color
+                                    .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                    .unwrap_or(CHANNEL_COLORS[0]),
                                 0,
                             );
                         }
@@ -775,7 +816,9 @@ pub fn load_workspace(
                                 shared,
                                 channel_name,
                                 sc.y_is_math,
-                                CHANNEL_COLORS[4],
+                                sc.y_color
+                                    .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2]))
+                                    .unwrap_or(CHANNEL_COLORS[4]),
                                 1,
                             );
                         }

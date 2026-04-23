@@ -37,6 +37,8 @@ pub struct TrackMapPanel {
     pub pop_out_requested: bool,
     /// Set by the "Dock" button or window close; consumed by App to move panel back to dock.
     pub dock_requested: bool,
+    /// Worksheet index this track map belongs to when docked.
+    pub home_worksheet: usize,
 }
 
 struct CachedSectorReport {
@@ -115,6 +117,7 @@ impl TrackMapPanel {
             is_popped_out: false,
             pop_out_requested: false,
             dock_requested: false,
+            home_worksheet: 0,
         }
     }
 

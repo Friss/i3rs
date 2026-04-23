@@ -13,11 +13,11 @@ use i3rs_core::{
 use crate::state::{
     CHANNEL_COLORS, ChannelId, ChannelPreference, DistanceAxisCache, DownsampleSeriesKey,
     DownsampleSeriesRequest, GraphMode, GraphXAxis, PlottedChannel, SharedState, YAxis,
-    channel_preference_key,
+    channel_preference_key, compute_channel_stats,
 };
 
 use super::gauge::{
-    GaugeChannel, GaugeDrawContext, GaugeStyle, default_style_for_name, draw_gauge,
+    GaugeChannel, GaugeDrawContext, GaugeStyle, best_gauge_grid, default_style_for_name, draw_gauge,
 };
 use super::utils::{
     ChannelDisplayMeta, DisplayTransformFingerprint, build_plotted_channel_info,
@@ -217,6 +217,48 @@ struct LapRenderCacheEntry {
     plot_points: Vec<egui_plot::PlotPoint>,
 }
 
+struct DisplayStats {
+    min: f64,
+    max: f64,
+    avg: f64,
+}
+
+#[derive(Clone, Copy)]
+struct ManageChannelDragPayload {
+    channel_id: ChannelId,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManageChannelsSelection {
+    Group(usize),
+    Channel(ChannelId),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddChannelPickerTarget {
+    ExistingGroup(usize),
+    NewGraph,
+}
+
+enum ManageChannelsAction {
+    Context(ContextAction),
+    MoveBefore {
+        dragged: ChannelId,
+        target: ChannelId,
+    },
+    MoveToGroupEnd {
+        dragged: ChannelId,
+        group: usize,
+    },
+    MoveToNewGraph(ChannelId),
+    AddToGroup {
+        channel_id: ChannelId,
+        group: usize,
+    },
+    AddToNewGraph(ChannelId),
+    Remove(ChannelId),
+}
+
 /// A single graph panel with its own set of plotted channels.
 pub struct GraphPanel {
     pub id: u64,
@@ -229,6 +271,14 @@ pub struct GraphPanel {
     pub reference_lap: Option<usize>,
     pub lap_overlays: Vec<LapOverlay>,
     pub overlay_sessions: Vec<OverlaySession>,
+    pub embedded_gauge_height: f32,
+    pub tile_heights: Vec<f32>,
+    show_manage_channels_window: bool,
+    manage_channels_selection: Option<ManageChannelsSelection>,
+    show_add_channel_picker: bool,
+    add_channel_target: Option<AddChannelPickerTarget>,
+    add_channel_filter: String,
+    add_channel_selection: Option<ChannelId>,
     /// Set when the first channel is added; consumed on next render to reset zoom.
     needs_zoom_reset: bool,
     render_cache: HashMap<ChannelId, GraphRenderCacheEntry>,
@@ -268,6 +318,14 @@ impl GraphPanel {
             reference_lap: None,
             lap_overlays: Vec::new(),
             overlay_sessions: Vec::new(),
+            embedded_gauge_height: 176.0,
+            tile_heights: Vec::new(),
+            show_manage_channels_window: false,
+            manage_channels_selection: None,
+            show_add_channel_picker: false,
+            add_channel_target: None,
+            add_channel_filter: String::new(),
+            add_channel_selection: None,
             needs_zoom_reset: false,
             render_cache: HashMap::new(),
             lap_render_cache: HashMap::new(),
@@ -280,12 +338,28 @@ impl GraphPanel {
         self.reference_lap = None;
         self.lap_overlays.clear();
         self.overlay_sessions.clear();
+        self.tile_heights.clear();
+        self.show_manage_channels_window = false;
+        self.manage_channels_selection = None;
+        self.show_add_channel_picker = false;
+        self.add_channel_target = None;
+        self.add_channel_filter.clear();
+        self.add_channel_selection = None;
         self.needs_zoom_reset = false;
         self.render_cache.clear();
         self.lap_render_cache.clear();
     }
 
     pub fn add_channel(&mut self, channel_id: ChannelId, shared: &SharedState) {
+        self.add_channel_to_group(channel_id, self.next_tile_group(), shared);
+    }
+
+    pub fn add_channel_to_group(
+        &mut self,
+        channel_id: ChannelId,
+        tile_group: usize,
+        shared: &SharedState,
+    ) {
         if self.is_channel_plotted(channel_id) {
             return;
         }
@@ -294,7 +368,7 @@ impl GraphPanel {
             if Self::preferred_color_for_channel(channel_id, shared).is_none() {
                 pc.color = self.colors[color_idx];
             }
-            pc.tile_group = self.next_tile_group();
+            pc.tile_group = tile_group;
             self.plotted_channels.push(pc);
         }
     }
@@ -407,19 +481,6 @@ impl GraphPanel {
             }
         }
 
-        // Handle drop from channel browser
-        if shared.dragging_channel.is_some()
-            && ui.input(|i| i.pointer.any_released())
-            && ui.ui_contains_pointer()
-            && let Some(ch_id) = shared.dragging_channel.take()
-        {
-            let was_empty = self.plotted_channels.is_empty();
-            self.add_channel(ch_id, shared);
-            if was_empty && !self.plotted_channels.is_empty() {
-                self.needs_zoom_reset = true;
-            }
-        }
-
         for channel in &mut self.plotted_channels {
             refresh_plotted_channel(channel, shared);
         }
@@ -428,9 +489,18 @@ impl GraphPanel {
         }
 
         if self.plotted_channels.is_empty() {
+            if shared.dragging_channel.is_some()
+                && ui.input(|i| i.pointer.any_released())
+                && ui.ui_contains_pointer()
+                && let Some(ch_id) = shared.dragging_channel.take()
+            {
+                self.add_channel(ch_id, shared);
+                self.needs_zoom_reset = true;
+            }
             ui.centered_and_justified(|ui| {
                 ui.label("Click channels in the browser to plot them, or drag and drop");
             });
+            self.show_manage_channels_window(ui.ctx(), shared);
             return;
         }
 
@@ -438,7 +508,26 @@ impl GraphPanel {
         self.show_toolbar(ui, shared);
         if !self.embedded_gauges.is_empty() {
             ui.add_space(4.0);
-            self.show_embedded_gauges(ui, shared);
+            let available_height = ui.available_height();
+            let max_gauge_height = (available_height - 96.0).max(120.0);
+            self.embedded_gauge_height = self.embedded_gauge_height.clamp(120.0, max_gauge_height);
+            let gauge_height = self.embedded_gauge_height;
+            let (gauge_rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), gauge_height),
+                egui::Sense::hover(),
+            );
+            let mut gauge_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(gauge_rect)
+                    .layout(*ui.layout()),
+            );
+            gauge_ui.set_clip_rect(gauge_rect);
+            self.show_embedded_gauges(&mut gauge_ui, shared);
+            let gauge_resize_delta = self.show_resize_handle(ui).y;
+            if gauge_resize_delta.abs() > 0.0 {
+                self.embedded_gauge_height = (self.embedded_gauge_height + gauge_resize_delta)
+                    .clamp(120.0, max_gauge_height);
+            }
             ui.separator();
         }
 
@@ -471,13 +560,16 @@ impl GraphPanel {
                     self.show_lap_overlay_tiled_graphs(ui, shared, needs_zoom_reset, &x_axis)
                 }
             }
-            return;
+        } else {
+            match self.graph_mode {
+                GraphMode::Overlay => {
+                    self.show_overlay_graph(ui, shared, needs_zoom_reset, &x_axis)
+                }
+                GraphMode::Tiled => self.show_tiled_graphs(ui, shared, needs_zoom_reset, &x_axis),
+            }
         }
 
-        match self.graph_mode {
-            GraphMode::Overlay => self.show_overlay_graph(ui, shared, needs_zoom_reset, &x_axis),
-            GraphMode::Tiled => self.show_tiled_graphs(ui, shared, needs_zoom_reset, &x_axis),
-        }
+        self.show_manage_channels_window(ui.ctx(), shared);
     }
 
     fn retain_valid_overlay_state(&mut self, shared: &SharedState) {
@@ -723,13 +815,20 @@ impl GraphPanel {
     }
 
     fn show_embedded_gauges(&mut self, ui: &mut egui::Ui, shared: &SharedState) {
-        let available_width = ui.available_width().max(1.0);
-        let gauge_size = 160.0_f32.min(available_width);
-        let cols = (available_width / gauge_size).floor().max(1.0) as usize;
+        let spacing = 8.0_f32;
+        let clip_rect = ui.clip_rect();
+        let available_width = ui.available_width().min(clip_rect.width()).max(1.0);
+        let available_height = (clip_rect.bottom() - ui.cursor().top()).max(1.0);
+        let (cols, gauge_size) = best_gauge_grid(
+            self.embedded_gauges.len(),
+            available_width,
+            available_height,
+            spacing,
+        );
 
         egui::Grid::new(format!("graph_embedded_gauges_{}", self.id))
             .num_columns(cols)
-            .spacing([8.0, 8.0])
+            .spacing([spacing, spacing])
             .show(ui, |ui| {
                 for (idx, gauge) in self.embedded_gauges.iter_mut().enumerate() {
                     let (name, unit, freq, dec_places, enum_labels) =
@@ -915,24 +1014,41 @@ impl GraphPanel {
             shared.cursor_time = Some(t);
         }
 
+        let bounds = response.transform.bounds();
+        let visible_time_range = Self::time_range_from_plot_bounds(
+            x_axis,
+            bounds.min()[0],
+            bounds.max()[0],
+            data_duration,
+        );
+
         Self::draw_legend(
             ui,
             response.response.rect,
             &plotted,
             &channel_meta,
             shared.cursor_time,
+            Some(visible_time_range),
         );
 
         if needs_zoom_reset {
             shared.zoom_range = Some((0.0, data_duration));
         } else if !zoom_from_timeline {
-            let bounds = response.transform.bounds();
             shared.zoom_range = Some(Self::time_range_from_plot_bounds(
                 x_axis,
                 bounds.min()[0],
                 bounds.max()[0],
                 data_duration,
             ));
+        }
+
+        if shared.dragging_channel.is_some()
+            && ui.input(|i| i.pointer.any_released())
+            && response.response.contains_pointer()
+            && let Some(ch_id) = shared.dragging_channel.take()
+        {
+            self.add_channel_to_group(ch_id, 0, shared);
+            self.needs_zoom_reset = true;
         }
 
         self.handle_context_menu(&response.response, shared);
@@ -967,7 +1083,7 @@ impl GraphPanel {
         let freq_map = build_freq_map(&all_plotted, shared);
 
         let available_height = ui.available_height();
-        let tile_height = (available_height / n as f32).max(80.0);
+        self.ensure_tile_heights(n, available_height);
 
         let mut any_hovered_cursor: Option<f64> = None;
         let mut hovered_x_bounds: Option<(f64, f64)> = None;
@@ -980,6 +1096,7 @@ impl GraphPanel {
             .show(ui, |ui| {
                 for (tile_idx, group) in tile_groups.iter().enumerate() {
                     let plot_id = format!("tile_{}_{}", self.id, tile_idx);
+                    let tile_height = self.tile_heights[tile_idx].max(80.0);
 
                     let mut plot = Plot::new(plot_id)
                         .height(tile_height)
@@ -1070,14 +1187,54 @@ impl GraphPanel {
                         &channel_meta,
                         group,
                         cursor_time,
+                        Some(Self::time_range_from_plot_bounds(
+                            x_axis,
+                            x_pair.0,
+                            x_pair.1,
+                            data_duration,
+                        )),
                     );
 
                     responses.push((group.clone(), resp.response));
+
+                    if tile_idx + 1 < n {
+                        let delta = self.show_resize_handle(ui).y;
+                        if delta.abs() > 0.0 {
+                            Self::apply_adjacent_tile_resize(
+                                &mut self.tile_heights,
+                                tile_idx,
+                                delta,
+                            );
+                        }
+                    }
                 }
             });
 
         for (group, resp) in &responses {
             self.handle_tile_group_context_menu(resp, group, &channel_meta, shared);
+        }
+
+        if shared.dragging_channel.is_some()
+            && ui.input(|i| i.pointer.any_released())
+            && ui.ui_contains_pointer()
+        {
+            let target_group = responses
+                .iter()
+                .find(|(_, resp)| resp.contains_pointer())
+                .and_then(|(group, _)| group.first())
+                .and_then(|&idx| self.plotted_channels.get(idx))
+                .map(|channel| channel.tile_group);
+            if let Some(ch_id) = shared.dragging_channel.take() {
+                self.add_channel_to_group(
+                    ch_id,
+                    target_group.unwrap_or_else(|| self.next_tile_group()),
+                    shared,
+                );
+                if target_group.is_none() {
+                    self.tile_heights.clear();
+                }
+                self.needs_zoom_reset = true;
+            }
         }
 
         if let Some(t) = any_hovered_cursor {
@@ -1245,6 +1402,10 @@ impl GraphPanel {
             shared.cursor_time = Some(cursor_time);
         }
 
+        let bounds = response.transform.bounds();
+        let visible_time_range =
+            viewport.time_range_from_plot_bounds(bounds.min()[0], bounds.max()[0]);
+
         Self::draw_overlay_summary(
             ui,
             response.response.rect,
@@ -1258,6 +1419,7 @@ impl GraphPanel {
             &plotted,
             &channel_meta,
             shared.cursor_time,
+            Some(visible_time_range),
         );
 
         if needs_zoom_reset {
@@ -1269,6 +1431,15 @@ impl GraphPanel {
             let bounds = response.transform.bounds();
             shared.zoom_range =
                 Some(viewport.time_range_from_plot_bounds(bounds.min()[0], bounds.max()[0]));
+        }
+
+        if shared.dragging_channel.is_some()
+            && ui.input(|i| i.pointer.any_released())
+            && response.response.contains_pointer()
+            && let Some(ch_id) = shared.dragging_channel.take()
+        {
+            self.add_channel_to_group(ch_id, 0, shared);
+            self.needs_zoom_reset = true;
         }
 
         self.handle_context_menu(&response.response, shared);
@@ -1305,7 +1476,7 @@ impl GraphPanel {
         let all_plotted: Vec<&PlottedChannel> = self.plotted_channels.iter().collect();
         let freq_map = build_freq_map(&all_plotted, shared);
         let available_height = ui.available_height();
-        let tile_height = (available_height / tile_groups.len().max(1) as f32).max(80.0);
+        self.ensure_tile_heights(tile_groups.len().max(1), available_height);
         let cursor_time = shared.cursor_time;
         let zoom_from_timeline = shared.zoom_from_timeline;
         let zoom_range = shared.zoom_range;
@@ -1324,6 +1495,7 @@ impl GraphPanel {
             .show(ui, |ui| {
                 let mut responses = Vec::new();
                 for (tile_idx, group) in tile_groups.iter().enumerate() {
+                    let tile_height = self.tile_heights[tile_idx].max(80.0);
                     let grouped: Vec<&PlottedChannel> = group
                         .iter()
                         .map(|&channel_idx| &self.plotted_channels[channel_idx])
@@ -1452,12 +1624,47 @@ impl GraphPanel {
                         &channel_meta,
                         group,
                         cursor_time,
+                        Some(viewport.time_range_from_plot_bounds(pair.0, pair.1)),
                     );
                     responses.push((group.clone(), resp.response));
+
+                    if tile_idx + 1 < tile_groups.len() {
+                        let delta = self.show_resize_handle(ui).y;
+                        if delta.abs() > 0.0 {
+                            Self::apply_adjacent_tile_resize(
+                                &mut self.tile_heights,
+                                tile_idx,
+                                delta,
+                            );
+                        }
+                    }
                 }
 
                 for (group, response) in &responses {
                     self.handle_tile_group_context_menu(response, group, &channel_meta, shared);
+                }
+
+                if shared.dragging_channel.is_some()
+                    && ui.input(|i| i.pointer.any_released())
+                    && ui.ui_contains_pointer()
+                {
+                    let target_group = responses
+                        .iter()
+                        .find(|(_, resp)| resp.contains_pointer())
+                        .and_then(|(group, _)| group.first())
+                        .and_then(|&idx| self.plotted_channels.get(idx))
+                        .map(|channel| channel.tile_group);
+                    if let Some(ch_id) = shared.dragging_channel.take() {
+                        self.add_channel_to_group(
+                            ch_id,
+                            target_group.unwrap_or_else(|| self.next_tile_group()),
+                            shared,
+                        );
+                        if target_group.is_none() {
+                            self.tile_heights.clear();
+                        }
+                        self.needs_zoom_reset = true;
+                    }
                 }
             });
 
@@ -1741,13 +1948,22 @@ impl GraphPanel {
         channels: &[&PlottedChannel],
         channel_meta: &[ChannelDisplayMeta],
         cursor_time: Option<f64>,
+        visible_time_range: Option<(f64, f64)>,
     ) {
         let line_height = 15.0;
         let pad = 4.0;
         for (i, pc) in channels.iter().enumerate() {
             if let Some(meta) = channel_meta.get(i) {
                 let y = plot_rect.top() + pad + i as f32 * line_height;
-                Self::draw_legend_entry(ui, plot_rect, pc, meta, cursor_time, y);
+                Self::draw_legend_entry(
+                    ui,
+                    plot_rect,
+                    pc,
+                    meta,
+                    cursor_time,
+                    visible_time_range,
+                    y,
+                );
             }
         }
     }
@@ -1759,13 +1975,22 @@ impl GraphPanel {
         all_meta: &[ChannelDisplayMeta],
         group: &[usize],
         cursor_time: Option<f64>,
+        visible_time_range: Option<(f64, f64)>,
     ) {
         let line_height = 15.0;
         let pad = 4.0;
         for (row, &channel_idx) in group.iter().enumerate() {
             if let (Some(pc), Some(meta)) = (channels.get(row), all_meta.get(channel_idx)) {
                 let y = plot_rect.top() + pad + row as f32 * line_height;
-                Self::draw_legend_entry(ui, plot_rect, pc, meta, cursor_time, y);
+                Self::draw_legend_entry(
+                    ui,
+                    plot_rect,
+                    pc,
+                    meta,
+                    cursor_time,
+                    visible_time_range,
+                    y,
+                );
             }
         }
     }
@@ -1776,21 +2001,13 @@ impl GraphPanel {
         pc: &PlottedChannel,
         meta: &ChannelDisplayMeta,
         cursor_time: Option<f64>,
+        visible_time_range: Option<(f64, f64)>,
         y: f32,
     ) {
         let (ref name, ref unit, freq, dec_places, ref enum_labels) = *meta;
         let painter = ui.painter();
         let font = egui::FontId::proportional(12.0);
         let pad = 4.0;
-        let bg_rect = egui::Rect::from_min_max(
-            egui::pos2(plot_rect.left() + 2.0, y - 2.0),
-            egui::pos2(plot_rect.right() - 2.0, y + 15.0),
-        );
-        painter.rect_filled(
-            bg_rect,
-            4.0,
-            egui::Color32::from_rgba_premultiplied(10, 10, 14, 150),
-        );
 
         let min_color = egui::Color32::from_rgb(80, 140, 255);
         let max_color = egui::Color32::from_rgb(255, 80, 80);
@@ -1808,6 +2025,76 @@ impl GraphPanel {
         } else {
             format!("{} [{}]", name, unit)
         };
+        let label_width = painter
+            .layout_no_wrap(label.clone(), font.clone(), pc.color)
+            .size()
+            .x;
+        let mut left_cluster_right = name_x + label_width;
+
+        let dec = dec_places.max(0) as usize;
+        let fmt = |v: f64| -> String {
+            format_enum_value(name, enum_labels, v)
+                .unwrap_or_else(|| format!("{:.prec$}", v, prec = dec))
+        };
+
+        let cursor_text = cursor_time.map(|t| {
+            let raw_val = crate::panels::cursor_readout::value_at_time(
+                &pc.data,
+                freq,
+                t,
+                uses_discrete_values(name, enum_labels),
+            );
+            let val = transformed_value_for_display(pc, name, enum_labels, raw_val);
+            fmt(val)
+        });
+        if let Some(cursor_text) = &cursor_text {
+            let width = painter
+                .layout_no_wrap(cursor_text.clone(), font.clone(), pc.color)
+                .size()
+                .x;
+            left_cluster_right += 16.0 + width;
+        }
+
+        let visible_stats =
+            Self::display_stats_for_time_range(pc, name, enum_labels, freq, visible_time_range);
+        let right_cluster_rect = visible_stats.as_ref().map(|stats| {
+            let icon_size = 7.0;
+            let spacing = 6.0;
+            let avg_width = painter
+                .layout_no_wrap(fmt(stats.avg), font.clone(), avg_color)
+                .size()
+                .x;
+            let max_width = painter
+                .layout_no_wrap(fmt(stats.max), font.clone(), max_color)
+                .size()
+                .x;
+            let min_width = painter
+                .layout_no_wrap(fmt(stats.min), font.clone(), min_color)
+                .size()
+                .x;
+            let total_width = avg_width + max_width + min_width + 3.0 * icon_size + 9.0 * spacing;
+            egui::Rect::from_min_max(
+                egui::pos2(plot_rect.right() - pad - total_width - pad, y - 2.0),
+                egui::pos2(plot_rect.right() - 2.0, y + 15.0),
+            )
+        });
+
+        let left_cluster_rect = egui::Rect::from_min_max(
+            egui::pos2(plot_rect.left() + 2.0, y - 2.0),
+            egui::pos2(left_cluster_right + pad, y + 15.0),
+        );
+        painter.rect_filled(
+            left_cluster_rect,
+            4.0,
+            egui::Color32::from_rgba_premultiplied(10, 10, 14, 150),
+        );
+        if let Some(rect) = right_cluster_rect {
+            painter.rect_filled(
+                rect,
+                4.0,
+                egui::Color32::from_rgba_premultiplied(10, 10, 14, 150),
+            );
+        }
 
         let label_rect = painter.text(
             egui::pos2(name_x, y),
@@ -1817,31 +2104,18 @@ impl GraphPanel {
             pc.color,
         );
 
-        let dec = dec_places.max(0) as usize;
-        let fmt = |v: f64| -> String {
-            format_enum_value(name, enum_labels, v)
-                .unwrap_or_else(|| format!("{:.prec$}", v, prec = dec))
-        };
-
-        if let Some(t) = cursor_time {
-            let raw_val = crate::panels::cursor_readout::value_at_time(
-                &pc.data,
-                freq,
-                t,
-                uses_discrete_values(name, enum_labels),
-            );
-            let val = transformed_value_for_display(pc, name, enum_labels, raw_val);
+        if let Some(cursor_text) = cursor_text {
             painter.text(
                 egui::pos2(label_rect.right() + 16.0, y),
                 egui::Align2::LEFT_TOP,
-                fmt(val),
+                cursor_text,
                 font.clone(),
                 pc.color,
             );
         }
 
         // Right side: colored min/max/avg stats (i2 style)
-        if !pc.data.is_empty() {
+        if let Some(stats) = visible_stats {
             let icon_size = 7.0;
             let spacing = 6.0;
             let mut x = plot_rect.right() - pad;
@@ -1866,19 +2140,10 @@ impl GraphPanel {
                 *x = icon.left() - spacing * 2.0;
             };
 
-            draw_stat(
-                &mut x,
-                transformed_value_for_display(pc, name, enum_labels, pc.cached_avg),
-                avg_color,
-            );
+            draw_stat(&mut x, stats.avg, avg_color);
 
             // Max uses a triangle icon instead of a square
-            let display_max = if pc.display_scale < 0.0 {
-                pc.cached_min * pc.display_scale + pc.display_offset
-            } else {
-                pc.cached_max * pc.display_scale + pc.display_offset
-            };
-            let max_text = fmt(display_max);
+            let max_text = fmt(stats.max);
             let max_rect = painter.text(
                 egui::pos2(x, y),
                 egui::Align2::RIGHT_TOP,
@@ -1899,13 +2164,93 @@ impl GraphPanel {
             ));
             x = tri_cx - icon_size / 2.0 - spacing * 2.0;
 
-            let display_min = if pc.display_scale < 0.0 {
-                pc.cached_max * pc.display_scale + pc.display_offset
-            } else {
-                pc.cached_min * pc.display_scale + pc.display_offset
-            };
-            draw_stat(&mut x, display_min, min_color);
+            draw_stat(&mut x, stats.min, min_color);
         }
+    }
+
+    fn display_stats_for_time_range(
+        pc: &PlottedChannel,
+        name: &str,
+        enum_labels: &HashMap<i64, String>,
+        freq: u16,
+        visible_time_range: Option<(f64, f64)>,
+    ) -> Option<DisplayStats> {
+        let stats = visible_time_range
+            .and_then(|range| Self::channel_stats_in_time_range(&pc.data, freq, range))
+            .unwrap_or_else(|| compute_channel_stats(&pc.data));
+        if !stats.min.is_finite() && !stats.max.is_finite() && !stats.avg.is_finite() {
+            return None;
+        }
+
+        let avg = transformed_value_for_display(pc, name, enum_labels, stats.avg);
+        let mut min = transformed_value_for_display(pc, name, enum_labels, stats.min);
+        let mut max = transformed_value_for_display(pc, name, enum_labels, stats.max);
+        if !uses_discrete_values(name, enum_labels) && pc.display_scale < 0.0 {
+            std::mem::swap(&mut min, &mut max);
+        }
+        Some(DisplayStats { min, max, avg })
+    }
+
+    fn channel_stats_in_time_range(
+        data: &[f64],
+        freq: u16,
+        visible_time_range: (f64, f64),
+    ) -> Option<crate::state::ChannelStats> {
+        if data.is_empty() || freq == 0 {
+            return None;
+        }
+        let (time_min, time_max) = if visible_time_range.0 <= visible_time_range.1 {
+            visible_time_range
+        } else {
+            (visible_time_range.1, visible_time_range.0)
+        };
+        let start = ((time_min.max(0.0) * freq as f64).floor() as usize).min(data.len());
+        let end = ((time_max.max(0.0) * freq as f64).ceil() as usize + 1).min(data.len());
+        (start < end).then(|| compute_channel_stats(&data[start..end]))
+    }
+
+    fn ensure_tile_heights(&mut self, tile_count: usize, available_height: f32) {
+        if tile_count == 0 {
+            self.tile_heights.clear();
+            return;
+        }
+        let default_height = (available_height / tile_count as f32).max(80.0);
+        if self.tile_heights.len() < tile_count {
+            self.tile_heights.resize(tile_count, default_height);
+        } else if self.tile_heights.len() > tile_count {
+            self.tile_heights.truncate(tile_count);
+        }
+        for height in &mut self.tile_heights {
+            *height = height.max(80.0);
+        }
+    }
+
+    fn apply_adjacent_tile_resize(tile_heights: &mut [f32], upper_idx: usize, delta: f32) {
+        if upper_idx + 1 >= tile_heights.len() {
+            return;
+        }
+        let min_height = 80.0;
+        let max_down = tile_heights[upper_idx + 1] - min_height;
+        let max_up = tile_heights[upper_idx] - min_height;
+        let applied = delta.clamp(-max_up, max_down);
+        tile_heights[upper_idx] += applied;
+        tile_heights[upper_idx + 1] -= applied;
+    }
+
+    fn show_resize_handle(&self, ui: &mut egui::Ui) -> egui::Vec2 {
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 8.0),
+            egui::Sense::click_and_drag(),
+        );
+        ui.painter().hline(
+            rect.x_range(),
+            rect.center().y,
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        );
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+        }
+        response.drag_motion()
     }
 
     fn draw_cursor_line(plot_ui: &mut egui_plot::PlotUi, axis_value: f64) {
@@ -1928,6 +2273,11 @@ impl GraphPanel {
 
     fn handle_context_menu(&mut self, response: &egui::Response, shared: &mut SharedState) {
         response.context_menu(|ui| {
+            if ui.button("Manage Channels...").clicked() {
+                self.show_manage_channels_window = true;
+                ui.close();
+            }
+            ui.separator();
             ui.label("Channels:");
             ui.separator();
 
@@ -1959,6 +2309,11 @@ impl GraphPanel {
             .collect();
 
         response.context_menu(|ui| {
+            if ui.button("Manage Channels...").clicked() {
+                self.show_manage_channels_window = true;
+                ui.close();
+            }
+            ui.separator();
             ui.label("Channels");
             ui.separator();
 
@@ -2108,6 +2463,126 @@ impl GraphPanel {
         ordered_groups
     }
 
+    fn tiled_channel_groups_with_keys(&self) -> Vec<(usize, Vec<usize>)> {
+        let mut ordered_groups = Vec::new();
+        let mut group_lookup: HashMap<usize, usize> = HashMap::new();
+
+        for (channel_idx, plotted) in self.plotted_channels.iter().enumerate() {
+            let bucket = if let Some(existing) = group_lookup.get(&plotted.tile_group) {
+                *existing
+            } else {
+                let next = ordered_groups.len();
+                ordered_groups.push((plotted.tile_group, Vec::new()));
+                group_lookup.insert(plotted.tile_group, next);
+                next
+            };
+            ordered_groups[bucket].1.push(channel_idx);
+        }
+
+        ordered_groups
+    }
+
+    fn normalize_tile_groups(&mut self) {
+        let mut next_group = 0usize;
+        let mut remap = HashMap::new();
+        for channel in &mut self.plotted_channels {
+            let mapped = *remap.entry(channel.tile_group).or_insert_with(|| {
+                let current = next_group;
+                next_group += 1;
+                current
+            });
+            channel.tile_group = mapped;
+        }
+    }
+
+    fn move_channel_before(&mut self, dragged: ChannelId, target: ChannelId) {
+        let Some(from_idx) = self
+            .plotted_channels
+            .iter()
+            .position(|pc| pc.channel_id == dragged)
+        else {
+            return;
+        };
+        let target_group = self
+            .plotted_channels
+            .iter()
+            .find(|pc| pc.channel_id == target)
+            .map(|pc| pc.tile_group);
+        let Some(target_group) = target_group else {
+            return;
+        };
+
+        let mut channel = self.plotted_channels.remove(from_idx);
+        channel.tile_group = target_group;
+
+        let Some(target_idx) = self
+            .plotted_channels
+            .iter()
+            .position(|pc| pc.channel_id == target)
+        else {
+            self.plotted_channels.push(channel);
+            self.normalize_tile_groups();
+            return;
+        };
+        self.plotted_channels.insert(target_idx, channel);
+        self.normalize_tile_groups();
+    }
+
+    fn move_channel_to_group_end(&mut self, dragged: ChannelId, group: usize) {
+        let Some(from_idx) = self
+            .plotted_channels
+            .iter()
+            .position(|pc| pc.channel_id == dragged)
+        else {
+            return;
+        };
+        let mut channel = self.plotted_channels.remove(from_idx);
+        channel.tile_group = group;
+
+        let insert_idx = self
+            .plotted_channels
+            .iter()
+            .rposition(|pc| pc.tile_group == group)
+            .map(|idx| idx + 1)
+            .unwrap_or(self.plotted_channels.len());
+        self.plotted_channels.insert(insert_idx, channel);
+        self.normalize_tile_groups();
+    }
+
+    fn move_channel_to_new_graph(&mut self, channel_id: ChannelId) {
+        let Some(from_idx) = self
+            .plotted_channels
+            .iter()
+            .position(|pc| pc.channel_id == channel_id)
+        else {
+            return;
+        };
+        let mut channel = self.plotted_channels.remove(from_idx);
+        channel.tile_group = self.next_tile_group();
+        self.plotted_channels.push(channel);
+        self.normalize_tile_groups();
+        self.tile_heights.clear();
+    }
+
+    fn sync_manage_channels_state(&mut self) {
+        match self.manage_channels_selection {
+            Some(ManageChannelsSelection::Channel(channel_id))
+                if !self.is_channel_plotted(channel_id) =>
+            {
+                self.manage_channels_selection = None;
+            }
+            Some(ManageChannelsSelection::Group(group))
+                if !self
+                    .plotted_channels
+                    .iter()
+                    .any(|pc| pc.tile_group == group) =>
+            {
+                self.manage_channels_selection = None;
+            }
+            _ => {}
+        }
+    }
+
     fn apply_context_action(&mut self, action: ContextAction, shared: &mut SharedState) {
         match action {
             ContextAction::Remove(id) => self.remove_channel(id),
@@ -2212,6 +2687,475 @@ impl GraphPanel {
                     });
                 }
             }
+        }
+    }
+
+    fn show_manage_channels_window(&mut self, ctx: &egui::Context, shared: &mut SharedState) {
+        if !self.show_manage_channels_window {
+            self.show_add_channel_picker = false;
+            self.add_channel_target = None;
+            return;
+        }
+
+        self.sync_manage_channels_state();
+
+        let mut open = self.show_manage_channels_window;
+        let mut pending_actions = Vec::new();
+        let mut pending_selection = self.manage_channels_selection;
+        let mut open_picker = None;
+        let viewport_id = egui::ViewportId::from_hash_of(format!("manage_channels_{}", self.id));
+        ctx.show_viewport_immediate(
+            viewport_id,
+            egui::ViewportBuilder::default()
+                .with_title(format!("Manage Channels - {}", self.title))
+                .with_inner_size([720.0, 560.0]),
+            |viewport_ui, _class| {
+                if viewport_ui.input(|i| i.viewport().close_requested()) {
+                    open = false;
+                    self.show_add_channel_picker = false;
+                    self.add_channel_target = None;
+                    self.add_channel_selection = None;
+                    self.add_channel_filter.clear();
+                    return;
+                }
+
+                let picker_ctx = viewport_ui.ctx().clone();
+                let ui = &mut *viewport_ui;
+                ui.label("Channels");
+                ui.small(
+                    "Drag rows onto the drop lines to reorder them or move them into another graph.",
+                );
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .max_height(380.0)
+                    .show(ui, |ui| {
+                        let grouped = self.tiled_channel_groups_with_keys();
+                        for (visual_group_idx, (tile_group, indices)) in grouped.iter().enumerate()
+                        {
+                            let group_selected =
+                                pending_selection == Some(ManageChannelsSelection::Group(*tile_group));
+                            ui.group(|ui| {
+                                let header = ui.selectable_label(
+                                    group_selected,
+                                    format!("Graph {}", visual_group_idx + 1),
+                                );
+                                if header.clicked() {
+                                    pending_selection =
+                                        Some(ManageChannelsSelection::Group(*tile_group));
+                                }
+                                header.on_hover_text(format!("{} channel(s)", indices.len()));
+                                ui.add_space(2.0);
+
+                                for (row_pos, &channel_idx) in indices.iter().enumerate() {
+                                    let pc = &self.plotted_channels[channel_idx];
+                                    if row_pos == 0 {
+                                        let start_drop = Self::manage_channel_drop_zone(
+                                            ui,
+                                            &format!(
+                                                "Drop at start of Graph {}",
+                                                visual_group_idx + 1
+                                            ),
+                                        );
+                                        if let Some(payload) = start_drop
+                                            .dnd_release_payload::<ManageChannelDragPayload>()
+                                        {
+                                            pending_actions.push(
+                                                ManageChannelsAction::MoveBefore {
+                                                    dragged: payload.channel_id,
+                                                    target: pc.channel_id,
+                                                },
+                                            );
+                                        }
+                                    }
+
+                                    let (name, unit, _, _, _) =
+                                        resolve_plotted_channel_display_meta(pc, shared);
+                                    let row_label = if unit.is_empty() {
+                                        name.clone()
+                                    } else {
+                                        format!("{name} [{unit}]")
+                                    };
+                                    let row_selected = pending_selection
+                                        == Some(ManageChannelsSelection::Channel(pc.channel_id));
+                                    let drag_id = egui::Id::new((
+                                        "manage_channel_row",
+                                        self.id,
+                                        Self::channel_id_key(pc.channel_id),
+                                    ));
+                                    let drag_response = ui.dnd_drag_source(
+                                        drag_id,
+                                        ManageChannelDragPayload {
+                                            channel_id: pc.channel_id,
+                                        },
+                                        |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("::").weak());
+                                                ui.colored_label(pc.color, "■");
+                                                ui.add(
+                                                    egui::Button::new(row_label.clone())
+                                                        .selected(row_selected),
+                                                )
+                                            })
+                                            .inner
+                                        },
+                                    );
+
+                                    if drag_response.inner.clicked() {
+                                        pending_selection =
+                                            Some(ManageChannelsSelection::Channel(pc.channel_id));
+                                    }
+
+                                    let raw_unit = resolve_channel_meta(pc.channel_id, shared).1;
+                                    drag_response.inner.context_menu(|ui| {
+                                        let mut action = None;
+                                        Self::show_channel_menu(
+                                            ui,
+                                            pc,
+                                            &raw_unit,
+                                            shared,
+                                            &mut action,
+                                        );
+                                        if let Some(action) = action {
+                                            pending_actions
+                                                .push(ManageChannelsAction::Context(action));
+                                        }
+                                    });
+
+                                    let drop_label = if row_pos + 1 == indices.len() {
+                                        format!("Drop at end of Graph {}", visual_group_idx + 1)
+                                    } else {
+                                        "Drop here".to_string()
+                                    };
+                                    let row_drop =
+                                        Self::manage_channel_drop_zone(ui, &drop_label);
+                                    if let Some(payload) =
+                                        row_drop.dnd_release_payload::<ManageChannelDragPayload>()
+                                    {
+                                        if row_pos + 1 < indices.len() {
+                                            let next_idx = indices[row_pos + 1];
+                                            let next_id =
+                                                self.plotted_channels[next_idx].channel_id;
+                                            pending_actions.push(
+                                                ManageChannelsAction::MoveBefore {
+                                                    dragged: payload.channel_id,
+                                                    target: next_id,
+                                                },
+                                            );
+                                        } else {
+                                            pending_actions.push(
+                                                ManageChannelsAction::MoveToGroupEnd {
+                                                    dragged: payload.channel_id,
+                                                    group: *tile_group,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                    });
+
+                let selected_channel = match pending_selection {
+                    Some(ManageChannelsSelection::Channel(channel_id))
+                        if self.is_channel_plotted(channel_id) =>
+                    {
+                        Some(channel_id)
+                    }
+                    _ => None,
+                };
+                let selected_group = match pending_selection {
+                    Some(ManageChannelsSelection::Group(group))
+                        if self.plotted_channels.iter().any(|pc| pc.tile_group == group) =>
+                    {
+                        Some(group)
+                    }
+                    Some(ManageChannelsSelection::Channel(channel_id)) => self
+                        .plotted_channels
+                        .iter()
+                        .find(|pc| pc.channel_id == channel_id)
+                        .map(|pc| pc.tile_group),
+                    _ => None,
+                };
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Add Graph").clicked() {
+                        if let Some(channel_id) = selected_channel {
+                            pending_actions.push(ManageChannelsAction::MoveToNewGraph(channel_id));
+                        } else {
+                            open_picker = Some(AddChannelPickerTarget::NewGraph);
+                        }
+                    }
+
+                    if ui.button("Add Channel...").clicked() {
+                        open_picker = Some(match selected_group {
+                            Some(group) => AddChannelPickerTarget::ExistingGroup(group),
+                            None => AddChannelPickerTarget::NewGraph,
+                        });
+                    }
+
+                    if ui
+                        .add_enabled(selected_channel.is_some(), egui::Button::new("Remove"))
+                        .clicked()
+                        && let Some(channel_id) = selected_channel
+                    {
+                        pending_actions.push(ManageChannelsAction::Remove(channel_id));
+                    }
+                });
+
+                ui.small("Add Channel... goes to the selected graph, or creates a new graph at the bottom if nothing is selected.");
+
+                self.show_add_channel_picker_window(&picker_ctx, shared, &mut pending_actions);
+            },
+        );
+
+        self.manage_channels_selection = pending_selection;
+        if let Some(target) = open_picker {
+            self.show_add_channel_picker = true;
+            self.add_channel_target = Some(target);
+            self.add_channel_filter.clear();
+            self.add_channel_selection = None;
+        }
+
+        if !open {
+            self.show_add_channel_picker = false;
+            self.add_channel_target = None;
+            self.add_channel_selection = None;
+            self.add_channel_filter.clear();
+        }
+
+        self.show_manage_channels_window = open;
+
+        for action in pending_actions {
+            match action {
+                ManageChannelsAction::Context(action) => self.apply_context_action(action, shared),
+                ManageChannelsAction::MoveBefore { dragged, target } => {
+                    if dragged != target {
+                        self.move_channel_before(dragged, target);
+                    }
+                }
+                ManageChannelsAction::MoveToGroupEnd { dragged, group } => {
+                    self.move_channel_to_group_end(dragged, group);
+                }
+                ManageChannelsAction::MoveToNewGraph(channel_id) => {
+                    self.move_channel_to_new_graph(channel_id);
+                }
+                ManageChannelsAction::AddToGroup { channel_id, group } => {
+                    self.add_channel_to_group(channel_id, group, shared);
+                }
+                ManageChannelsAction::AddToNewGraph(channel_id) => {
+                    self.add_channel(channel_id, shared);
+                }
+                ManageChannelsAction::Remove(channel_id) => self.remove_channel(channel_id),
+            }
+        }
+
+        self.sync_manage_channels_state();
+    }
+
+    fn show_add_channel_picker_window(
+        &mut self,
+        ctx: &egui::Context,
+        shared: &SharedState,
+        pending_actions: &mut Vec<ManageChannelsAction>,
+    ) {
+        if !self.show_add_channel_picker {
+            return;
+        }
+
+        let Some(target) = self.add_channel_target else {
+            self.show_add_channel_picker = false;
+            return;
+        };
+
+        let mut open = self.show_add_channel_picker;
+        let mut close_picker = false;
+        let title = match target {
+            AddChannelPickerTarget::ExistingGroup(group) => {
+                let visual_idx = self
+                    .tiled_channel_groups_with_keys()
+                    .iter()
+                    .position(|(tile_group, _)| *tile_group == group)
+                    .map(|idx| idx + 1)
+                    .unwrap_or(group + 1);
+                format!("Add Channel to Graph {visual_idx}")
+            }
+            AddChannelPickerTarget::NewGraph => "Add Channel to New Graph".to_string(),
+        };
+
+        egui::Window::new(title)
+            .open(&mut open)
+            .resizable(true)
+            .default_size([420.0, 520.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    ui.text_edit_singleline(&mut self.add_channel_filter);
+                });
+                ui.separator();
+
+                let filter = self.add_channel_filter.to_lowercase();
+                egui::ScrollArea::vertical()
+                    .max_height(400.0)
+                    .show(ui, |ui| {
+                        for (channel_id, label) in self.available_channel_entries(shared) {
+                            if !filter.is_empty() && !label.to_lowercase().contains(&filter) {
+                                continue;
+                            }
+
+                            let already_plotted = self.is_channel_plotted(channel_id);
+                            let selected = self.add_channel_selection == Some(channel_id);
+                            ui.horizontal(|ui| {
+                                let response = ui.add_enabled(
+                                    !already_plotted,
+                                    egui::Button::new(label.clone()).selected(selected),
+                                );
+                                if response.clicked() {
+                                    self.add_channel_selection = Some(channel_id);
+                                }
+                                if response.double_clicked() {
+                                    match target {
+                                        AddChannelPickerTarget::ExistingGroup(group) => {
+                                            pending_actions.push(
+                                                ManageChannelsAction::AddToGroup {
+                                                    channel_id,
+                                                    group,
+                                                },
+                                            );
+                                        }
+                                        AddChannelPickerTarget::NewGraph => {
+                                            pending_actions.push(
+                                                ManageChannelsAction::AddToNewGraph(channel_id),
+                                            );
+                                        }
+                                    }
+                                    close_picker = true;
+                                }
+                                if already_plotted {
+                                    ui.weak("Already plotted");
+                                }
+                            });
+                        }
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            matches!(
+                                self.add_channel_selection,
+                                Some(channel_id) if !self.is_channel_plotted(channel_id)
+                            ),
+                            egui::Button::new("Add"),
+                        )
+                        .clicked()
+                        && let Some(channel_id) = self.add_channel_selection
+                    {
+                        match target {
+                            AddChannelPickerTarget::ExistingGroup(group) => {
+                                pending_actions
+                                    .push(ManageChannelsAction::AddToGroup { channel_id, group });
+                            }
+                            AddChannelPickerTarget::NewGraph => {
+                                pending_actions
+                                    .push(ManageChannelsAction::AddToNewGraph(channel_id));
+                            }
+                        }
+                        close_picker = true;
+                    }
+
+                    if ui.button("Cancel").clicked() {
+                        close_picker = true;
+                    }
+                });
+            });
+
+        if close_picker {
+            open = false;
+        }
+        self.show_add_channel_picker = open;
+        if !self.show_add_channel_picker {
+            self.add_channel_target = None;
+            self.add_channel_selection = None;
+            self.add_channel_filter.clear();
+        }
+    }
+
+    fn manage_channel_drop_zone(ui: &mut egui::Ui, label: &str) -> egui::Response {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
+        if response
+            .dnd_hover_payload::<ManageChannelDragPayload>()
+            .is_some()
+        {
+            let fill = egui::Color32::from_rgba_premultiplied(70, 110, 170, 80);
+            let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 170, 240));
+            ui.painter().rect_filled(rect, 4.0, fill);
+            ui.painter()
+                .rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Outside);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+        }
+        response
+    }
+
+    fn available_channel_entries(&self, shared: &SharedState) -> Vec<(ChannelId, String)> {
+        let mut entries = Vec::new();
+
+        if let Some(ld) = &shared.ld_file {
+            let mut physical: Vec<_> = ld.channels.iter().collect();
+            physical.sort_by_key(|channel| channel.name.to_lowercase());
+            for channel in physical {
+                let label = format!(
+                    "{} [{}] {}Hz",
+                    channel.name,
+                    if channel.unit.is_empty() {
+                        "-"
+                    } else {
+                        &channel.unit
+                    },
+                    channel.freq
+                );
+                entries.push((ChannelId::Physical(channel.index), label));
+            }
+        }
+
+        let mut math_entries: Vec<_> = shared
+            .math_channels
+            .iter()
+            .enumerate()
+            .filter(|(_, channel)| channel.data.is_some())
+            .map(|(idx, channel)| {
+                let label = format!(
+                    "f {} [{}] {}Hz",
+                    channel.name,
+                    if channel.unit.is_empty() {
+                        "-"
+                    } else {
+                        &channel.unit
+                    },
+                    channel.freq
+                );
+                (ChannelId::Math(idx), label)
+            })
+            .collect();
+        math_entries.sort_by_key(|(_, label)| label.to_lowercase());
+        entries.extend(math_entries);
+
+        entries
+    }
+
+    fn channel_id_key(channel_id: ChannelId) -> (u8, usize) {
+        match channel_id {
+            ChannelId::Physical(idx) => (0, idx),
+            ChannelId::Math(idx) => (1, idx),
         }
     }
 
