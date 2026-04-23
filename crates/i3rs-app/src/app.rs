@@ -117,6 +117,7 @@ fn apply_theme_to_ctx(ctx: &egui::Context, theme: ThemeChoice) {
 }
 
 pub struct App {
+    egui_ctx: egui::Context,
     shared: SharedState,
     worksheets: Vec<Worksheet>,
     active_worksheet: usize,
@@ -167,6 +168,7 @@ impl App {
         }];
         apply_theme_to_ctx(&cc.egui_ctx, preferences.theme);
         Self {
+            egui_ctx: cc.egui_ctx.clone(),
             shared,
             worksheets,
             active_worksheet: 0,
@@ -370,6 +372,8 @@ impl App {
         if let Some(path) = self.shared.ld_path.clone() {
             self.register_project_session(&path);
         }
+
+        self.egui_ctx.request_repaint();
     }
 
     fn submit_load_session(
@@ -2166,6 +2170,7 @@ mod tests {
         #[cfg(not(target_arch = "wasm32"))]
         let (native_pick_tx, native_pick_rx) = crate::platform::native_pick_channel();
         App {
+            egui_ctx: egui::Context::default(),
             shared,
             worksheets,
             active_worksheet: 0,

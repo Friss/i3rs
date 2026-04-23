@@ -2721,7 +2721,14 @@ impl GraphPanel {
 
                 let picker_ctx = viewport_ui.ctx().clone();
                 let ui = &mut *viewport_ui;
-                ui.label("Channels");
+                ui.horizontal(|ui| {
+                    ui.label("Channels");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            open = false;
+                        }
+                    });
+                });
                 ui.small(
                     "Drag rows onto the drop lines to reorder them or move them into another graph.",
                 );

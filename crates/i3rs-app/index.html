@@ -4,7 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>i3rs Web</title>
+    <link rel="icon" href="i3rs.ico" />
     <link data-trunk rel="rust" href="Cargo.toml" data-target-name="i3rs_app" />
+    <link data-trunk rel="copy-file" href="packaging/icons/i3rs.ico" />
     <link data-trunk rel="copy-file" href="../../test_data/VIR_LAP.ld" />
     <link data-trunk rel="copy-file" href="../../test_data/VIR_LAP.ldx" />
     <style>
@@ -21,24 +23,41 @@
       }
 
       body {
+        position: relative;
+      }
+
+      .load-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 10;
         display: grid;
-        grid-template-rows: auto 1fr;
+        place-items: center;
+        padding: 1rem;
+        background: rgba(15, 17, 21, 0.5);
+        backdrop-filter: blur(3px);
       }
 
-      .app-shell {
-        padding: 0.75rem 1rem;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-        background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0));
+      .load-overlay[hidden] {
+        display: none;
       }
 
-      .app-shell h1 {
+      .load-modal {
+        width: min(40rem, 100%);
+        padding: 1rem;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 0.5rem;
+        background: #171a20;
+        box-shadow: 0 1.5rem 4rem rgba(0, 0, 0, 0.35);
+      }
+
+      .load-modal h1 {
         margin: 0;
         font-size: 1rem;
         font-weight: 650;
         letter-spacing: 0.02em;
       }
 
-      .app-shell p {
+      .load-modal p {
         margin: 0.3rem 0 0;
         font-size: 0.9rem;
         opacity: 0.75;
@@ -133,30 +152,32 @@
     </style>
   </head>
   <body>
-    <div class="app-shell">
-      <h1>i3rs Web</h1>
-      <p>Open a MoTeC <code>.ld</code> file from the File menu inside the app.</p>
-      <div class="load-controls">
-        <label>
-          LD file
-          <input id="ld-file" type="file" accept=".ld" />
-        </label>
-        <label>
-          Optional LDX file
-          <input id="ldx-file" type="file" accept=".ldx" />
-        </label>
-        <button id="load-session" type="button">Load Session</button>
-        <button id="load-vir-lap" type="button">Load VIR_LAP Sample</button>
-      </div>
-      <div id="load-status" class="load-status" data-state="idle" aria-live="polite">
-        <span class="load-status-message">Web app starting...</span>
+    <canvas id="i3rs-canvas"></canvas>
+    <div id="load-overlay" class="load-overlay">
+      <div class="load-modal" role="dialog" aria-labelledby="load-title" aria-modal="true">
+        <h1 id="load-title">Open telemetry</h1>
+        <p>Select a MoTeC <code>.ld</code> file and optional <code>.ldx</code> sidecar together.</p>
+        <div class="load-controls">
+          <label for="session-files">
+            Session files
+            <input
+              id="session-files"
+              name="session-files"
+              type="file"
+              accept=".ld,.ldx"
+              multiple
+            />
+          </label>
+          <button id="load-vir-lap" type="button">Load VIR_LAP Sample</button>
+        </div>
+        <div id="load-status" class="load-status" data-state="idle" aria-live="polite">
+          <span class="load-status-message">Web app starting...</span>
+        </div>
       </div>
     </div>
-    <canvas id="i3rs-canvas"></canvas>
     <script>
-      const ldInput = document.getElementById("ld-file");
-      const ldxInput = document.getElementById("ldx-file");
-      const loadButton = document.getElementById("load-session");
+      const loadOverlay = document.getElementById("load-overlay");
+      const sessionFilesInput = document.getElementById("session-files");
       const sampleButton = document.getElementById("load-vir-lap");
       const statusEl = document.getElementById("load-status");
       const statusMessageEl = statusEl.querySelector(".load-status-message");
@@ -165,9 +186,13 @@
 
       const readAsUint8Array = async (file) => new Uint8Array(await file.arrayBuffer());
       const readAsText = async (file) => await file.text();
+      const extensionOf = (file) => file.name.split(".").pop()?.toLowerCase() ?? "";
       const waitForPaint = async () =>
         await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       const notifyLoadState = (state) => {
+        if (state.state !== "success") {
+          loadOverlay.hidden = false;
+        }
         window.i3rsLoadState = state;
         statusEl.dataset.state = state.state;
         statusMessageEl.textContent = state.message;
@@ -180,7 +205,7 @@
         }
       };
       const setBusy = (busy) => {
-        loadButton.disabled = busy;
+        sessionFilesInput.disabled = busy;
         sampleButton.disabled = busy;
       };
       const setLoadState = (state, message, extra = {}) => {
@@ -221,6 +246,8 @@
           parseDurationMs,
           summary,
         });
+        await waitForPaint();
+        loadOverlay.hidden = true;
         return summary;
       };
 
@@ -241,10 +268,17 @@
         setLoadState("error", "Web app startup timed out.");
       };
 
-      loadButton.addEventListener("click", async () => {
-        const ldFile = ldInput.files && ldInput.files[0];
+      const loadSelectedFiles = async () => {
+        const selectedFiles = Array.from(sessionFilesInput.files ?? []);
+        const ldFiles = selectedFiles.filter((file) => extensionOf(file) === "ld");
+        const ldxFiles = selectedFiles.filter((file) => extensionOf(file) === "ldx");
+        const ldFile = ldFiles[0];
         if (!ldFile) {
           setLoadState("error", "Choose an .ld file first.");
+          return;
+        }
+        if (ldFiles.length > 1) {
+          setLoadState("error", "Choose only one .ld file.");
           return;
         }
 
@@ -256,7 +290,7 @@
             phase: "read",
           });
           const ldBytes = await readAsUint8Array(ldFile);
-          const ldxFile = ldxInput.files && ldxInput.files[0];
+          const ldxFile = ldxFiles[0];
           let ldxText = null;
           if (ldxFile) {
             setLoadState("loading", `Reading ${ldxFile.name}...`, {
@@ -276,6 +310,12 @@
           });
         } finally {
           setBusy(false);
+        }
+      };
+
+      sessionFilesInput.addEventListener("change", () => {
+        if (sessionFilesInput.files && sessionFilesInput.files.length > 0) {
+          void loadSelectedFiles();
         }
       });
 
