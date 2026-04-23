@@ -125,15 +125,21 @@ jobs:
 
           check_publish_needed() {
             local crate_name="$1"
-            local response
-            response=$(curl -fsSL "https://crates.io/api/v1/crates/${crate_name}")
-            echo "$response"
+            local cargo_info_output
 
-            if CRATE_NAME="$crate_name" VERSION="$VERSION" RESPONSE="$response" python3 -c "import json, os, sys; crate_name = os.environ['CRATE_NAME']; version = os.environ['VERSION']; response = json.loads(os.environ['RESPONSE']); published_versions = {entry['num'] for entry in response.get('versions', [])}; already_published = version in published_versions; print(f'{crate_name} {version} already exists on crates.io' if already_published else f'{crate_name} {version} is not published yet'); sys.exit(0 if already_published else 1)"
+            if cargo_info_output=$(cargo info "$crate_name@$VERSION" --registry crates-io 2>&1)
             then
+              echo "$cargo_info_output"
+              echo "$crate_name $VERSION already exists on crates.io"
               echo "publish-${crate_name}=false" >> "$GITHUB_OUTPUT"
             else
-              echo "publish-${crate_name}=true" >> "$GITHUB_OUTPUT"
+              echo "$cargo_info_output"
+              if grep -F -q "could not find \`$crate_name@$VERSION\`" <<< "$cargo_info_output"; then
+                echo "$crate_name $VERSION is not published yet"
+                echo "publish-${crate_name}=true" >> "$GITHUB_OUTPUT"
+              else
+                return 1
+              fi
             fi
           }
 
