@@ -23,6 +23,7 @@ struct HistogramBins {
 struct HistogramChannelFingerprint {
     data_ptr: usize,
     display_transform: DisplayTransformFingerprint,
+    color: [u8; 4],
 }
 
 #[derive(PartialEq, Eq)]
@@ -224,6 +225,7 @@ impl HistogramPanel {
             .map(|pc| HistogramChannelFingerprint {
                 data_ptr: pc.data.as_ptr() as usize,
                 display_transform: display_transform_fingerprint(pc),
+                color: [pc.color.r(), pc.color.g(), pc.color.b(), pc.color.a()],
             })
             .collect();
         let fingerprint = HistogramFingerprint {
@@ -300,7 +302,7 @@ impl HistogramPanel {
             None
         };
 
-        plot.show(ui, |plot_ui| {
+        let plot_response = plot.show(ui, |plot_ui| {
             if let Some((x_min, x_max)) = locked_x_range {
                 plot_ui.set_plot_bounds_x(x_min..=x_max);
             }
@@ -318,6 +320,27 @@ impl HistogramPanel {
                         .color(*color)
                         .style(egui_plot::LineStyle::dashed_dense()),
                 );
+            }
+        });
+
+        plot_response.response.context_menu(|ui| {
+            ui.label("Channels");
+            ui.separator();
+
+            let mut to_remove = None;
+            for pc in &mut self.channels {
+                let (name, _, _, _, _) = resolve_plotted_channel_display_meta(pc, shared);
+                ui.menu_button(name, |ui| {
+                    if show_plotted_channel_display_menu(ui, pc, shared) {
+                        to_remove = Some(pc.channel_id);
+                    }
+                });
+            }
+
+            if let Some(id) = to_remove {
+                self.remove_channel(id);
+                self.cache = None;
+                ui.close();
             }
         });
     }

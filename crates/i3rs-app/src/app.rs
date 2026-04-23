@@ -23,6 +23,7 @@ use crate::panels::report::ReportPanel;
 use crate::panels::scatter::ScatterPanel;
 use crate::panels::timeline::TimelinePanel;
 use crate::panels::track_map::TrackMapPanel;
+use crate::panels::utils::resolve_channel_meta;
 use crate::panels::{AppTabViewer, PanelTab};
 use crate::preferences::{AppPreferences, ThemeChoice};
 use crate::state::SharedState;
@@ -219,7 +220,7 @@ impl App {
             crate::workspace::save_workspace(&ws_refs, self.active_worksheet, &self.shared);
 
         if include_popped_out_track_maps {
-            // Include popped-out track maps in the active worksheet so they're preserved.
+            // Preserve popped-out track maps in the worksheet they came from.
             for tm in &self.popped_out_track_maps {
                 let color_channel_name = tm.color_channel_idx.and_then(|idx| {
                     self.shared
@@ -227,7 +228,8 @@ impl App {
                         .as_ref()
                         .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
                 });
-                if let Some(ws) = workspace.worksheets.get_mut(self.active_worksheet) {
+                let worksheet_idx = tm.home_worksheet.min(workspace.worksheets.len().saturating_sub(1));
+                if let Some(ws) = workspace.worksheets.get_mut(worksheet_idx) {
                     ws.panels.push(crate::workspace::PanelConfig::TrackMap(
                         crate::workspace::TrackMapPanelConfig {
                             id: tm.id,
@@ -1387,7 +1389,8 @@ impl App {
     fn add_track_map_panel(&mut self) {
         let id = self.shared.next_panel_id;
         self.shared.next_panel_id += 1;
-        let track_map = TrackMapPanel::new(id, format!("Track Map {}", id));
+        let mut track_map = TrackMapPanel::new(id, format!("Track Map {}", id));
+        track_map.home_worksheet = self.active_worksheet;
         self.worksheets[self.active_worksheet]
             .dock_state
             .push_to_focused_leaf(PanelTab::TrackMap(track_map));
@@ -1781,6 +1784,48 @@ impl App {
         });
     }
 
+    fn draw_dragging_channel_badge(&self, ctx: &egui::Context) {
+        let Some(channel_id) = self.shared.dragging_channel else {
+            return;
+        };
+        let Some(pointer_pos) = ctx.input(|i| i.pointer.latest_pos()) else {
+            return;
+        };
+
+        let (name, unit, _, _) = resolve_channel_meta(channel_id, &self.shared);
+        let label = if unit.is_empty() {
+            name
+        } else {
+            format!("{name} [{unit}]")
+        };
+
+        let layer_id = egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("dragging_channel_badge"),
+        );
+        let painter = ctx.layer_painter(layer_id);
+        let font = egui::FontId::proportional(14.0);
+        let galley = painter.layout_no_wrap(label, font.clone(), egui::Color32::WHITE);
+        let padding = egui::vec2(10.0, 6.0);
+        let badge_rect = egui::Rect::from_min_size(
+            pointer_pos + egui::vec2(14.0, 14.0),
+            galley.size() + padding * 2.0,
+        );
+
+        painter.rect_filled(
+            badge_rect,
+            8.0,
+            egui::Color32::from_rgba_premultiplied(18, 18, 24, 230),
+        );
+        painter.rect_stroke(
+            badge_rect,
+            8.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+            egui::StrokeKind::Outside,
+        );
+        painter.galley(badge_rect.min + padding, galley, egui::Color32::WHITE);
+    }
+
     /// Draw a collapsed panel strip with vertical text. Returns true if clicked to expand.
     fn collapsed_panel_strip(ui: &mut egui::Ui, label: &str) -> bool {
         let size = ui.available_size();
@@ -2018,6 +2063,14 @@ impl eframe::App for App {
             .draggable_tabs(true)
             .show_inside(ui, &mut viewer);
 
+        if self.shared.dragging_channel.is_some() {
+            if ui.input(|i| i.pointer.any_released()) {
+                self.shared.dragging_channel = None;
+            } else {
+                self.draw_dragging_channel_badge(ui.ctx());
+            }
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         // Pop-out: move track map panels that requested pop-out from dock to separate windows
         let dock = &mut self.worksheets[self.active_worksheet].dock_state;
@@ -2028,6 +2081,7 @@ impl eframe::App for App {
             if let Some(PanelTab::TrackMap(mut tm)) = dock.remove_tab(path) {
                 tm.pop_out_requested = false;
                 tm.is_popped_out = true;
+                tm.home_worksheet = self.active_worksheet;
                 self.popped_out_track_maps.push(tm);
             } else {
                 break;
@@ -2056,7 +2110,6 @@ impl eframe::App for App {
         #[cfg(not(target_arch = "wasm32"))]
         {
             // Dock-back: return panels that requested docking to the main dock
-            let dock = &mut self.worksheets[self.active_worksheet].dock_state;
             let (to_dock, to_keep): (Vec<_>, Vec<_>) = self
                 .popped_out_track_maps
                 .drain(..)
@@ -2065,7 +2118,10 @@ impl eframe::App for App {
             for mut tm in to_dock {
                 tm.dock_requested = false;
                 tm.is_popped_out = false;
-                dock.push_to_focused_leaf(PanelTab::TrackMap(tm));
+                let worksheet_idx = tm.home_worksheet.min(self.worksheets.len().saturating_sub(1));
+                self.worksheets[worksheet_idx]
+                    .dock_state
+                    .push_to_focused_leaf(PanelTab::TrackMap(tm));
             }
         }
 

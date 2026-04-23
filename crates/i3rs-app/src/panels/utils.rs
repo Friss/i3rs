@@ -347,6 +347,23 @@ pub fn show_plotted_channel_display_menu(
         ui.close();
     }
 
+    ui.separator();
+    ui.label("Color:");
+    for (i, &color) in CHANNEL_COLORS.iter().enumerate() {
+        let label = format!("Color {}", i + 1);
+        let resp = ui.selectable_label(channel.color == color, &label);
+        let rect = resp.rect;
+        let swatch = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - 14.0, rect.center().y - 5.0),
+            egui::vec2(10.0, 10.0),
+        );
+        ui.painter().rect_filled(swatch, 2.0, color);
+        if resp.clicked() {
+            channel.color = color;
+            ui.close();
+        }
+    }
+
     let presets = display_presets_for_unit(&raw_unit);
     if !presets.is_empty() || channel.display_unit.is_some() {
         ui.separator();
@@ -379,13 +396,13 @@ pub fn show_plotted_channel_display_menu(
     let pref_key = channel_preference_key(&name);
     let has_global_pref = shared.channel_preferences.contains_key(&pref_key);
     ui.separator();
-    if ui
-        .button("Save current display as global default")
-        .clicked()
-    {
+    if ui.button("Save current style as global default").clicked() {
         shared.channel_preferences.insert(
             pref_key.clone(),
-            merged_display_preference(shared.channel_preferences.get(&pref_key), channel),
+            ChannelPreference {
+                color: Some([channel.color.r(), channel.color.g(), channel.color.b()]),
+                ..merged_display_preference(shared.channel_preferences.get(&pref_key), channel)
+            },
         );
         shared.channel_preferences_dirty = true;
         ui.close();

@@ -112,111 +112,144 @@ impl GaugePanel {
                 .push(build_plotted_channel_info(&gc.channel, shared));
         }
 
-        egui::ScrollArea::both()
-            .auto_shrink([false, false])
+        let spacing = 8.0_f32;
+        let clip_rect = ui.clip_rect();
+        let available_width = ui.available_width().min(clip_rect.width()).max(1.0);
+        let available_height = (clip_rect.bottom() - ui.cursor().top()).max(1.0);
+        let (cols, gauge_size) = best_gauge_grid(
+            self.gauges.len(),
+            available_width,
+            available_height,
+            spacing,
+        );
+
+        egui::Grid::new(format!("gauge_grid_{}", self.id))
+            .num_columns(cols)
+            .spacing([spacing, spacing])
             .show(ui, |ui| {
-                // Layout gauges in a grid
-                let available_width = ui.available_width();
-                let gauge_size = 200.0_f32;
-                let cols = (available_width / gauge_size).floor().max(1.0) as usize;
+                let mut context_action = None;
 
-                egui::Grid::new(format!("gauge_grid_{}", self.id))
-                    .num_columns(cols)
-                    .spacing([8.0, 8.0])
-                    .show(ui, |ui| {
-                        let mut context_action = None;
-
-                        for (i, gc) in self.gauges.iter().enumerate() {
-                            let (name, unit, freq, dec_places, enum_labels) =
-                                resolve_plotted_channel_display_meta(&gc.channel, shared);
-                            let raw_value = shared
-                                .cursor_time
-                                .and_then(|t| interp_at_time(&gc.channel.data, freq, t));
-                            let discrete = !enum_labels.is_empty();
-                            let value = raw_value.map(|v| {
-                                if discrete {
-                                    v
-                                } else {
-                                    v * gc.channel.display_scale + gc.channel.display_offset
-                                }
-                            });
-                            let mut min = gc.channel.cached_min * gc.channel.display_scale
-                                + gc.channel.display_offset;
-                            let mut max = gc.channel.cached_max * gc.channel.display_scale
-                                + gc.channel.display_offset;
-                            if gc.channel.display_scale < 0.0 {
-                                std::mem::swap(&mut min, &mut max);
-                            }
-
-                            let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(gauge_size, gauge_size),
-                                egui::Sense::click(),
-                            );
-
-                            // Context menu for style change / removal
-                            response.context_menu(|ui| {
-                                ui.label(&name);
-                                ui.separator();
-                                if ui.button("Analog").clicked() {
-                                    context_action = Some((i, Some(GaugeStyle::Analog)));
-                                    ui.close();
-                                }
-                                if ui.button("Bar").clicked() {
-                                    context_action = Some((i, Some(GaugeStyle::Bar)));
-                                    ui.close();
-                                }
-                                if ui.button("Digital").clicked() {
-                                    context_action = Some((i, Some(GaugeStyle::Digital)));
-                                    ui.close();
-                                }
-                                if ui.button("Steering Wheel").clicked() {
-                                    context_action = Some((i, Some(GaugeStyle::SteeringWheel)));
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if ui.button("Remove").clicked() {
-                                    context_action = Some((i, None));
-                                    ui.close();
-                                }
-                            });
-
-                            let painter = ui.painter_at(rect);
-
-                            let ctx = GaugeDrawContext {
-                                name: &name,
-                                unit: &unit,
-                                value,
-                                min,
-                                max,
-                                dec_places,
-                                color: gc.channel.color,
-                            };
-
-                            match gc.style {
-                                GaugeStyle::Analog => draw_analog_gauge(&painter, rect, &ctx),
-                                GaugeStyle::Bar => draw_bar_gauge(&painter, rect, &ctx),
-                                GaugeStyle::Digital => draw_digital_gauge(&painter, rect, &ctx),
-                                GaugeStyle::SteeringWheel => {
-                                    draw_steering_wheel(&painter, rect, &ctx)
-                                }
-                            }
-
-                            if (i + 1) % cols == 0 {
-                                ui.end_row();
-                            }
-                        }
-
-                        // Apply context menu action
-                        if let Some((idx, action)) = context_action {
-                            if let Some(style) = action {
-                                self.gauges[idx].style = style;
-                            } else {
-                                self.gauges.remove(idx);
-                            }
+                for (i, gc) in self.gauges.iter().enumerate() {
+                    let (name, unit, freq, dec_places, enum_labels) =
+                        resolve_plotted_channel_display_meta(&gc.channel, shared);
+                    let raw_value = shared
+                        .cursor_time
+                        .and_then(|t| interp_at_time(&gc.channel.data, freq, t));
+                    let discrete = !enum_labels.is_empty();
+                    let value = raw_value.map(|v| {
+                        if discrete {
+                            v
+                        } else {
+                            v * gc.channel.display_scale + gc.channel.display_offset
                         }
                     });
+                    let mut min = gc.channel.cached_min * gc.channel.display_scale
+                        + gc.channel.display_offset;
+                    let mut max = gc.channel.cached_max * gc.channel.display_scale
+                        + gc.channel.display_offset;
+                    if gc.channel.display_scale < 0.0 {
+                        std::mem::swap(&mut min, &mut max);
+                    }
+
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(gauge_size, gauge_size),
+                        egui::Sense::click(),
+                    );
+
+                    // Context menu for style change / removal
+                    response.context_menu(|ui| {
+                        ui.label(&name);
+                        ui.separator();
+                        if ui.button("Analog").clicked() {
+                            context_action = Some((i, Some(GaugeStyle::Analog)));
+                            ui.close();
+                        }
+                        if ui.button("Bar").clicked() {
+                            context_action = Some((i, Some(GaugeStyle::Bar)));
+                            ui.close();
+                        }
+                        if ui.button("Digital").clicked() {
+                            context_action = Some((i, Some(GaugeStyle::Digital)));
+                            ui.close();
+                        }
+                        if ui.button("Steering Wheel").clicked() {
+                            context_action = Some((i, Some(GaugeStyle::SteeringWheel)));
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Remove").clicked() {
+                            context_action = Some((i, None));
+                            ui.close();
+                        }
+                    });
+
+                    let painter = ui.painter_at(rect);
+
+                    let ctx = GaugeDrawContext {
+                        name: &name,
+                        unit: &unit,
+                        value,
+                        min,
+                        max,
+                        dec_places,
+                        color: gc.channel.color,
+                    };
+
+                    match gc.style {
+                        GaugeStyle::Analog => draw_analog_gauge(&painter, rect, &ctx),
+                        GaugeStyle::Bar => draw_bar_gauge(&painter, rect, &ctx),
+                        GaugeStyle::Digital => draw_digital_gauge(&painter, rect, &ctx),
+                        GaugeStyle::SteeringWheel => draw_steering_wheel(&painter, rect, &ctx),
+                    }
+
+                    if (i + 1) % cols == 0 {
+                        ui.end_row();
+                    }
+                }
+
+                // Apply context menu action
+                if let Some((idx, action)) = context_action {
+                    if let Some(style) = action {
+                        self.gauges[idx].style = style;
+                    } else {
+                        self.gauges.remove(idx);
+                    }
+                }
             });
     }
+}
+
+pub(crate) fn best_gauge_grid(
+    count: usize,
+    available_width: f32,
+    available_height: f32,
+    spacing: f32,
+) -> (usize, f32) {
+    let count = count.max(1);
+    let available_width = available_width.max(1.0);
+    let available_height = available_height.max(1.0);
+
+    let mut best_cols = 1;
+    let mut best_size = 1.0_f32;
+
+    for cols in 1..=count {
+        let rows = count.div_ceil(cols);
+        let width_budget = available_width - spacing * (cols.saturating_sub(1)) as f32;
+        let height_budget = available_height - spacing * (rows.saturating_sub(1)) as f32;
+        if width_budget <= 0.0 || height_budget <= 0.0 {
+            continue;
+        }
+
+        let candidate = (width_budget / cols as f32)
+            .min(height_budget / rows as f32)
+            .min(200.0);
+        if candidate > best_size {
+            best_size = candidate;
+            best_cols = cols;
+        }
+    }
+
+    (best_cols, best_size.max(1.0))
 }
 
 /// Display parameters for drawing a gauge.

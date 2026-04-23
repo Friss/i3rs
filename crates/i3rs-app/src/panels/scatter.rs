@@ -3,7 +3,7 @@
 use eframe::egui;
 use egui_plot::{Legend, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, Points};
 
-use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState};
+use crate::state::{ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
     DisplayTransformFingerprint, build_plotted_channel_info, create_plotted_channel,
@@ -87,6 +87,24 @@ impl ScatterPanel {
         }
     }
 
+    fn sync_series_color_from_x(&mut self) {
+        let Some(color) = self.x_channel.as_ref().map(|channel| channel.color) else {
+            return;
+        };
+        if let Some(channel) = self.y_channel.as_mut() {
+            channel.color = color;
+        }
+    }
+
+    fn sync_series_color_from_y(&mut self) {
+        let Some(color) = self.y_channel.as_ref().map(|channel| channel.color) else {
+            return;
+        };
+        if let Some(channel) = self.x_channel.as_mut() {
+            channel.color = color;
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
         let _perf = crate::perf_metrics::scope("scatter draw");
 
@@ -115,13 +133,17 @@ impl ScatterPanel {
         ui.horizontal(|ui| {
             ui.label("X:");
             let mut clear_x = false;
+            let mut sync_x_color = false;
             if let Some(channel) = self.x_channel.as_mut() {
                 let (x_name, _, _, _, _) = resolve_plotted_channel_display_meta(channel, shared);
                 let (x_resp, clear_clicked) =
                     segmented_channel_button(ui, &x_name, None, "Clear X channel");
                 x_resp.context_menu(|ui| {
+                    let old_color = channel.color;
                     if show_plotted_channel_display_menu(ui, channel, shared) {
                         clear_x = true;
+                    } else if channel.color != old_color {
+                        sync_x_color = true;
                     }
                 });
                 if clear_clicked {
@@ -133,17 +155,23 @@ impl ScatterPanel {
             if clear_x {
                 self.x_channel = None;
                 self.cache = None;
+            } else if sync_x_color {
+                self.sync_series_color_from_x();
             }
 
             ui.label("Y:");
             let mut clear_y = false;
+            let mut sync_y_color = false;
             if let Some(channel) = self.y_channel.as_mut() {
                 let (y_name, _, _, _, _) = resolve_plotted_channel_display_meta(channel, shared);
                 let (y_resp, clear_clicked) =
                     segmented_channel_button(ui, &y_name, None, "Clear Y channel");
                 y_resp.context_menu(|ui| {
+                    let old_color = channel.color;
                     if show_plotted_channel_display_menu(ui, channel, shared) {
                         clear_y = true;
+                    } else if channel.color != old_color {
+                        sync_y_color = true;
                     }
                 });
                 if clear_clicked {
@@ -155,6 +183,8 @@ impl ScatterPanel {
             if clear_y {
                 self.y_channel = None;
                 self.cache = None;
+            } else if sync_y_color {
+                self.sync_series_color_from_y();
             }
 
             ui.label("Size:");
@@ -203,7 +233,11 @@ impl ScatterPanel {
 
         // Build scatter points, resampling to the lower frequency
         let target_freq = x_freq.min(y_freq);
-        let color = CHANNEL_COLORS[4]; // purple for scatter
+        let color = self
+            .y_channel
+            .as_ref()
+            .map(|channel| channel.color)
+            .unwrap_or(egui::Color32::WHITE);
 
         // Get time range for visible data
         let (t0, t1) = shared
@@ -259,7 +293,7 @@ impl ScatterPanel {
 
         let series_name = format!("{} vs {}", y_name, x_name);
 
-        plot.show(ui, |plot_ui| {
+        let plot_response = plot.show(ui, |plot_ui| {
             plot_ui.points(
                 Points::new(&series_name, PlotPoints::Borrowed(plot_points.as_slice()))
                     .shape(MarkerShape::Circle)
@@ -293,6 +327,49 @@ impl ScatterPanel {
             {
                 let clamped = clamp_plot_bounds(plot_ui.plot_bounds(), allowed_bounds);
                 plot_ui.set_plot_bounds(clamped);
+            }
+        });
+
+        plot_response.response.context_menu(|ui| {
+            let mut clear_x = false;
+            let mut sync_x_color = false;
+            if let Some(channel) = self.x_channel.as_mut() {
+                ui.menu_button("X Channel", |ui| {
+                    let old_color = channel.color;
+                    if show_plotted_channel_display_menu(ui, channel, shared) {
+                        clear_x = true;
+                    } else if channel.color != old_color {
+                        sync_x_color = true;
+                    }
+                });
+            }
+
+            let mut clear_y = false;
+            let mut sync_y_color = false;
+            if let Some(channel) = self.y_channel.as_mut() {
+                ui.menu_button("Y Channel", |ui| {
+                    let old_color = channel.color;
+                    if show_plotted_channel_display_menu(ui, channel, shared) {
+                        clear_y = true;
+                    } else if channel.color != old_color {
+                        sync_y_color = true;
+                    }
+                });
+            }
+
+            if clear_x {
+                self.x_channel = None;
+                self.cache = None;
+                ui.close();
+            } else if sync_x_color {
+                self.sync_series_color_from_x();
+            }
+            if clear_y {
+                self.y_channel = None;
+                self.cache = None;
+                ui.close();
+            } else if sync_y_color {
+                self.sync_series_color_from_y();
             }
         });
 
