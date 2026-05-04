@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
+use web_sys::{Document, Element, HtmlCanvasElement};
 
 thread_local! {
     static WEB_HANDLE: RefCell<Option<WebHandle>> = const { RefCell::new(None) };
@@ -28,10 +29,7 @@ impl WebHandle {
     }
 
     #[wasm_bindgen]
-    pub async fn start(
-        &self,
-        canvas: web_sys::HtmlCanvasElement,
-    ) -> Result<(), wasm_bindgen::JsValue> {
+    pub async fn start(&self, canvas: HtmlCanvasElement) -> Result<(), wasm_bindgen::JsValue> {
         self.runner
             .start(
                 canvas,
@@ -88,6 +86,35 @@ impl WebHandle {
     }
 }
 
+fn focus_element(element: &Element) {
+    if let Some(element) = element.dyn_ref::<web_sys::HtmlElement>() {
+        element.focus().ok();
+    }
+}
+
+fn blur_element(element: &Element) {
+    if let Some(element) = element.dyn_ref::<web_sys::HtmlElement>() {
+        element.blur().ok();
+    }
+}
+
+fn is_body_element(document: &Document, element: &Element) -> bool {
+    document
+        .body()
+        .is_some_and(|body| element.is_same_node(Some(body.as_ref())))
+}
+
+fn restore_startup_focus(document: &Document, previous_focus: Option<Element>) {
+    match previous_focus {
+        Some(element) if !is_body_element(document, &element) => focus_element(&element),
+        _ => {
+            if let Some(active_element) = document.active_element() {
+                blur_element(&active_element);
+            }
+        }
+    }
+}
+
 #[wasm_bindgen(start)]
 pub fn bootstrap() -> Result<(), wasm_bindgen::JsValue> {
     let window =
@@ -106,10 +133,14 @@ pub fn bootstrap() -> Result<(), wasm_bindgen::JsValue> {
     });
 
     wasm_bindgen_futures::spawn_local(async move {
+        let previous_focus = document.active_element();
+
         if let Err(err) = handle.start(canvas).await {
             log::error!("failed to start web app: {err:?}");
             return;
         }
+
+        restore_startup_focus(&document, previous_focus);
 
         if let Some(window) = web_sys::window() {
             let handle_for_js = handle.clone();

@@ -1,5 +1,7 @@
 //! Native executable entry point for the i3rs app.
 
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     let file_path = std::env::args().nth(1).map(std::path::PathBuf::from);
