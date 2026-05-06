@@ -18,3 +18,7 @@ dist
 
 examples/**
 .claude/**
+
+# Local validation fixture; too large for normal repository fixtures.
+test_data/S1_#28299_20260415_110834_2.ld
+test_data/S1_#28299_20260415_110834_2.ldx

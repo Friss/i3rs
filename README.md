@@ -88,11 +88,46 @@ The release workflow also publishes this bundle as a GitHub release asset named 
 
 ### CLI
 
-Print session metadata and channel statistics (min/max/mean) for a log file:
+Print the legacy text summary for a log file:
 
 ```bash
 cargo run --release -p i3rs-cli -- path/to/session.ld
 ```
+
+When installed, the executable is named `i3rs`; the examples below use
+`cargo run` for source-tree development.
+
+The CLI also exposes machine-readable commands for agentic/session analysis:
+
+```bash
+# Session metadata, channels, and lap windows
+cargo run --release -p i3rs-cli -- summary path/to/session.ld --format json
+cargo run --release -p i3rs-cli -- channels path/to/session.ld --filter speed --format json
+cargo run --release -p i3rs-cli -- laps path/to/session.ld --format json
+
+# Extract how values change through a lap instead of relying only on min/max
+cargo run --release -p i3rs-cli -- extract path/to/session.ld \
+  --channel "Engine Speed" --channel "Throttle Position" \
+  --lap "Lap 1" --x lap-percent --resample points:200 --format csv
+
+# Per-lap statistics and lap-to-lap comparison
+cargo run --release -p i3rs-cli -- stats path/to/session.ld \
+  --channel "Engine Speed" --group lap --format json
+cargo run --release -p i3rs-cli -- compare-laps path/to/session.ld \
+  --channel "Engine Speed" --laps "Lap 1,Lap 2" \
+  --reference "Lap 1" --x lap-percent --resample points:200 --format json
+```
+
+See [`docs/cli-analysis.md`](docs/cli-analysis.md) for command output shapes and the repeatable `run` spec format.
+
+Show CLI help or install agent skill files for the CLI:
+
+```bash
+cargo run --release -p i3rs-cli -- help
+cargo run --release -p i3rs-cli -- install-skill
+```
+
+`install-skill` writes `$CWD/.agents/skills/i3rs/SKILL.md` and `$CWD/.claude/skills/i3rs/SKILL.md`.
 
 ## Project Structure
 
@@ -103,6 +138,7 @@ crates/
   i3rs-cli/     Command-line file inspector
 docs/
   PLAN.md           Development roadmap (Milestones 1-9)
+  cli-analysis.md   Machine-readable CLI command reference
   ld-file-format.md MoTeC .ld binary format specification
 test_data/
   VIR_LAP.ld        Sample telemetry log (~4.8MB, single lap at Virginia International Raceway)
