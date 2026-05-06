@@ -11,6 +11,8 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::state_labels::state_channel_labels;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -549,7 +551,7 @@ fn parse_channel_metadata(
         // Extract enum reference from extended metadata:
         //   +208: u16 enum_type (0x0002 = uses enum table)
         //   +210: u16 enum_id   (indexes into parsed enum tables)
-        let enum_labels =
+        let mut enum_labels =
             if off + CHAN_RECORD_SIZE <= data.len() && read_u16(data, off + 208) == 0x0002 {
                 let enum_id = read_u16(data, off + 210);
                 enum_tables
@@ -559,6 +561,11 @@ fn parse_channel_metadata(
             } else {
                 Arc::new(HashMap::new())
             };
+        if enum_labels.is_empty()
+            && let Some(fallback_labels) = state_channel_labels(&name)
+        {
+            enum_labels = Arc::new(fallback_labels);
+        }
 
         channels.push(ChannelMeta {
             index: channels.len(),

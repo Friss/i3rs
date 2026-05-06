@@ -8,6 +8,10 @@ use std::path::Path;
 
 const TEST_LD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/VIR_LAP.ld");
 const TEST_LDX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/VIR_LAP.ldx");
+const TEST_S1_20260415_LD: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../test_data/S1_#28299_20260415_110834_2.ld"
+);
 
 // ---------------------------------------------------------------------------
 // .ld file parsing
@@ -438,4 +442,29 @@ fn enum_labels_parsed_for_state_channels() {
     let label = ld.format_channel_value(esls, 0.0);
     assert!(label.is_some(), "ESLS value 0 should have a label");
     eprintln!("ESLS value 0 = {:?}", label);
+}
+
+#[test]
+#[ignore = "requires local S1 validation fixture that is not checked in"]
+fn warning_source_uses_fallback_enum_labels_when_file_has_no_enum_ref() {
+    let ld = LdFile::open(TEST_S1_20260415_LD).expect("failed to open .ld file");
+
+    let warning_source = ld
+        .channels
+        .iter()
+        .find(|c| c.name == "Warning Source")
+        .expect("Warning Source channel not found");
+
+    assert_eq!(
+        warning_source.enum_labels.get(&0).map(String::as_str),
+        Some("None")
+    );
+    assert_eq!(
+        warning_source.enum_labels.get(&1).map(String::as_str),
+        Some("Engine Oil Pressure Warning")
+    );
+    assert_eq!(
+        ld.format_channel_value(warning_source, 1.0),
+        Some("Engine Oil Pressure Warning")
+    );
 }

@@ -13,3 +13,10 @@ categories = ["command-line-utilities", "science"]
 
 [dependencies]
 i3rs-core = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "i3rs"
+path = "src/main.rs"
