@@ -8,7 +8,7 @@ use i3rs_core::Sector;
 use crate::panels::PanelTab;
 use crate::panels::fft::FftPanel;
 use crate::panels::gauge::{GaugePanel, GaugeStyle};
-use crate::panels::graph::{GraphPanel, OverlaySource};
+use crate::panels::graph::{EmbeddedTrack, GraphPanel, OverlaySource};
 use crate::panels::histogram::HistogramPanel;
 use crate::panels::mixture_map::MixtureMapPanel;
 use crate::panels::scatter::ScatterPanel;
@@ -80,6 +80,8 @@ pub struct GraphPanelConfig {
     pub overlays: Vec<GraphOverlayConfig>,
     #[serde(default)]
     pub embedded_gauges: Vec<GraphGaugeConfig>,
+    #[serde(default)]
+    pub embedded_track: Option<GraphEmbeddedTrackConfig>,
     #[serde(default = "default_graph_embedded_gauge_height")]
     pub embedded_gauge_height: f32,
     /// Whether each channel is a math channel (true) or physical (false).
@@ -130,6 +132,11 @@ pub struct GraphGaugeConfig {
     pub channel_name: String,
     pub is_math: bool,
     pub style: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GraphEmbeddedTrackConfig {
+    pub color_channel_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -397,6 +404,11 @@ pub fn save_workspace(
                                 })
                             })
                             .collect();
+                        let embedded_track = g.embedded_track.as_ref().map(|track| {
+                            GraphEmbeddedTrackConfig {
+                                color_channel_name: track.color_channel_name.clone(),
+                            }
+                        });
                         PanelConfig::Graph(GraphPanelConfig {
                             id: g.id,
                             title: g.title.clone(),
@@ -414,6 +426,7 @@ pub fn save_workspace(
                             reference_lap: g.reference_lap,
                             overlays,
                             embedded_gauges,
+                            embedded_track,
                             embedded_gauge_height: g.embedded_gauge_height,
                             is_math,
                             display_transforms,
@@ -421,7 +434,7 @@ pub fn save_workspace(
                         })
                     }
                     PanelTab::TrackMap(t) => {
-                        let color_channel_name = t.color_channel_idx.and_then(|idx| {
+                        let color_channel_name = t.color_channel_idx().and_then(|idx| {
                             shared
                                 .ld_file
                                 .as_ref()
@@ -714,6 +727,13 @@ pub fn load_workspace(
                             }
                         }
 
+                        if let Some(track_cfg) = &gc.embedded_track {
+                            graph.embedded_track = Some(EmbeddedTrack::new(
+                                track_cfg.color_channel_name.clone(),
+                                shared,
+                            ));
+                        }
+
                         for overlay in &gc.overlays {
                             let source = if let Some(path) = &overlay.file_path {
                                 let path = std::path::PathBuf::from(path);
@@ -749,7 +769,7 @@ pub fn load_workspace(
                             && let Some(idx) =
                                 ld.channels.iter().position(|ch| &ch.name == color_name)
                         {
-                            track_map.color_channel_idx = Some(idx);
+                            track_map.set_color_channel_idx(Some(idx));
                         }
                         if tc.id >= shared.next_panel_id {
                             shared.next_panel_id = tc.id + 1;

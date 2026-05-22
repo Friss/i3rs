@@ -220,6 +220,7 @@ mod tests {
                         },
                     ],
                     embedded_gauges: vec![],
+                    embedded_track: None,
                     embedded_gauge_height: 176.0,
                     is_math: vec![],
                     display_transforms: vec![],

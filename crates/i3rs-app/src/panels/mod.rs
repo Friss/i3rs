@@ -12,6 +12,7 @@ pub mod report;
 pub mod scatter;
 pub mod timeline;
 pub mod track_map;
+pub mod track_widget;
 pub mod utils;
 
 use eframe::egui;

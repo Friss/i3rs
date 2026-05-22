@@ -19,6 +19,7 @@ use crate::state::{
 use super::gauge::{
     GaugeChannel, GaugeDrawContext, GaugeStyle, best_gauge_grid, default_style_for_name, draw_gauge,
 };
+use super::track_widget::{TrackPlotOptions, TrackWidgetState};
 use super::utils::{
     ChannelDisplayMeta, DisplayTransformFingerprint, build_plotted_channel_info,
     create_plotted_channel, display_transform_fingerprint, interp_at_time, refresh_plotted_channel,
@@ -362,12 +363,34 @@ enum ManageChannelsAction {
     Remove(ChannelId),
 }
 
+/// Embedded mini track map in the graph gauge row (persisted via workspace JSON).
+pub struct EmbeddedTrack {
+    pub color_channel_name: Option<String>,
+    pub widget: TrackWidgetState,
+}
+
+impl EmbeddedTrack {
+    pub fn new(color_channel_name: Option<String>, shared: &SharedState) -> Self {
+        let mut widget = TrackWidgetState::new();
+        widget.set_color_channel_by_name(color_channel_name.clone(), shared);
+        Self {
+            color_channel_name,
+            widget,
+        }
+    }
+
+    pub fn new_default(shared: &SharedState) -> Self {
+        Self::new(TrackWidgetState::default_color_channel_name(shared), shared)
+    }
+}
+
 /// A single graph panel with its own set of plotted channels.
 pub struct GraphPanel {
     pub id: u64,
     pub title: String,
     pub plotted_channels: Vec<PlottedChannel>,
     pub embedded_gauges: Vec<GaugeChannel>,
+    pub embedded_track: Option<EmbeddedTrack>,
     pub colors: Vec<egui::Color32>,
     pub graph_mode: GraphMode,
     pub x_axis_mode: GraphXAxis,
@@ -415,6 +438,7 @@ impl GraphPanel {
             title: title.into(),
             plotted_channels: Vec::new(),
             embedded_gauges: Vec::new(),
+            embedded_track: None,
             colors: CHANNEL_COLORS.to_vec(),
             graph_mode: GraphMode::Tiled,
             x_axis_mode: GraphXAxis::Time,
@@ -438,6 +462,7 @@ impl GraphPanel {
     pub fn reset_for_new_main_session(&mut self) {
         self.plotted_channels.clear();
         self.embedded_gauges.clear();
+        self.embedded_track = None;
         self.reference_lap = None;
         self.lap_overlays.clear();
         self.overlay_sessions.clear();
@@ -609,7 +634,7 @@ impl GraphPanel {
 
         self.retain_valid_overlay_state(shared);
         self.show_toolbar(ui, shared);
-        if !self.embedded_gauges.is_empty() {
+        if !self.embedded_gauges.is_empty() || self.embedded_track.is_some() {
             ui.add_space(4.0);
             let available_height = ui.available_height();
             let max_gauge_height = (available_height - 96.0).max(120.0);
@@ -625,7 +650,7 @@ impl GraphPanel {
                     .layout(*ui.layout()),
             );
             gauge_ui.set_clip_rect(gauge_rect);
-            self.show_embedded_gauges(&mut gauge_ui, shared);
+            self.show_embedded_gauge_row(&mut gauge_ui, shared);
             let gauge_resize_delta = self.show_resize_handle(ui).y;
             if gauge_resize_delta.abs() > 0.0 {
                 self.embedded_gauge_height = (self.embedded_gauge_height + gauge_resize_delta)
@@ -798,6 +823,20 @@ impl GraphPanel {
             {
                 self.embedded_gauges.clear();
             }
+
+            if ui
+                .add_enabled(self.embedded_track.is_none(), egui::Button::new("Add Track"))
+                .clicked()
+            {
+                self.embedded_track = Some(EmbeddedTrack::new_default(shared));
+            }
+
+            if ui
+                .add_enabled(self.embedded_track.is_some(), egui::Button::new("Remove Track"))
+                .clicked()
+            {
+                self.embedded_track = None;
+            }
         });
 
         if new_reference != self.reference_lap {
@@ -885,7 +924,7 @@ impl GraphPanel {
                 });
         }
 
-        if !self.embedded_gauges.is_empty() {
+        if !self.embedded_gauges.is_empty() || self.embedded_track.is_some() {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.weak("Panel gauges:");
@@ -911,29 +950,70 @@ impl GraphPanel {
                 if let Some(idx) = remove_idx {
                     self.embedded_gauges.remove(idx);
                 }
+
+                if let Some(track) = &mut self.embedded_track {
+                    let mut remove_track = false;
+                    ui.menu_button("Track", |ui| {
+                        let current = track
+                            .color_channel_name
+                            .as_deref()
+                            .unwrap_or("None");
+                        ui.label(format!("Color: {current}"));
+                        ui.separator();
+                        if ui.selectable_label(false, "None").clicked() {
+                            track.color_channel_name = None;
+                            track.widget.set_color_channel_by_name(None, shared);
+                            ui.close();
+                        }
+                        if let Some(ld) = &shared.ld_file {
+                            for ch in &ld.channels {
+                                if ui
+                                    .selectable_label(
+                                        track.color_channel_name.as_deref() == Some(&ch.name),
+                                        &ch.name,
+                                    )
+                                    .clicked()
+                                {
+                                    track.color_channel_name = Some(ch.name.clone());
+                                    track
+                                        .widget
+                                        .set_color_channel_by_name(Some(ch.name.clone()), shared);
+                                    ui.close();
+                                }
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Remove").clicked() {
+                            remove_track = true;
+                            ui.close();
+                        }
+                    });
+                    if remove_track {
+                        self.embedded_track = None;
+                    }
+                }
             });
         }
 
         ui.separator();
     }
 
-    fn show_embedded_gauges(&mut self, ui: &mut egui::Ui, shared: &SharedState) {
+    fn show_embedded_gauge_row(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
         let spacing = 8.0_f32;
         let clip_rect = ui.clip_rect();
         let available_width = ui.available_width().min(clip_rect.width()).max(1.0);
         let available_height = (clip_rect.bottom() - ui.cursor().top()).max(1.0);
-        let (cols, gauge_size) = best_gauge_grid(
-            self.embedded_gauges.len(),
-            available_width,
-            available_height,
-            spacing,
-        );
+        let widget_count = self.embedded_gauges.len() + usize::from(self.embedded_track.is_some());
+        let (cols, gauge_size) =
+            best_gauge_grid(widget_count, available_width, available_height, spacing);
 
+        let mut cell_idx = 0usize;
+        let mut remove_embedded_track = false;
         egui::Grid::new(format!("graph_embedded_gauges_{}", self.id))
             .num_columns(cols)
             .spacing([spacing, spacing])
             .show(ui, |ui| {
-                for (idx, gauge) in self.embedded_gauges.iter_mut().enumerate() {
+                for gauge in &mut self.embedded_gauges {
                     let (name, unit, freq, dec_places, enum_labels) =
                         resolve_plotted_channel_display_meta(&gauge.channel, shared);
                     let raw_value = shared
@@ -982,11 +1062,77 @@ impl GraphPanel {
                     };
                     draw_gauge(&painter, rect, gauge.style, &ctx);
 
-                    if (idx + 1) % cols == 0 {
+                    cell_idx += 1;
+                    if cell_idx % cols == 0 {
+                        ui.end_row();
+                    }
+                }
+
+                if self.embedded_track.is_some() {
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(gauge_size, gauge_size),
+                        egui::Sense::click(),
+                    );
+                    response.context_menu(|ui| {
+                        ui.label("Track map");
+                        ui.separator();
+                        if ui.button("Remove Track").clicked() {
+                            remove_embedded_track = true;
+                            ui.close();
+                        }
+                    });
+                    if !remove_embedded_track {
+                        let track = self.embedded_track.as_mut().unwrap();
+                        track.widget.ensure_track_data(shared);
+                        if track.widget.track_data().is_some() {
+                            let options = TrackPlotOptions::embedded(format!(
+                                "graph_embedded_track_{}",
+                                self.id
+                            ));
+                            let _ = track.widget.show_plot_in_rect(
+                                ui,
+                                rect,
+                                shared,
+                                &options,
+                            );
+                        } else {
+                            let painter = ui.painter_at(rect);
+                            painter.text(
+                                egui::pos2(rect.center().x, rect.min.y + 10.0),
+                                egui::Align2::CENTER_TOP,
+                                "Track",
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::LIGHT_GRAY,
+                            );
+                            let center = egui::pos2(rect.center().x, rect.center().y + 6.0);
+                            if shared.is_track_data_build_pending() {
+                                painter.circle_filled(
+                                    center,
+                                    gauge_size * 0.08,
+                                    egui::Color32::from_gray(120),
+                                );
+                            } else {
+                                painter.text(
+                                    center,
+                                    egui::Align2::CENTER_CENTER,
+                                    "No GPS",
+                                    egui::FontId::proportional(11.0),
+                                    egui::Color32::from_gray(160),
+                                );
+                            }
+                        }
+                    }
+
+                    cell_idx += 1;
+                    if cell_idx % cols == 0 {
                         ui.end_row();
                     }
                 }
             });
+
+        if remove_embedded_track {
+            self.embedded_track = None;
+        }
     }
 
     fn load_external_overlay(&mut self) {
