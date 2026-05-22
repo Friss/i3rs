@@ -40,19 +40,20 @@ Three crates in `crates/`:
 ### i3rs-app (`crates/i3rs-app/src/`)
 - `app.rs` — Top-level `App` struct, egui-dock layout, file open logic, menu bar
 - `state.rs` — `SharedState`: cursor position, zoom range, selected lap, channel data cache, `ChannelId` (Physical/Math), `MathChannelDef`
-- `workspace.rs` — Save/load workspace layouts + math channels as JSON
-- `panels/graph.rs` — Main graph panel: multi-channel time-series, overlay/tiled modes, dual Y-axes, zoom/pan. Uses `ChannelId` for both physical and math channels
+- `workspace.rs` — Save/load workspace layouts + math channels as JSON. Graph panels persist `embedded_gauges` (`GraphGaugeConfig`), optional `embedded_track` (`GraphEmbeddedTrackConfig` with `color_channel_name`), and `embedded_gauge_height`
 - `panels/channel_browser.rs` — Searchable channel list with drag-and-drop, includes math channels section
 - `panels/cursor_readout.rs` — Shows all plotted channel values at cursor time (uses file-parsed enum labels with hardcoded fallback)
 - `default_layouts.rs` — Default i2-style worksheet templates (Driver, Braking, Engine, Fuel/Ign, Spare) auto-populated on file open
 - `panels/timeline.rs` — Overview bar with draggable zoom window
 - `panels/math_editor.rs` — Math channel definition UI: add/edit/delete/evaluate expressions, predefined calculation templates, channel alias management
 - `panels/report.rs` — Statistics report panel: min/max/avg/stddev per channel per lap
-- `panels/track_map.rs` — GPS track map panel: rainbow coloring by channel value, sector editor, sector time report, cursor sync, reference lap selection
+- `panels/graph.rs` — Main graph panel: multi-channel time-series, overlay/tiled modes, dual Y-axes, zoom/pan, distance X-axis. Uses `ChannelId` for physical and math channels. **Embedded gauge row** above plots: `embedded_gauges` (`GaugeChannel` + `GaugeStyle`), optional **`embedded_track`** (`EmbeddedTrack` + `TrackWidgetState`) as the last square cell; toolbar **Add Gauge** / **Add Track** / **Remove Track**; resizable band via `embedded_gauge_height`
+- `panels/track_widget.rs` — Shared GPS track rendering for full `TrackMapPanel` and embedded graph gauge cell: `TrackWidgetState`, `TrackPlotOptions` (embedded mode: no plot background, click sets `cursor_time`, gauge label). Draw helpers and caches for colored track line, cursor marker, sector markers
+- `panels/track_map.rs` — Full-size GPS track map dock panel (pop-out supported): rainbow coloring, sector editor, sector time report, cursor sync via `track_widget`. **View → Add Track Map** adds this panel; distinct from graph-embedded track
 - `panels/histogram.rs` — Distribution histogram with configurable bins, per-lap breakdown, cursor value lines
 - `panels/scatter.rs` — XY scatter plot (channel vs channel), cursor highlight point
 - `panels/fft.rs` — FFT frequency spectrum analysis with Hann window, log scale option, cached computation
-- `panels/gauge.rs` — Gauges panel: analog arc, bar, digital, and steering wheel angle widgets at cursor time
+- `panels/gauge.rs` — Gauge drawing (`GaugeStyle`: analog, bar, digital, steering wheel) and `best_gauge_grid` layout. Used by graph embedded gauge row and optional standalone **Gauges** dock panel (`GaugePanel`; channel list not persisted in workspace JSON)
 - `panels/mixture_map.rs` — 2D heatmap (e.g., AFR vs RPM vs TPS), binned with heat color scale
 
 ## Architecture Notes
@@ -62,6 +63,8 @@ Three crates in `crates/`:
 - All panels share state through `SharedState` for cursor/zoom synchronization
 - GUI uses immediate-mode rendering (egui) — redraws every frame during interaction
 - egui-dock provides the dockable/tabbable panel layout system
+- **Graph embedded gauge row**: square cells laid out with `best_gauge_grid`; values at `SharedState.cursor_time`. Mini track map reuses `SharedState` GPS cache (`request_track_data_build` / `track_data_if_ready`); embedded plot uses `show_background(false)` so it matches borderless analog/bar gauges
+- **Two gauge placements**: (1) `GraphPanel.embedded_gauges` / `embedded_track` — saved per graph in workspace JSON; (2) standalone `GaugePanel` tab — runtime-only unless channels re-added after load
 
 ## Binary Format
 
@@ -81,7 +84,8 @@ Full format docs: `docs/ld-file-format.md`
 - `test_data/VIR_LAP.ld` (~4.8MB) — single lap at Virginia International Raceway
 - `test_data/VIR_LAP.ldx` — accompanying lap metadata XML
 - `examples/` (gitignored) — larger files up to 100MB for manual testing
+- `BMW.workspace.json` (repo root) — BMW S1000RR worksheet example with graph `embedded_gauges` and `embedded_track` on the "1 Rider" worksheet
 
 ## Current Status
 
-Milestones 1–6 complete. Next up: Milestone 7 (overlays — compare laps across sessions).
+Upstream milestones through lap overlays and graph distance axis are implemented in this fork. BMW-focused work includes embedded gauge rows and optional mini track map in the graph panel gauge band (see `panels/graph.rs`, `panels/track_widget.rs`, `BMW.workspace.json`).

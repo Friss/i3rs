@@ -224,7 +224,7 @@ impl App {
         if include_popped_out_track_maps {
             // Preserve popped-out track maps in the worksheet they came from.
             for tm in &self.popped_out_track_maps {
-                let color_channel_name = tm.color_channel_idx.and_then(|idx| {
+                let color_channel_name = tm.color_channel_idx().and_then(|idx| {
                     self.shared
                         .ld_file
                         .as_ref()
