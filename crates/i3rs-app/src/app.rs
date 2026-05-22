@@ -22,6 +22,7 @@ use crate::panels::mixture_map::MixtureMapPanel;
 use crate::panels::report::ReportPanel;
 use crate::panels::scatter::ScatterPanel;
 use crate::panels::timeline::TimelinePanel;
+use crate::panels::motorcycle_chassis::MotorcycleChassisPanel;
 use crate::panels::track_map::TrackMapPanel;
 use crate::panels::utils::resolve_channel_meta;
 use crate::panels::{AppTabViewer, PanelTab};
@@ -128,6 +129,8 @@ pub struct App {
     math_editor_state: MathEditorState,
     /// Track map panels that have been popped out into separate OS windows.
     popped_out_track_maps: Vec<TrackMapPanel>,
+    /// Motorcycle chassis panels that have been popped out into separate OS windows.
+    popped_out_chassis_panels: Vec<MotorcycleChassisPanel>,
     project_path: Option<PathBuf>,
     project_name: Option<String>,
     project_sessions: Vec<ProjectSessionRecord>,
@@ -178,6 +181,7 @@ impl App {
             timeline: TimelinePanel::new(),
             math_editor_state: MathEditorState::new(),
             popped_out_track_maps: Vec::new(),
+            popped_out_chassis_panels: Vec::new(),
             project_path: None,
             project_name: None,
             project_sessions: Vec::new(),
@@ -239,6 +243,26 @@ impl App {
                             id: tm.id,
                             title: tm.title.clone(),
                             color_channel_name,
+                        },
+                    ));
+                }
+            }
+            // Preserve popped-out chassis panels in the worksheet they came from.
+            for panel in &self.popped_out_chassis_panels {
+                let worksheet_idx = panel
+                    .home_worksheet
+                    .min(workspace.worksheets.len().saturating_sub(1));
+                if let Some(ws) = workspace.worksheets.get_mut(worksheet_idx) {
+                    ws.panels.push(crate::workspace::PanelConfig::MotorcycleChassis(
+                        crate::workspace::MotorcycleChassisPanelConfig {
+                            id: panel.id,
+                            title: panel.title.clone(),
+                            motospec_path: panel.motospec_path.as_ref()
+                                .map(|p| p.to_string_lossy().into_owned()),
+                            motospec_column: 1,
+                            rr_pot_channel: panel.rr_pot_channel.clone(),
+                            fr_pot_channel: panel.fr_pot_channel.clone(),
+                            lean_channel: panel.lean_channel.clone(),
                         },
                     ));
                 }
@@ -1403,6 +1427,16 @@ impl App {
             .push_to_focused_leaf(PanelTab::TrackMap(track_map));
     }
 
+    fn add_motorcycle_chassis_panel(&mut self) {
+        let id = self.shared.next_panel_id;
+        self.shared.next_panel_id += 1;
+        let mut panel = MotorcycleChassisPanel::new(id, format!("Chassis {}", id));
+        panel.home_worksheet = self.active_worksheet;
+        self.worksheets[self.active_worksheet]
+            .dock_state
+            .push_to_focused_leaf(PanelTab::MotorcycleChassis(panel));
+    }
+
     fn add_histogram_panel(&mut self) {
         let id = self.shared.next_panel_id;
         self.shared.next_panel_id += 1;
@@ -1598,6 +1632,10 @@ impl App {
                 }
                 if ui.button("Add Track Map").clicked() {
                     self.add_track_map_panel();
+                    ui.close();
+                }
+                if ui.button("Add Motorcycle Chassis").clicked() {
+                    self.add_motorcycle_chassis_panel();
                     ui.close();
                 }
                 if ui.button("Add Histogram").clicked() {
@@ -2134,6 +2172,61 @@ impl eframe::App for App {
             }
         }
 
+        // --- Motorcycle chassis pop-out lifecycle ---
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let dock = &mut self.worksheets[self.active_worksheet].dock_state;
+            while let Some(path) = dock.find_tab_from(|t| {
+                matches!(t, PanelTab::MotorcycleChassis(c) if c.pop_out_requested)
+            }) {
+                if let Some(PanelTab::MotorcycleChassis(mut panel)) = dock.remove_tab(path) {
+                    panel.pop_out_requested = false;
+                    panel.is_popped_out = true;
+                    panel.home_worksheet = self.active_worksheet;
+                    self.popped_out_chassis_panels.push(panel);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let shared = &mut self.shared;
+            for panel in self.popped_out_chassis_panels.iter_mut() {
+                let viewport_id =
+                    egui::ViewportId::from_hash_of(format!("moto_chassis_{}", panel.id));
+                ui.ctx().show_viewport_immediate(
+                    viewport_id,
+                    egui::ViewportBuilder::default()
+                        .with_title(format!("Chassis — {}", panel.title))
+                        .with_inner_size([1000.0, 650.0]),
+                    |viewport_ui, _class| {
+                        panel.ui(viewport_ui, shared);
+                    },
+                );
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (to_dock, to_keep): (Vec<_>, Vec<_>) = self
+                .popped_out_chassis_panels
+                .drain(..)
+                .partition(|p| p.dock_requested);
+            self.popped_out_chassis_panels = to_keep;
+            for mut panel in to_dock {
+                panel.dock_requested = false;
+                panel.is_popped_out = false;
+                let worksheet_idx = panel
+                    .home_worksheet
+                    .min(self.worksheets.len().saturating_sub(1));
+                self.worksheets[worksheet_idx]
+                    .dock_state
+                    .push_to_focused_leaf(PanelTab::MotorcycleChassis(panel));
+            }
+        }
+
         self.show_channel_preferences_window(ui.ctx());
         self.show_session_details_window(ui.ctx());
         self.submit_requested_channel_decodes(ui.ctx());
@@ -2180,6 +2273,7 @@ mod tests {
             timeline: TimelinePanel::new(),
             math_editor_state: MathEditorState::new(),
             popped_out_track_maps: Vec::new(),
+            popped_out_chassis_panels: Vec::new(),
             project_path: None,
             project_name: None,
             project_sessions: Vec::new(),

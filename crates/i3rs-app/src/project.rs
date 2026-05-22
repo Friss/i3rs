@@ -170,7 +170,9 @@ fn resolve_path_string(path: &str, base_dir: &Path) -> String {
     } else {
         base_dir.join(path)
     };
-    resolved.to_string_lossy().to_string()
+    // Normalise to forward slashes so JSON-stored paths are consistent across
+    // platforms — Windows file APIs accept both separators.
+    resolved.to_string_lossy().replace('\\', "/")
 }
 
 fn push_unique_session(entries: &mut Vec<ProjectSessionEntry>, entry: ProjectSessionEntry) {

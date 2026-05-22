@@ -11,6 +11,7 @@ use crate::panels::gauge::{GaugePanel, GaugeStyle};
 use crate::panels::graph::{EmbeddedTrack, GraphPanel, OverlaySource};
 use crate::panels::histogram::HistogramPanel;
 use crate::panels::mixture_map::MixtureMapPanel;
+use crate::panels::motorcycle_chassis::MotorcycleChassisPanel;
 use crate::panels::scatter::ScatterPanel;
 use crate::panels::track_map::TrackMapPanel;
 use crate::panels::utils::{apply_channel_preferences, create_plotted_channel};
@@ -53,6 +54,7 @@ pub struct WorksheetConfig {
 pub enum PanelConfig {
     Graph(GraphPanelConfig),
     TrackMap(TrackMapPanelConfig),
+    MotorcycleChassis(MotorcycleChassisPanelConfig),
     ChannelBrowser,
     CursorReadout,
     Report(ReportPanelConfig),
@@ -158,6 +160,33 @@ pub struct TrackMapPanelConfig {
     pub title: String,
     pub color_channel_name: Option<String>,
 }
+
+/// Workspace configuration for the Motorcycle Chassis panel.
+#[derive(Serialize, Deserialize)]
+pub struct MotorcycleChassisPanelConfig {
+    pub id: u64,
+    pub title: String,
+    /// Path to the MotoSPEC MS1/MS3 chassis definition file, if one was loaded.
+    #[serde(default)]
+    pub motospec_path: Option<String>,
+    /// Setup column to load from the chassis file (1, 2, or 3).
+    #[serde(default = "default_motospec_column")]
+    pub motospec_column: u8,
+    /// MoTeC channel name for the rear suspension pot.
+    #[serde(default = "default_rr_pot_channel")]
+    pub rr_pot_channel: String,
+    /// MoTeC channel name for the front suspension pot.
+    #[serde(default = "default_fr_pot_channel")]
+    pub fr_pot_channel: String,
+    /// MoTeC channel name for lean angle.
+    #[serde(default = "default_lean_channel")]
+    pub lean_channel: String,
+}
+
+fn default_motospec_column() -> u8 { 1 }
+fn default_rr_pot_channel() -> String { "s_susp_rr".into() }
+fn default_fr_pot_channel() -> String { "s_susp_fr".into() }
+fn default_lean_channel() -> String { "phi_lean".into() }
 
 #[derive(Serialize, Deserialize)]
 pub struct HistogramPanelConfig {
@@ -444,6 +473,18 @@ pub fn save_workspace(
                             id: t.id,
                             title: t.title.clone(),
                             color_channel_name,
+                        })
+                    }
+                    PanelTab::MotorcycleChassis(c) => {
+                        PanelConfig::MotorcycleChassis(MotorcycleChassisPanelConfig {
+                            id: c.id,
+                            title: c.title.clone(),
+                            motospec_path: c.motospec_path.as_ref()
+                                .map(|p| p.to_string_lossy().into_owned()),
+                            motospec_column: c.motospec_column,
+                            rr_pot_channel: c.rr_pot_channel.clone(),
+                            fr_pot_channel: c.fr_pot_channel.clone(),
+                            lean_channel: c.lean_channel.clone(),
                         })
                     }
                     PanelTab::ChannelBrowser => PanelConfig::ChannelBrowser,
@@ -775,6 +816,24 @@ pub fn load_workspace(
                             shared.next_panel_id = tc.id + 1;
                         }
                         PanelTab::TrackMap(track_map)
+                    }
+                    PanelConfig::MotorcycleChassis(cc) => {
+                        let mut panel = MotorcycleChassisPanel::new(cc.id, &cc.title);
+                        panel.home_worksheet = worksheet_idx;
+                        panel.rr_pot_channel = cc.rr_pot_channel.clone();
+                        panel.fr_pot_channel = cc.fr_pot_channel.clone();
+                        panel.lean_channel = cc.lean_channel.clone();
+                        // Reload chassis file if the path is still accessible
+                        if let Some(ref path_str) = cc.motospec_path {
+                            let path = std::path::PathBuf::from(path_str);
+                            if path.exists() {
+                                panel.load_motospec(path, cc.motospec_column);
+                            }
+                        }
+                        if cc.id >= shared.next_panel_id {
+                            shared.next_panel_id = cc.id + 1;
+                        }
+                        PanelTab::MotorcycleChassis(panel)
                     }
                     PanelConfig::ChannelBrowser => PanelTab::ChannelBrowser,
                     PanelConfig::CursorReadout => PanelTab::CursorReadout,

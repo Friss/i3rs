@@ -8,6 +8,7 @@ pub mod graph;
 pub mod histogram;
 pub mod math_editor;
 pub mod mixture_map;
+pub mod motorcycle_chassis;
 pub mod report;
 pub mod scatter;
 pub mod timeline;
@@ -24,6 +25,7 @@ use gauge::GaugePanel;
 use graph::GraphPanel;
 use histogram::HistogramPanel;
 use mixture_map::MixtureMapPanel;
+use motorcycle_chassis::MotorcycleChassisPanel;
 use report::ReportPanel;
 use scatter::ScatterPanel;
 use track_map::TrackMapPanel;
@@ -32,6 +34,7 @@ use track_map::TrackMapPanel;
 pub enum PanelTab {
     Graph(GraphPanel),
     TrackMap(TrackMapPanel),
+    MotorcycleChassis(MotorcycleChassisPanel),
     ChannelBrowser,
     CursorReadout,
     Report(ReportPanel),
@@ -54,6 +57,7 @@ impl TabViewer for AppTabViewer<'_> {
         match tab {
             PanelTab::Graph(g) => g.title.clone().into(),
             PanelTab::TrackMap(t) => t.title.clone().into(),
+            PanelTab::MotorcycleChassis(c) => c.title.clone().into(),
             PanelTab::ChannelBrowser => "Channels".into(),
             PanelTab::CursorReadout => "Readout".into(),
             PanelTab::Report(r) => r.title.clone().into(),
@@ -72,6 +76,9 @@ impl TabViewer for AppTabViewer<'_> {
             }
             PanelTab::TrackMap(track_map) => {
                 track_map.ui(ui, self.shared);
+            }
+            PanelTab::MotorcycleChassis(chassis) => {
+                chassis.ui(ui, self.shared);
             }
             PanelTab::ChannelBrowser => {
                 channel_browser::show_standalone(ui, self.shared);
@@ -104,6 +111,7 @@ impl TabViewer for AppTabViewer<'_> {
         match tab {
             PanelTab::Graph(g) => egui::Id::new(format!("graph_{}", g.id)),
             PanelTab::TrackMap(t) => egui::Id::new(format!("trackmap_{}", t.id)),
+            PanelTab::MotorcycleChassis(c) => egui::Id::new(format!("moto_chassis_{}", c.id)),
             PanelTab::ChannelBrowser => egui::Id::new("channel_browser"),
             PanelTab::CursorReadout => egui::Id::new("cursor_readout"),
             PanelTab::Report(r) => egui::Id::new(format!("report_{}", r.id)),
@@ -120,6 +128,7 @@ impl TabViewer for AppTabViewer<'_> {
             tab,
             PanelTab::Graph(_)
                 | PanelTab::TrackMap(_)
+                | PanelTab::MotorcycleChassis(_)
                 | PanelTab::Report(_)
                 | PanelTab::Histogram(_)
                 | PanelTab::Scatter(_)

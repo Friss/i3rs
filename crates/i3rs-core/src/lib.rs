@@ -4,6 +4,7 @@
 //! (100MB+) with on-demand channel data decoding.
 
 pub mod analysis;
+pub mod chassis;
 mod downsample;
 pub mod export;
 pub mod fft;
@@ -37,3 +38,15 @@ pub use track::{
     Sector, SectorTime, TrackData, compute_color_map, compute_sector_times, extract_gps_track,
     find_nearest_sample,
 };
+pub use chassis::{
+    AirSpringMode, CartridgeType, ChassisModel, ForkForceCurve, ForkForceRow, ForkInstance,
+    FrameInstance, FrameState, LinkInstanceRecord, RearSuspCurve, RearSuspRow, ShockInstance,
+    SwingarmInstance, YokeInstance,
+};
+pub use chassis::motospec_parser::{detect_columns, parse_motospec_file};
+pub use chassis::xml_loader::{parse_chassis_xml, parse_chassis_xml_str};
+pub use chassis::side_view::{
+    LegendEntry, SchematicBounds, SchematicCircle, SchematicLine, SchematicStroke,
+    SideViewSchematic, compute_schematic,
+};
+pub use chassis::solver::ChassisSolver;
