@@ -137,6 +137,9 @@ pub struct GraphDisplayTransformConfig {
     pub scale: f64,
     pub offset: f64,
     pub unit: Option<String>,
+    /// Fixed display range `(min, max)` in display units. `None` = auto-scale.
+    #[serde(default)]
+    pub scale_manual: Option<(f64, f64)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -282,6 +285,9 @@ fn resolve_saved_plotted_channel(
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            scale_mode: crate::state::ScaleMode::Auto,
+            manual_min: stats.min,
+            manual_max: stats.max,
             cached_min: stats.min,
             cached_max: stats.max,
             cached_avg: stats.avg,
@@ -357,6 +363,12 @@ pub fn save_workspace(
                                 scale: pc.display_scale,
                                 offset: pc.display_offset,
                                 unit: pc.display_unit.clone(),
+                                scale_manual: match pc.scale_mode {
+                                    crate::state::ScaleMode::Manual => {
+                                        Some((pc.manual_min, pc.manual_max))
+                                    }
+                                    crate::state::ScaleMode::Auto => None,
+                                },
                             })
                             .collect();
                         let overlays: Vec<GraphOverlayConfig> = g
@@ -650,6 +662,12 @@ pub fn load_workspace(
                             let display_offset =
                                 display_transform.map(|cfg| cfg.offset).unwrap_or(0.0);
                             let display_unit = display_transform.and_then(|cfg| cfg.unit.clone());
+                            let scale_manual =
+                                display_transform.and_then(|cfg| cfg.scale_manual);
+                            let (scale_mode, manual_min, manual_max) = match scale_manual {
+                                Some((min, max)) => (crate::state::ScaleMode::Manual, min, max),
+                                None => (crate::state::ScaleMode::Auto, 0.0, 0.0),
+                            };
 
                             if is_math {
                                 // Find math channel by name
@@ -667,6 +685,17 @@ pub fn load_workspace(
                                         display_scale,
                                         display_offset,
                                         display_unit: display_unit.clone(),
+                                        scale_mode,
+                                        manual_min: if scale_manual.is_some() {
+                                            manual_min
+                                        } else {
+                                            stats.min
+                                        },
+                                        manual_max: if scale_manual.is_some() {
+                                            manual_max
+                                        } else {
+                                            stats.max
+                                        },
                                         cached_min: stats.min,
                                         cached_max: stats.max,
                                         cached_avg: stats.avg,
@@ -686,6 +715,11 @@ pub fn load_workspace(
                                 plotted.display_scale = display_scale;
                                 plotted.display_offset = display_offset;
                                 plotted.display_unit = display_unit.clone();
+                                if scale_manual.is_some() {
+                                    plotted.scale_mode = scale_mode;
+                                    plotted.manual_min = manual_min;
+                                    plotted.manual_max = manual_max;
+                                }
                                 graph.plotted_channels.push(plotted);
                             }
                         }

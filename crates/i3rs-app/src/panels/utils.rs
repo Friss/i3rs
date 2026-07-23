@@ -235,6 +235,9 @@ pub fn create_plotted_channel(
         display_scale: 1.0,
         display_offset: 0.0,
         display_unit: None,
+        scale_mode: crate::state::ScaleMode::Auto,
+        manual_min: cached_min,
+        manual_max: cached_max,
         cached_min,
         cached_max,
         cached_avg,
@@ -320,6 +323,16 @@ pub fn apply_channel_preferences(channel: &mut PlottedChannel, shared: &SharedSt
     channel.display_scale = pref.display_scale;
     channel.display_offset = pref.display_offset;
     channel.display_unit = pref.display_unit.clone();
+    match pref.scale_manual {
+        Some((min, max)) => {
+            channel.scale_mode = crate::state::ScaleMode::Manual;
+            channel.manual_min = min;
+            channel.manual_max = max;
+        }
+        None => {
+            channel.scale_mode = crate::state::ScaleMode::Auto;
+        }
+    }
 }
 
 fn merged_display_preference(
@@ -331,6 +344,10 @@ fn merged_display_preference(
         display_scale: channel.display_scale,
         display_offset: channel.display_offset,
         display_unit: channel.display_unit.clone(),
+        scale_manual: match channel.scale_mode {
+            crate::state::ScaleMode::Manual => Some((channel.manual_min, channel.manual_max)),
+            crate::state::ScaleMode::Auto => None,
+        },
     }
 }
 
@@ -481,6 +498,7 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            scale_manual: None,
         };
         let channel = PlottedChannel {
             channel_id: ChannelId::Physical(0),
@@ -491,6 +509,9 @@ mod tests {
             display_scale: 2.0,
             display_offset: 5.0,
             display_unit: Some("psi".into()),
+            scale_mode: crate::state::ScaleMode::Auto,
+            manual_min: 1.0,
+            manual_max: 1.0,
             cached_min: 1.0,
             cached_max: 1.0,
             cached_avg: 1.0,

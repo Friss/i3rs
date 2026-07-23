@@ -27,6 +27,16 @@ pub enum YAxis {
     Right,
 }
 
+/// How a channel's display (Y) range is determined.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ScaleMode {
+    /// Range is derived automatically from the channel's data min/max.
+    #[default]
+    Auto,
+    /// Range uses the fixed `manual_min`/`manual_max` values.
+    Manual,
+}
+
 /// A loaded channel's cached display data.
 pub struct PlottedChannel {
     pub channel_id: ChannelId,
@@ -37,6 +47,12 @@ pub struct PlottedChannel {
     pub display_scale: f64,
     pub display_offset: f64,
     pub display_unit: Option<String>,
+    /// How the display (Y) range is determined for this channel.
+    pub scale_mode: ScaleMode,
+    /// Fixed lower bound (in display units) used when `scale_mode` is `Manual`.
+    pub manual_min: f64,
+    /// Fixed upper bound (in display units) used when `scale_mode` is `Manual`.
+    pub manual_max: f64,
     /// Cached min value (computed once on load).
     pub cached_min: f64,
     /// Cached max value (computed once on load).
@@ -291,6 +307,9 @@ pub struct ChannelPreference {
     pub display_offset: f64,
     #[serde(default)]
     pub display_unit: Option<String>,
+    /// Fixed display range `(min, max)` in display units. `None` = auto-scale.
+    #[serde(default)]
+    pub scale_manual: Option<(f64, f64)>,
 }
 
 fn default_display_scale() -> f64 {
@@ -304,6 +323,7 @@ impl Default for ChannelPreference {
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            scale_manual: None,
         }
     }
 }
