@@ -26,7 +26,7 @@ pub fn show_standalone(ui: &mut egui::Ui, shared: &mut SharedState) {
             egui::Panel::bottom("lap_selector_panel")
                 .default_size(180.0)
                 .resizable(true)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     show_lap_selector(ui, shared);
                 });
         }

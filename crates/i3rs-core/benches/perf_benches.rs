@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use i3rs_core::{
     ChannelData, FftPlanner, LdFile, TrackData, compute_fft_with_planner, downsample_minmax,
     evaluate_expression_with_aliases, find_nearest_sample,
 };
+use std::hint::black_box;
 
 const TEST_LD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/VIR_LAP.ld");
 

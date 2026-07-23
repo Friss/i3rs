@@ -305,7 +305,7 @@ fn draw_analog_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawC
         let p1 = center + egui::vec2(a1.cos(), a1.sin()) * radius;
         painter.line_segment(
             [p0, p1],
-            egui::Stroke::new(3.0, egui::Color32::from_gray(60)),
+            egui::Stroke::new(3.0_f32, egui::Color32::from_gray(60)),
         );
     }
 
@@ -327,7 +327,7 @@ fn draw_analog_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawC
             let a1 = start_angle + t1 * sweep;
             let p0 = center + egui::vec2(a0.cos(), a0.sin()) * radius;
             let p1 = center + egui::vec2(a1.cos(), a1.sin()) * radius;
-            painter.line_segment([p0, p1], egui::Stroke::new(4.0, color));
+            painter.line_segment([p0, p1], egui::Stroke::new(4.0_f32, color));
         }
 
         // Needle
@@ -336,7 +336,7 @@ fn draw_analog_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawC
             center + egui::vec2(needle_angle.cos(), needle_angle.sin()) * (radius * 0.85);
         painter.line_segment(
             [center, needle_end],
-            egui::Stroke::new(2.0, egui::Color32::WHITE),
+            egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
         );
         painter.circle_filled(center, 4.0, egui::Color32::WHITE);
     }
@@ -473,7 +473,7 @@ fn draw_digital_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDraw
     painter.rect_stroke(
         inner,
         6.0,
-        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)),
         egui::StrokeKind::Outside,
     );
 
@@ -523,8 +523,8 @@ fn draw_steering_wheel(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDra
     let wheel_fill = egui::Color32::from_rgba_premultiplied(255, 255, 255, 10);
     let value_color = egui::Color32::from_rgb(255, 206, 92);
     let value_shadow = egui::Color32::from_rgba_premultiplied(0, 0, 0, 150);
-    let rim_stroke = 6.0;
-    let spoke_stroke = 5.0;
+    let rim_stroke = 6.0_f32;
+    let spoke_stroke = 5.0_f32;
 
     let rotate = |point: egui::Vec2| -> egui::Pos2 {
         let rotated = egui::vec2(
@@ -542,7 +542,7 @@ fn draw_steering_wheel(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDra
     let draw_path = |points: &[(f32, f32)]| {
         painter.add(egui::Shape::line(
             map_path(points, egui::vec2(1.0, 1.0)),
-            egui::Stroke::new(spoke_stroke + 1.0, shadow_color),
+            egui::Stroke::new(spoke_stroke + 1.0_f32, shadow_color),
         ));
         painter.add(egui::Shape::line(
             map_path(points, egui::Vec2::ZERO),
@@ -554,13 +554,13 @@ fn draw_steering_wheel(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDra
     painter.circle_stroke(
         center + egui::vec2(1.0, 1.0),
         radius,
-        egui::Stroke::new(rim_stroke + 1.0, shadow_color),
+        egui::Stroke::new(rim_stroke + 1.0_f32, shadow_color),
     );
     painter.circle_stroke(center, radius, egui::Stroke::new(rim_stroke, line_color));
     painter.circle_stroke(
         center + egui::vec2(1.0, 1.0),
         radius * 0.83,
-        egui::Stroke::new(rim_stroke + 1.0, shadow_color),
+        egui::Stroke::new(rim_stroke + 1.0_f32, shadow_color),
     );
     painter.circle_stroke(
         center,
@@ -615,7 +615,7 @@ fn draw_steering_wheel(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDra
     painter.circle_stroke(
         center + egui::vec2(1.0, 1.0),
         hub_radius,
-        egui::Stroke::new(rim_stroke + 1.0, shadow_color),
+        egui::Stroke::new(rim_stroke + 1.0_f32, shadow_color),
     );
     painter.circle_stroke(
         center,

@@ -12,7 +12,7 @@ use i3rs_core::{
 
 use crate::state::{
     CHANNEL_COLORS, ChannelId, ChannelPreference, DistanceAxisCache, DownsampleSeriesKey,
-    DownsampleSeriesRequest, GraphMode, GraphXAxis, PlottedChannel, SharedState, YAxis,
+    DownsampleSeriesRequest, GraphMode, GraphXAxis, PlottedChannel, ScaleMode, SharedState, YAxis,
     channel_preference_key, compute_channel_stats,
 };
 
@@ -20,9 +20,10 @@ use super::gauge::{
     GaugeChannel, GaugeDrawContext, GaugeStyle, best_gauge_grid, default_style_for_name, draw_gauge,
 };
 use super::utils::{
-    ChannelDisplayMeta, DisplayTransformFingerprint, build_plotted_channel_info,
-    create_plotted_channel, display_transform_fingerprint, interp_at_time, refresh_plotted_channel,
-    resolve_channel_display_meta, resolve_channel_meta, resolve_plotted_channel_display_meta,
+    ChannelDisplayMeta, DisplayTransformFingerprint, apply_channel_preference,
+    build_plotted_channel_info, create_plotted_channel, display_transform_fingerprint,
+    interp_at_time, refresh_plotted_channel, resolve_channel_display_meta, resolve_channel_meta,
+    resolve_plotted_channel_display_meta, set_plotted_channel_display_transform,
 };
 
 /// Format a value using file-parsed enum labels, falling back to hardcoded labels.
@@ -326,6 +327,11 @@ struct DisplayStats {
     avg: f64,
 }
 
+/// Column widths for the Manage Channels list table.
+const MANAGE_NAME_COL_W: f32 = 240.0;
+const MANAGE_MODE_COL_W: f32 = 80.0;
+const MANAGE_NUM_COL_W: f32 = 70.0;
+
 #[derive(Clone, Copy)]
 struct ManageChannelDragPayload {
     channel_id: ChannelId,
@@ -378,6 +384,8 @@ pub struct GraphPanel {
     pub tile_heights: Vec<f32>,
     show_manage_channels_window: bool,
     manage_channels_selection: Option<ManageChannelsSelection>,
+    /// Channel whose properties (edit) window is currently open, if any.
+    editing_channel: Option<ChannelId>,
     show_add_channel_picker: bool,
     add_channel_target: Option<AddChannelPickerTarget>,
     add_channel_filter: String,
@@ -425,6 +433,7 @@ impl GraphPanel {
             tile_heights: Vec::new(),
             show_manage_channels_window: false,
             manage_channels_selection: None,
+            editing_channel: None,
             show_add_channel_picker: false,
             add_channel_target: None,
             add_channel_filter: String::new(),
@@ -444,6 +453,7 @@ impl GraphPanel {
         self.tile_heights.clear();
         self.show_manage_channels_window = false;
         self.manage_channels_selection = None;
+        self.editing_channel = None;
         self.show_add_channel_picker = false;
         self.add_channel_target = None;
         self.add_channel_filter.clear();
@@ -1088,12 +1098,7 @@ impl GraphPanel {
             }
 
             if let Some((y_min, y_max)) = y_range {
-                let padding = if (y_max - y_min).abs() < 1e-10 {
-                    1.0
-                } else {
-                    (y_max - y_min) * 0.05
-                };
-                plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
+                plot_ui.set_plot_bounds_y(y_min..=y_max);
             }
 
             Self::draw_channels(plot_ui, &plotted, &freq_map, x_axis, shared, render_cache);
@@ -1239,12 +1244,7 @@ impl GraphPanel {
                         }
 
                         if let Some((y_min, y_max)) = y_range {
-                            let padding = if (y_max - y_min).abs() < 1e-10 {
-                                1.0
-                            } else {
-                                (y_max - y_min) * 0.05
-                            };
-                            plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
+                            plot_ui.set_plot_bounds_y(y_min..=y_max);
                         }
 
                         Self::draw_channels(
@@ -1429,12 +1429,7 @@ impl GraphPanel {
             plot_ui.set_plot_bounds_x(x_min..=x_max);
 
             if let Some((y_min, y_max)) = y_range {
-                let padding = if (y_max - y_min).abs() < 1e-10 {
-                    1.0
-                } else {
-                    (y_max - y_min) * 0.05
-                };
-                plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
+                plot_ui.set_plot_bounds_y(y_min..=y_max);
             }
 
             let target_width = plot_ui.response().rect.width().max(100.0) as usize;
@@ -1643,12 +1638,7 @@ impl GraphPanel {
                         plot_ui.set_plot_bounds_x(x_min..=x_max);
 
                         if let Some((y_min, y_max)) = y_range {
-                            let padding = if (y_max - y_min).abs() < 1e-10 {
-                                1.0
-                            } else {
-                                (y_max - y_min) * 0.05
-                            };
-                            plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
+                            plot_ui.set_plot_bounds_y(y_min..=y_max);
                         }
 
                         let target_width = plot_ui.response().rect.width().max(100.0) as usize;
@@ -1828,31 +1818,62 @@ impl GraphPanel {
         (min, max)
     }
 
-    /// Compute Y range from cached min/max values (O(n_channels), not O(n_samples)).
+    /// Compute final Y plot bounds from cached min/max values (O(n_channels), not O(n_samples)).
+    ///
+    /// Automatic extrema receive 5% headroom. Manual extrema remain exact.
     fn compute_y_range(channels: &[&PlottedChannel]) -> Option<(f64, f64)> {
         let mut global_min = f64::MAX;
         let mut global_max = f64::MIN;
+        let mut min_is_manual = false;
+        let mut max_is_manual = false;
         let mut has_data = false;
 
         for pc in channels {
             if !pc.data.is_empty() {
-                let mut display_min = pc.cached_min * pc.display_scale + pc.display_offset;
-                let mut display_max = pc.cached_max * pc.display_scale + pc.display_offset;
-                if pc.display_scale < 0.0 {
+                let is_manual = pc.scale_mode == ScaleMode::Manual;
+                let (mut display_min, mut display_max) = match pc.scale_mode {
+                    ScaleMode::Manual => (pc.manual_min, pc.manual_max),
+                    ScaleMode::Auto => (
+                        pc.cached_min * pc.display_scale + pc.display_offset,
+                        pc.cached_max * pc.display_scale + pc.display_offset,
+                    ),
+                };
+                if display_min > display_max {
                     std::mem::swap(&mut display_min, &mut display_max);
                 }
                 if display_min < global_min {
                     global_min = display_min;
+                    min_is_manual = is_manual;
+                } else if display_min == global_min && is_manual {
+                    min_is_manual = true;
                 }
                 if display_max > global_max {
                     global_max = display_max;
+                    max_is_manual = is_manual;
+                } else if display_max == global_max && is_manual {
+                    max_is_manual = true;
                 }
                 has_data = true;
             }
         }
 
         if has_data {
-            Some((global_min, global_max))
+            if (global_max - global_min).abs() < 1e-10 {
+                return Some((global_min - 1.0, global_max + 1.0));
+            }
+            let padding = (global_max - global_min) * 0.05;
+            Some((
+                if min_is_manual {
+                    global_min
+                } else {
+                    global_min - padding
+                },
+                if max_is_manual {
+                    global_max
+                } else {
+                    global_max + padding
+                },
+            ))
         } else {
             None
         }
@@ -2036,7 +2057,7 @@ impl GraphPanel {
 
             let line = Line::new("", PlotPoints::Borrowed(cache_entry.plot_points.as_slice()))
                 .color(pc.color)
-                .width(1.5);
+                .width(1.5_f32);
             plot_ui.line(line);
         }
     }
@@ -2344,7 +2365,7 @@ impl GraphPanel {
         ui.painter().hline(
             rect.x_range(),
             rect.center().y,
-            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
         if response.hovered() || response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
@@ -2355,7 +2376,7 @@ impl GraphPanel {
     fn draw_cursor_line(plot_ui: &mut egui_plot::PlotUi, axis_value: f64) {
         let cursor_line = VLine::new("cursor", axis_value)
             .color(egui::Color32::from_rgb(255, 255, 0))
-            .width(1.0);
+            .width(1.0_f32);
         plot_ui.vline(cursor_line);
     }
 
@@ -2364,7 +2385,7 @@ impl GraphPanel {
         for lap in laps {
             let vline = VLine::new(&lap.name, x_axis.axis_value_at_time(lap.start_time))
                 .color(marker_color)
-                .width(1.0)
+                .width(1.0_f32)
                 .style(egui_plot::LineStyle::dashed_dense());
             plot_ui.vline(vline);
         }
@@ -2523,6 +2544,10 @@ impl GraphPanel {
                     display_scale: pc.display_scale,
                     display_offset: pc.display_offset,
                     display_unit: pc.display_unit.clone(),
+                    scale_manual: match pc.scale_mode {
+                        ScaleMode::Manual => Some((pc.manual_min, pc.manual_max)),
+                        ScaleMode::Auto => None,
+                    },
                 },
             ));
             ui.close();
@@ -2709,9 +2734,7 @@ impl GraphPanel {
                     .iter_mut()
                     .find(|pc| pc.channel_id == id)
                 {
-                    pc.display_scale = scale;
-                    pc.display_offset = offset;
-                    pc.display_unit = unit;
+                    set_plotted_channel_display_transform(pc, scale, offset, unit);
                 }
             }
             ContextAction::SaveGlobalPreference(id, preference) => {
@@ -2726,12 +2749,7 @@ impl GraphPanel {
                     .iter_mut()
                     .find(|pc| pc.channel_id == id)
                 {
-                    if let Some(color) = preference.color {
-                        pc.color = egui::Color32::from_rgb(color[0], color[1], color[2]);
-                    }
-                    pc.display_scale = preference.display_scale;
-                    pc.display_offset = preference.display_offset;
-                    pc.display_unit = preference.display_unit;
+                    apply_channel_preference(pc, &preference);
                 }
             }
             ContextAction::ApplyGlobalPreference(id) => {
@@ -2745,12 +2763,7 @@ impl GraphPanel {
                         .iter_mut()
                         .find(|pc| pc.channel_id == id)
                 {
-                    if let Some(color) = preference.color {
-                        pc.color = egui::Color32::from_rgb(color[0], color[1], color[2]);
-                    }
-                    pc.display_scale = preference.display_scale;
-                    pc.display_offset = preference.display_offset;
-                    pc.display_unit = preference.display_unit;
+                    apply_channel_preference(pc, &preference);
                 }
             }
             ContextAction::ClearGlobalPreference(id) => {
@@ -2778,6 +2791,9 @@ impl GraphPanel {
                             display_scale: pc.display_scale,
                             display_offset: pc.display_offset,
                             display_unit: pc.display_unit.clone(),
+                            scale_mode: pc.scale_mode,
+                            manual_min: pc.manual_min,
+                            manual_max: pc.manual_max,
                             cached_min: pc.cached_min,
                             cached_max: pc.cached_max,
                             cached_avg: pc.cached_avg,
@@ -2802,6 +2818,7 @@ impl GraphPanel {
         let mut pending_actions = Vec::new();
         let mut pending_selection = self.manage_channels_selection;
         let mut open_picker = None;
+        let mut edit_request: Option<ChannelId> = None;
         let viewport_id = egui::ViewportId::from_hash_of(format!("manage_channels_{}", self.id));
         ctx.show_viewport_immediate(
             viewport_id,
@@ -2833,8 +2850,29 @@ impl GraphPanel {
                 );
                 ui.separator();
 
+                let row_h = ui.spacing().interact_size.y;
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [MANAGE_NAME_COL_W, row_h],
+                        egui::Label::new(egui::RichText::new("Channel").strong()),
+                    );
+                    ui.add_sized(
+                        [MANAGE_MODE_COL_W, row_h],
+                        egui::Label::new(egui::RichText::new("Scale").strong()),
+                    );
+                    ui.add_sized(
+                        [MANAGE_NUM_COL_W, row_h],
+                        egui::Label::new(egui::RichText::new("Min").strong()),
+                    );
+                    ui.add_sized(
+                        [MANAGE_NUM_COL_W, row_h],
+                        egui::Label::new(egui::RichText::new("Max").strong()),
+                    );
+                });
+                ui.add_space(2.0);
+
                 egui::ScrollArea::vertical()
-                    .max_height(380.0)
+                    .max_height(360.0)
                     .show(ui, |ui| {
                         let grouped = self.tiled_channel_groups_with_keys();
                         for (visual_group_idx, (tile_group, indices)) in grouped.iter().enumerate()
@@ -2875,7 +2913,7 @@ impl GraphPanel {
                                         }
                                     }
 
-                                    let (name, unit, _, _, _) =
+                                    let (name, unit, _, dec_places, enum_labels) =
                                         resolve_plotted_channel_display_meta(pc, shared);
                                     let row_label = if unit.is_empty() {
                                         name.clone()
@@ -2884,47 +2922,96 @@ impl GraphPanel {
                                     };
                                     let row_selected = pending_selection
                                         == Some(ManageChannelsSelection::Channel(pc.channel_id));
+                                    let discrete = uses_discrete_values(&name, &enum_labels);
+                                    let (mode_text, min_text, max_text) = if discrete {
+                                        ("State".to_string(), "—".to_string(), "—".to_string())
+                                    } else {
+                                        let (min_v, max_v) = match pc.scale_mode {
+                                            ScaleMode::Manual => (pc.manual_min, pc.manual_max),
+                                            ScaleMode::Auto => {
+                                                let a = pc.cached_min * pc.display_scale
+                                                    + pc.display_offset;
+                                                let b = pc.cached_max * pc.display_scale
+                                                    + pc.display_offset;
+                                                if a <= b { (a, b) } else { (b, a) }
+                                            }
+                                        };
+                                        let dp = dec_places.clamp(0, 6) as usize;
+                                        let mode = match pc.scale_mode {
+                                            ScaleMode::Manual => "Manual",
+                                            ScaleMode::Auto => "Auto",
+                                        };
+                                        (
+                                            mode.to_string(),
+                                            format!("{min_v:.dp$}"),
+                                            format!("{max_v:.dp$}"),
+                                        )
+                                    };
                                     let drag_id = egui::Id::new((
                                         "manage_channel_row",
                                         self.id,
                                         Self::channel_id_key(pc.channel_id),
                                     ));
-                                    let drag_response = ui.dnd_drag_source(
-                                        drag_id,
-                                        ManageChannelDragPayload {
-                                            channel_id: pc.channel_id,
-                                        },
-                                        |ui| {
-                                            ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new("::").weak());
-                                                ui.colored_label(pc.color, "■");
-                                                ui.add(
-                                                    egui::Button::new(row_label.clone())
-                                                        .selected(row_selected),
-                                                )
-                                            })
-                                            .inner
-                                        },
-                                    );
-
-                                    if drag_response.inner.clicked() {
-                                        pending_selection =
-                                            Some(ManageChannelsSelection::Channel(pc.channel_id));
-                                    }
-
                                     let raw_unit = resolve_channel_meta(pc.channel_id, shared).1;
-                                    drag_response.inner.context_menu(|ui| {
-                                        let mut action = None;
-                                        Self::show_channel_menu(
-                                            ui,
-                                            pc,
-                                            &raw_unit,
-                                            shared,
-                                            &mut action,
+                                    ui.horizontal(|ui| {
+                                        let drag_response = ui.dnd_drag_source(
+                                            drag_id,
+                                            ManageChannelDragPayload {
+                                                channel_id: pc.channel_id,
+                                            },
+                                            |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new("::").weak());
+                                                    ui.colored_label(pc.color, "■");
+                                                    ui.add_sized(
+                                                        [MANAGE_NAME_COL_W - 34.0, row_h],
+                                                        egui::Button::new(row_label.clone())
+                                                            .selected(row_selected)
+                                                            .truncate(),
+                                                    )
+                                                })
+                                                .inner
+                                            },
                                         );
-                                        if let Some(action) = action {
-                                            pending_actions
-                                                .push(ManageChannelsAction::Context(action));
+
+                                        if drag_response.inner.clicked() {
+                                            pending_selection = Some(
+                                                ManageChannelsSelection::Channel(pc.channel_id),
+                                            );
+                                        }
+
+                                        drag_response.inner.context_menu(|ui| {
+                                            let mut action = None;
+                                            Self::show_channel_menu(
+                                                ui,
+                                                pc,
+                                                &raw_unit,
+                                                shared,
+                                                &mut action,
+                                            );
+                                            if let Some(action) = action {
+                                                pending_actions
+                                                    .push(ManageChannelsAction::Context(action));
+                                            }
+                                        });
+
+                                        ui.add_sized(
+                                            [MANAGE_MODE_COL_W, row_h],
+                                            egui::Label::new(mode_text).truncate(),
+                                        );
+                                        ui.add_sized(
+                                            [MANAGE_NUM_COL_W, row_h],
+                                            egui::Label::new(min_text),
+                                        );
+                                        ui.add_sized(
+                                            [MANAGE_NUM_COL_W, row_h],
+                                            egui::Label::new(max_text),
+                                        );
+                                        if ui.button("Edit").clicked() {
+                                            pending_selection = Some(
+                                                ManageChannelsSelection::Channel(pc.channel_id),
+                                            );
+                                            edit_request = Some(pc.channel_id);
                                         }
                                     });
 
@@ -3013,6 +3100,11 @@ impl GraphPanel {
 
                 ui.small("Add Channel... goes to the selected graph, or creates a new graph at the bottom if nothing is selected.");
 
+                if let Some(id) = edit_request {
+                    self.editing_channel = Some(id);
+                }
+                self.show_channel_properties_window(ui.ctx(), shared);
+
                 self.show_add_channel_picker_window(&picker_ctx, shared, &mut pending_actions);
             },
         );
@@ -3030,6 +3122,7 @@ impl GraphPanel {
             self.add_channel_target = None;
             self.add_channel_selection = None;
             self.add_channel_filter.clear();
+            self.editing_channel = None;
         }
 
         self.show_manage_channels_window = open;
@@ -3059,6 +3152,170 @@ impl GraphPanel {
         }
 
         self.sync_manage_channels_state();
+    }
+
+    /// The "Channel Properties" editor window: color, unit, and display scaling.
+    fn show_channel_properties_window(&mut self, ctx: &egui::Context, shared: &SharedState) {
+        let Some(channel_id) = self.editing_channel else {
+            return;
+        };
+        let Some(idx) = self
+            .plotted_channels
+            .iter()
+            .position(|pc| pc.channel_id == channel_id)
+        else {
+            self.editing_channel = None;
+            return;
+        };
+
+        let (name, raw_unit, freq, dec_places) = resolve_channel_meta(channel_id, shared);
+        let source_label = match channel_id {
+            ChannelId::Physical(_) => "Logged",
+            ChannelId::Math(_) => "Math",
+        };
+        let sample_count = self.plotted_channels[idx].data.len();
+        let presets = display_presets_for_unit(&raw_unit);
+
+        // Estimate a reasonable drag speed from the channel's data range.
+        let pc_ref = &self.plotted_channels[idx];
+        let span = ((pc_ref.cached_max - pc_ref.cached_min) * pc_ref.display_scale).abs();
+        let drag_speed = (span / 200.0).max(0.001);
+
+        let mut open = true;
+        let mut close_clicked = false;
+        egui::Window::new("Channel Properties")
+            .id(egui::Id::new(("channel_props", self.id)))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                let pc = &mut self.plotted_channels[idx];
+
+                ui.label(egui::RichText::new("General").strong());
+                egui::Grid::new("channel_props_general")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.label(&name);
+                        ui.end_row();
+                        ui.label("Source");
+                        ui.label(source_label);
+                        ui.end_row();
+                        ui.label("Sample Rate");
+                        ui.label(format!("{freq} Hz"));
+                        ui.end_row();
+                        ui.label("Sample Count");
+                        ui.label(sample_count.to_string());
+                        ui.end_row();
+                    });
+
+                ui.separator();
+                ui.label(egui::RichText::new("Display").strong());
+                egui::Grid::new("channel_props_display")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Unit");
+                        let mut unit_str =
+                            pc.display_unit.clone().unwrap_or_else(|| raw_unit.clone());
+                        if ui.text_edit_singleline(&mut unit_str).changed() {
+                            pc.display_unit = if unit_str.is_empty() || unit_str == raw_unit {
+                                None
+                            } else {
+                                Some(unit_str)
+                            };
+                        }
+                        ui.end_row();
+
+                        ui.label("Colour");
+                        ui.color_edit_button_srgba(&mut pc.color);
+                        ui.end_row();
+                    });
+
+                if !presets.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Convert:");
+                        let raw_selected = pc.display_scale == 1.0
+                            && pc.display_offset == 0.0
+                            && pc.display_unit.is_none();
+                        if ui
+                            .selectable_label(raw_selected, format!("Raw ({raw_unit})"))
+                            .clicked()
+                        {
+                            set_plotted_channel_display_transform(pc, 1.0, 0.0, None);
+                        }
+                        for preset in &presets {
+                            let selected = (pc.display_scale - preset.scale).abs() < 1e-9
+                                && (pc.display_offset - preset.offset).abs() < 1e-9
+                                && pc.display_unit.as_deref() == Some(preset.unit);
+                            if ui.selectable_label(selected, preset.label).clicked() {
+                                set_plotted_channel_display_transform(
+                                    pc,
+                                    preset.scale,
+                                    preset.offset,
+                                    Some(preset.unit.to_string()),
+                                );
+                            }
+                        }
+                    });
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("Display Limits").strong());
+                let mut manual = pc.scale_mode == ScaleMode::Manual;
+                ui.horizontal(|ui| {
+                    ui.label("Mode");
+                    ui.radio_value(&mut manual, false, "Auto");
+                    ui.radio_value(&mut manual, true, "Manual");
+                });
+                // Seed manual bounds from the current auto range when first switching.
+                if manual && pc.scale_mode == ScaleMode::Auto {
+                    let a = pc.cached_min * pc.display_scale + pc.display_offset;
+                    let b = pc.cached_max * pc.display_scale + pc.display_offset;
+                    pc.manual_min = a.min(b);
+                    pc.manual_max = a.max(b);
+                }
+                pc.scale_mode = if manual {
+                    ScaleMode::Manual
+                } else {
+                    ScaleMode::Auto
+                };
+                let dp = dec_places.clamp(0, 6) as usize;
+                ui.add_enabled_ui(manual, |ui| {
+                    egui::Grid::new("channel_props_limits")
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("Min");
+                            ui.add(
+                                egui::DragValue::new(&mut pc.manual_min)
+                                    .speed(drag_speed)
+                                    .max_decimals(dp.max(1)),
+                            );
+                            ui.end_row();
+                            ui.label("Max");
+                            ui.add(
+                                egui::DragValue::new(&mut pc.manual_max)
+                                    .speed(drag_speed)
+                                    .max_decimals(dp.max(1)),
+                            );
+                            ui.end_row();
+                        });
+                });
+
+                ui.separator();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        close_clicked = true;
+                    }
+                });
+            });
+
+        if !open || close_clicked {
+            self.editing_channel = None;
+        }
     }
 
     fn show_add_channel_picker_window(
@@ -3197,7 +3454,7 @@ impl GraphPanel {
             .is_some()
         {
             let fill = egui::Color32::from_rgba_premultiplied(70, 110, 170, 80);
-            let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 170, 240));
+            let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 170, 240));
             ui.painter().rect_filled(rect, 4.0, fill);
             ui.painter()
                 .rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Outside);
@@ -4234,6 +4491,9 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            scale_mode: crate::state::ScaleMode::Auto,
+            manual_min: 0.0,
+            manual_max: 1.0,
             cached_min: 0.0,
             cached_max: 1.0,
             cached_avg: 0.5,
@@ -4306,6 +4566,44 @@ mod tests {
 
         assert!(base != zoom_changed);
         assert!(base != offset_changed);
+    }
+
+    #[test]
+    fn automatic_y_range_gets_headroom() {
+        let channel = sample_channel(Arc::from(vec![0.0, 1.0]));
+
+        let range = GraphPanel::compute_y_range(&[&channel]).unwrap();
+
+        assert!((range.0 + 0.05).abs() < 1e-9);
+        assert!((range.1 - 1.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn manual_y_range_remains_exact() {
+        let mut channel = sample_channel(Arc::from(vec![0.0, 1.0]));
+        channel.scale_mode = crate::state::ScaleMode::Manual;
+        channel.manual_min = -10.0;
+        channel.manual_max = 20.0;
+
+        let range = GraphPanel::compute_y_range(&[&channel]).unwrap();
+
+        assert_eq!(range, (-10.0, 20.0));
+    }
+
+    #[test]
+    fn mixed_y_range_only_pads_automatic_extrema() {
+        let mut automatic = sample_channel(Arc::from(vec![-2.0, 0.5]));
+        automatic.cached_min = -2.0;
+        automatic.cached_max = 0.5;
+        let mut manual = sample_channel(Arc::from(vec![0.0, 1.0]));
+        manual.scale_mode = crate::state::ScaleMode::Manual;
+        manual.manual_min = 0.0;
+        manual.manual_max = 1.0;
+
+        let range = GraphPanel::compute_y_range(&[&automatic, &manual]).unwrap();
+
+        assert!((range.0 + 2.15).abs() < 1e-9);
+        assert_eq!(range.1, 1.0);
     }
 
     #[test]

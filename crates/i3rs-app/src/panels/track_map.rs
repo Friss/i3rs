@@ -338,14 +338,14 @@ impl TrackMapPanel {
                     "Track",
                     PlotPoints::Borrowed(cached.solid_points.as_slice()),
                 )
-                .width(2.5)
+                .width(2.5_f32)
                 .color(egui::Color32::from_rgb(50, 255, 200));
                 plot_ui.line(line);
             }
         } else {
             for segment in &cached.colored_segments {
                 let line = Line::new("", PlotPoints::Borrowed(segment.points.as_slice()))
-                    .width(3.0)
+                    .width(3.0_f32)
                     .color(segment.color);
                 plot_ui.line(line);
             }
@@ -378,7 +378,7 @@ impl TrackMapPanel {
 
         let marker = Points::new("cursor", PlotPoints::Borrowed(cached.points.as_slice()))
             .shape(MarkerShape::Circle)
-            .radius(6.0)
+            .radius(6.0_f32)
             .color(egui::Color32::from_rgb(255, 255, 0))
             .filled(true);
         plot_ui.points(marker);
@@ -404,7 +404,7 @@ impl TrackMapPanel {
         for marker in &cached.markers {
             let points = Points::new(&marker.name, PlotPoints::Borrowed(marker.points.as_slice()))
                 .shape(MarkerShape::Diamond)
-                .radius(8.0)
+                .radius(8.0_f32)
                 .color(marker.color)
                 .filled(true);
             plot_ui.points(points);

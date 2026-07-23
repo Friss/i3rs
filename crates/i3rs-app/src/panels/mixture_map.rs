@@ -316,7 +316,7 @@ impl MixtureMapPanel {
         painter.rect_stroke(
             plot_rect,
             0.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(80)),
             egui::StrokeKind::Outside,
         );
 
@@ -438,7 +438,7 @@ impl MixtureMapPanel {
             painter.circle_stroke(
                 egui::pos2(cx, cy),
                 6.0,
-                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
             );
         }
     }

@@ -72,7 +72,7 @@ impl TimelinePanel {
         painter.rect_stroke(
             zoom_rect,
             0.0,
-            egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 180, 255)),
+            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 180, 255)),
             egui::StrokeKind::Outside,
         );
 
@@ -93,7 +93,7 @@ impl TimelinePanel {
             let cx = rect.left() + (t / duration) as f32 * rect.width();
             painter.line_segment(
                 [egui::pos2(cx, rect.top()), egui::pos2(cx, rect.bottom())],
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 255, 0)),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 255, 0)),
             );
         }
 
@@ -164,7 +164,7 @@ impl TimelinePanel {
                         egui::pos2(left, inner_rect.bottom()),
                     ],
                     egui::Stroke::new(
-                        1.0,
+                        1.0_f32,
                         egui::Color32::from_rgba_premultiplied(255, 255, 255, 60),
                     ),
                 );

@@ -235,6 +235,9 @@ pub fn create_plotted_channel(
         display_scale: 1.0,
         display_offset: 0.0,
         display_unit: None,
+        scale_mode: crate::state::ScaleMode::Auto,
+        manual_min: cached_min,
+        manual_max: cached_max,
         cached_min,
         cached_max,
         cached_avg,
@@ -314,12 +317,58 @@ pub fn apply_channel_preferences(channel: &mut PlottedChannel, shared: &SharedSt
         return;
     };
 
+    apply_channel_preference(channel, pref);
+}
+
+pub fn apply_channel_preference(channel: &mut PlottedChannel, pref: &ChannelPreference) {
     if let Some(color) = pref.color {
         channel.color = egui::Color32::from_rgb(color[0], color[1], color[2]);
     }
     channel.display_scale = pref.display_scale;
     channel.display_offset = pref.display_offset;
     channel.display_unit = pref.display_unit.clone();
+    match pref.scale_manual {
+        Some((min, max)) => {
+            channel.scale_mode = crate::state::ScaleMode::Manual;
+            channel.manual_min = min;
+            channel.manual_max = max;
+        }
+        None => {
+            channel.scale_mode = crate::state::ScaleMode::Auto;
+        }
+    }
+}
+
+/// Change display units while keeping manual limits tied to the same raw values.
+pub fn set_plotted_channel_display_transform(
+    channel: &mut PlottedChannel,
+    scale: f64,
+    offset: f64,
+    unit: Option<String>,
+) {
+    if channel.scale_mode == crate::state::ScaleMode::Manual {
+        let (mut min, mut max) = if channel.display_scale.abs() > f64::EPSILON {
+            let transform = |value: f64| {
+                let raw = (value - channel.display_offset) / channel.display_scale;
+                raw * scale + offset
+            };
+            (transform(channel.manual_min), transform(channel.manual_max))
+        } else {
+            (
+                channel.cached_min * scale + offset,
+                channel.cached_max * scale + offset,
+            )
+        };
+        if min > max {
+            std::mem::swap(&mut min, &mut max);
+        }
+        channel.manual_min = min;
+        channel.manual_max = max;
+    }
+
+    channel.display_scale = scale;
+    channel.display_offset = offset;
+    channel.display_unit = unit;
 }
 
 fn merged_display_preference(
@@ -331,6 +380,10 @@ fn merged_display_preference(
         display_scale: channel.display_scale,
         display_offset: channel.display_offset,
         display_unit: channel.display_unit.clone(),
+        scale_manual: match channel.scale_mode {
+            crate::state::ScaleMode::Manual => Some((channel.manual_min, channel.manual_max)),
+            crate::state::ScaleMode::Auto => None,
+        },
     }
 }
 
@@ -375,9 +428,7 @@ pub fn show_plotted_channel_display_menu(
             .selectable_label(raw_selected, format!("Raw ({})", raw_unit))
             .clicked()
         {
-            channel.display_scale = 1.0;
-            channel.display_offset = 0.0;
-            channel.display_unit = None;
+            set_plotted_channel_display_transform(channel, 1.0, 0.0, None);
             ui.close();
         }
         for preset in presets {
@@ -385,9 +436,12 @@ pub fn show_plotted_channel_display_menu(
                 && (channel.display_offset - preset.offset).abs() < 1e-9
                 && channel.display_unit.as_deref() == Some(preset.unit);
             if ui.selectable_label(is_selected, preset.label).clicked() {
-                channel.display_scale = preset.scale;
-                channel.display_offset = preset.offset;
-                channel.display_unit = Some(preset.unit.to_string());
+                set_plotted_channel_display_transform(
+                    channel,
+                    preset.scale,
+                    preset.offset,
+                    Some(preset.unit.to_string()),
+                );
                 ui.close();
             }
         }
@@ -481,6 +535,7 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            scale_manual: None,
         };
         let channel = PlottedChannel {
             channel_id: ChannelId::Physical(0),
@@ -491,6 +546,9 @@ mod tests {
             display_scale: 2.0,
             display_offset: 5.0,
             display_unit: Some("psi".into()),
+            scale_mode: crate::state::ScaleMode::Auto,
+            manual_min: 1.0,
+            manual_max: 1.0,
             cached_min: 1.0,
             cached_max: 1.0,
             cached_avg: 1.0,
@@ -502,5 +560,62 @@ mod tests {
         assert_eq!(merged.display_scale, 2.0);
         assert_eq!(merged.display_offset, 5.0);
         assert_eq!(merged.display_unit.as_deref(), Some("psi"));
+    }
+
+    #[test]
+    fn applying_preference_sets_and_clears_manual_limits() {
+        let mut channel = PlottedChannel {
+            channel_id: ChannelId::Physical(0),
+            color: egui::Color32::WHITE,
+            data: Arc::from(vec![1.0]),
+            tile_group: 0,
+            y_axis: YAxis::Left,
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
+            scale_mode: crate::state::ScaleMode::Auto,
+            manual_min: 0.0,
+            manual_max: 1.0,
+            cached_min: 0.0,
+            cached_max: 1.0,
+            cached_avg: 0.5,
+        };
+        let mut preference = ChannelPreference {
+            scale_manual: Some((10.0, 20.0)),
+            ..ChannelPreference::default()
+        };
+
+        apply_channel_preference(&mut channel, &preference);
+        assert_eq!(channel.scale_mode, crate::state::ScaleMode::Manual);
+        assert_eq!((channel.manual_min, channel.manual_max), (10.0, 20.0));
+
+        preference.scale_manual = None;
+        apply_channel_preference(&mut channel, &preference);
+        assert_eq!(channel.scale_mode, crate::state::ScaleMode::Auto);
+    }
+
+    #[test]
+    fn unit_conversion_preserves_manual_limits_as_raw_values() {
+        let mut channel = PlottedChannel {
+            channel_id: ChannelId::Physical(0),
+            color: egui::Color32::WHITE,
+            data: Arc::from(vec![0.0, 1000.0]),
+            tile_group: 0,
+            y_axis: YAxis::Left,
+            display_scale: 0.145_037_738,
+            display_offset: 0.0,
+            display_unit: Some("psi".into()),
+            scale_mode: crate::state::ScaleMode::Manual,
+            manual_min: 0.0,
+            manual_max: 145.037_738,
+            cached_min: 0.0,
+            cached_max: 1000.0,
+            cached_avg: 500.0,
+        };
+
+        set_plotted_channel_display_transform(&mut channel, 1.0, 0.0, None);
+
+        assert!((channel.manual_min - 0.0).abs() < 1e-9);
+        assert!((channel.manual_max - 1000.0).abs() < 1e-6);
     }
 }
