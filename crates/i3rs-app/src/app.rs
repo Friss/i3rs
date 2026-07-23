@@ -1827,7 +1827,7 @@ impl App {
         painter.rect_stroke(
             badge_rect,
             8.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110)),
             egui::StrokeKind::Outside,
         );
         painter.galley(badge_rect.min + padding, galley, egui::Color32::WHITE);
@@ -1904,13 +1904,13 @@ impl eframe::App for App {
 
         // Top menu bar
         let ctx = ui.ctx().clone();
-        egui::Panel::top("menu_bar").show_inside(ui, |ui| {
+        egui::Panel::top("menu_bar").show(ui, |ui| {
             self.show_menu_bar(ui, &ctx);
         });
 
         let mut dismiss_load_error = false;
         if let Some(err) = &self.load_error {
-            egui::Panel::top("load_error").show_inside(ui, |ui| {
+            egui::Panel::top("load_error").show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
                     if ui.small_button("Dismiss").clicked() {
@@ -1924,7 +1924,7 @@ impl eframe::App for App {
         }
 
         if let Some(pending) = &self.pending_session_load {
-            egui::Panel::top("load_status").show_inside(ui, |ui| {
+            egui::Panel::top("load_status").show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spinner();
                     ui.label(format!("Loading {}…", pending.file_label));
@@ -1934,7 +1934,7 @@ impl eframe::App for App {
 
         #[cfg(target_arch = "wasm32")]
         if self.shared.ld_file.is_none() {
-            egui::Panel::top("web_open_hint").show_inside(ui, |ui| {
+            egui::Panel::top("web_open_hint").show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Web mode:");
                     ui.label("Use");
@@ -1946,12 +1946,12 @@ impl eframe::App for App {
 
         // Session info bar
         if self.shared.ld_file.is_some() {
-            egui::Panel::top("session_info").show_inside(ui, |ui| {
+            egui::Panel::top("session_info").show(ui, |ui| {
                 self.show_session_info(ui);
             });
 
             // Timeline overview strip
-            egui::Panel::top("timeline").show_inside(ui, |ui| {
+            egui::Panel::top("timeline").show(ui, |ui| {
                 self.timeline.ui(ui, &mut self.shared);
             });
         }
@@ -1961,7 +1961,7 @@ impl eframe::App for App {
             egui::Panel::left("channel_browser")
                 .default_size(280.0)
                 .resizable(true)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui
                             .small_button("\u{25C0}")
@@ -1979,7 +1979,7 @@ impl eframe::App for App {
             egui::Panel::left("channel_browser_collapsed")
                 .exact_size(18.0)
                 .resizable(false)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     if Self::collapsed_panel_strip(ui, "Channels") {
                         self.show_channel_browser = true;
                     }
@@ -1991,7 +1991,7 @@ impl eframe::App for App {
             egui::Panel::left("math_editor")
                 .default_size(300.0)
                 .resizable(true)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui
                             .small_button("\u{25C0}")
@@ -2014,7 +2014,7 @@ impl eframe::App for App {
                 .min_size(72.0)
                 .max_size(320.0)
                 .resizable(true)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.strong("Readout");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2034,7 +2034,7 @@ impl eframe::App for App {
             egui::Panel::right("cursor_readout_collapsed")
                 .exact_size(18.0)
                 .resizable(false)
-                .show_inside(ui, |ui| {
+                .show(ui, |ui| {
                     if Self::collapsed_panel_strip(ui, "Readout") {
                         self.show_cursor_readout = true;
                     }

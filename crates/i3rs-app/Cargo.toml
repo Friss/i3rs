@@ -26,12 +26,12 @@ rfd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 crossbeam-channel = "0.5.15"
-pollster = "0.4.0"
+pollster = "1.0.1"
 log = "0.4.29"
 js-sys = "0.3.94"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2.117"
 wasm-bindgen-futures = "0.4.67"
-gloo-timers = { version = "0.3.0", features = ["futures"] }
+gloo-timers = { version = "0.4.0", features = ["futures"] }
 web-sys = { version = "0.3.94", features = ["Document", "Element", "HtmlCanvasElement", "HtmlElement", "Storage", "Window"] }

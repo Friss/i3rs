@@ -142,6 +142,24 @@ pub struct GraphDisplayTransformConfig {
     pub scale_manual: Option<(f64, f64)>,
 }
 
+fn apply_saved_scale_limits(
+    channel: &mut crate::state::PlottedChannel,
+    scale_manual: Option<(f64, f64)>,
+) {
+    match scale_manual {
+        Some((min, max)) => {
+            channel.scale_mode = crate::state::ScaleMode::Manual;
+            channel.manual_min = min;
+            channel.manual_max = max;
+        }
+        None => {
+            channel.scale_mode = crate::state::ScaleMode::Auto;
+            channel.manual_min = channel.cached_min;
+            channel.manual_max = channel.cached_max;
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ReportPanelConfig {
     pub id: u64,
@@ -662,12 +680,7 @@ pub fn load_workspace(
                             let display_offset =
                                 display_transform.map(|cfg| cfg.offset).unwrap_or(0.0);
                             let display_unit = display_transform.and_then(|cfg| cfg.unit.clone());
-                            let scale_manual =
-                                display_transform.and_then(|cfg| cfg.scale_manual);
-                            let (scale_mode, manual_min, manual_max) = match scale_manual {
-                                Some((min, max)) => (crate::state::ScaleMode::Manual, min, max),
-                                None => (crate::state::ScaleMode::Auto, 0.0, 0.0),
-                            };
+                            let scale_manual = display_transform.and_then(|cfg| cfg.scale_manual);
 
                             if is_math {
                                 // Find math channel by name
@@ -676,7 +689,7 @@ pub fn load_workspace(
                                     && let Some(data) = &shared.math_channels[mc_idx].data
                                 {
                                     let stats = compute_channel_stats(data);
-                                    graph.plotted_channels.push(crate::state::PlottedChannel {
+                                    let mut plotted = crate::state::PlottedChannel {
                                         channel_id: ChannelId::Math(mc_idx),
                                         color,
                                         data: data.clone(),
@@ -685,21 +698,15 @@ pub fn load_workspace(
                                         display_scale,
                                         display_offset,
                                         display_unit: display_unit.clone(),
-                                        scale_mode,
-                                        manual_min: if scale_manual.is_some() {
-                                            manual_min
-                                        } else {
-                                            stats.min
-                                        },
-                                        manual_max: if scale_manual.is_some() {
-                                            manual_max
-                                        } else {
-                                            stats.max
-                                        },
+                                        scale_mode: crate::state::ScaleMode::Auto,
+                                        manual_min: stats.min,
+                                        manual_max: stats.max,
                                         cached_min: stats.min,
                                         cached_max: stats.max,
                                         cached_avg: stats.avg,
-                                    });
+                                    };
+                                    apply_saved_scale_limits(&mut plotted, scale_manual);
+                                    graph.plotted_channels.push(plotted);
                                 }
                             } else if let Some(ld) = &shared.ld_file
                                 && let Some(ch) = ld.channels.iter().find(|c| &c.name == name)
@@ -715,11 +722,7 @@ pub fn load_workspace(
                                 plotted.display_scale = display_scale;
                                 plotted.display_offset = display_offset;
                                 plotted.display_unit = display_unit.clone();
-                                if scale_manual.is_some() {
-                                    plotted.scale_mode = scale_mode;
-                                    plotted.manual_min = manual_min;
-                                    plotted.manual_max = manual_max;
-                                }
+                                apply_saved_scale_limits(&mut plotted, scale_manual);
                                 graph.plotted_channels.push(plotted);
                             }
                         }
@@ -960,4 +963,50 @@ pub fn load_workspace(
             (ws_config.name.clone(), dock)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_saved_scale_limits;
+    use crate::state::{ChannelId, PlottedChannel, ScaleMode, YAxis};
+    use std::sync::Arc;
+
+    fn sample_channel() -> PlottedChannel {
+        PlottedChannel {
+            channel_id: ChannelId::Physical(0),
+            color: egui::Color32::WHITE,
+            data: Arc::from(vec![0.0, 100.0]),
+            tile_group: 0,
+            y_axis: YAxis::Left,
+            display_scale: 1.0,
+            display_offset: 0.0,
+            display_unit: None,
+            scale_mode: ScaleMode::Manual,
+            manual_min: 10.0,
+            manual_max: 20.0,
+            cached_min: 0.0,
+            cached_max: 100.0,
+            cached_avg: 50.0,
+        }
+    }
+
+    #[test]
+    fn saved_auto_scale_overrides_inherited_manual_preference() {
+        let mut channel = sample_channel();
+
+        apply_saved_scale_limits(&mut channel, None);
+
+        assert_eq!(channel.scale_mode, ScaleMode::Auto);
+        assert_eq!((channel.manual_min, channel.manual_max), (0.0, 100.0));
+    }
+
+    #[test]
+    fn saved_manual_scale_restores_limits() {
+        let mut channel = sample_channel();
+
+        apply_saved_scale_limits(&mut channel, Some((-5.0, 25.0)));
+
+        assert_eq!(channel.scale_mode, ScaleMode::Manual);
+        assert_eq!((channel.manual_min, channel.manual_max), (-5.0, 25.0));
+    }
 }

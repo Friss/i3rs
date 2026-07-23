@@ -20,9 +20,10 @@ use super::gauge::{
     GaugeChannel, GaugeDrawContext, GaugeStyle, best_gauge_grid, default_style_for_name, draw_gauge,
 };
 use super::utils::{
-    ChannelDisplayMeta, DisplayTransformFingerprint, build_plotted_channel_info,
-    create_plotted_channel, display_transform_fingerprint, interp_at_time, refresh_plotted_channel,
-    resolve_channel_display_meta, resolve_channel_meta, resolve_plotted_channel_display_meta,
+    ChannelDisplayMeta, DisplayTransformFingerprint, apply_channel_preference,
+    build_plotted_channel_info, create_plotted_channel, display_transform_fingerprint,
+    interp_at_time, refresh_plotted_channel, resolve_channel_display_meta, resolve_channel_meta,
+    resolve_plotted_channel_display_meta, set_plotted_channel_display_transform,
 };
 
 /// Format a value using file-parsed enum labels, falling back to hardcoded labels.
@@ -1097,12 +1098,7 @@ impl GraphPanel {
             }
 
             if let Some((y_min, y_max)) = y_range {
-                let padding = if (y_max - y_min).abs() < 1e-10 {
-                    1.0
-                } else {
-                    (y_max - y_min) * 0.05
-                };
-                plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
+                plot_ui.set_plot_bounds_y(y_min..=y_max);
             }
 
             Self::draw_channels(plot_ui, &plotted, &freq_map, x_axis, shared, render_cache);
@@ -1248,12 +1244,7 @@ impl GraphPanel {
                         }
 
                         if let Some((y_min, y_max)) = y_range {
-                            let padding = if (y_max - y_min).abs() < 1e-10 {
-                                1.0
-                            } else {
-                                (y_max - y_min) * 0.05
-                            };
-                            plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
+                            plot_ui.set_plot_bounds_y(y_min..=y_max);
                         }
 
                         Self::draw_channels(
@@ -1438,12 +1429,7 @@ impl GraphPanel {
             plot_ui.set_plot_bounds_x(x_min..=x_max);
 
             if let Some((y_min, y_max)) = y_range {
-                let padding = if (y_max - y_min).abs() < 1e-10 {
-                    1.0
-                } else {
-                    (y_max - y_min) * 0.05
-                };
-                plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
+                plot_ui.set_plot_bounds_y(y_min..=y_max);
             }
 
             let target_width = plot_ui.response().rect.width().max(100.0) as usize;
@@ -1652,12 +1638,7 @@ impl GraphPanel {
                         plot_ui.set_plot_bounds_x(x_min..=x_max);
 
                         if let Some((y_min, y_max)) = y_range {
-                            let padding = if (y_max - y_min).abs() < 1e-10 {
-                                1.0
-                            } else {
-                                (y_max - y_min) * 0.05
-                            };
-                            plot_ui.set_plot_bounds_y((y_min - padding)..=(y_max + padding));
+                            plot_ui.set_plot_bounds_y(y_min..=y_max);
                         }
 
                         let target_width = plot_ui.response().rect.width().max(100.0) as usize;
@@ -1837,14 +1818,19 @@ impl GraphPanel {
         (min, max)
     }
 
-    /// Compute Y range from cached min/max values (O(n_channels), not O(n_samples)).
+    /// Compute final Y plot bounds from cached min/max values (O(n_channels), not O(n_samples)).
+    ///
+    /// Automatic extrema receive 5% headroom. Manual extrema remain exact.
     fn compute_y_range(channels: &[&PlottedChannel]) -> Option<(f64, f64)> {
         let mut global_min = f64::MAX;
         let mut global_max = f64::MIN;
+        let mut min_is_manual = false;
+        let mut max_is_manual = false;
         let mut has_data = false;
 
         for pc in channels {
             if !pc.data.is_empty() {
+                let is_manual = pc.scale_mode == ScaleMode::Manual;
                 let (mut display_min, mut display_max) = match pc.scale_mode {
                     ScaleMode::Manual => (pc.manual_min, pc.manual_max),
                     ScaleMode::Auto => (
@@ -1857,16 +1843,37 @@ impl GraphPanel {
                 }
                 if display_min < global_min {
                     global_min = display_min;
+                    min_is_manual = is_manual;
+                } else if display_min == global_min && is_manual {
+                    min_is_manual = true;
                 }
                 if display_max > global_max {
                     global_max = display_max;
+                    max_is_manual = is_manual;
+                } else if display_max == global_max && is_manual {
+                    max_is_manual = true;
                 }
                 has_data = true;
             }
         }
 
         if has_data {
-            Some((global_min, global_max))
+            if (global_max - global_min).abs() < 1e-10 {
+                return Some((global_min - 1.0, global_max + 1.0));
+            }
+            let padding = (global_max - global_min) * 0.05;
+            Some((
+                if min_is_manual {
+                    global_min
+                } else {
+                    global_min - padding
+                },
+                if max_is_manual {
+                    global_max
+                } else {
+                    global_max + padding
+                },
+            ))
         } else {
             None
         }
@@ -2050,7 +2057,7 @@ impl GraphPanel {
 
             let line = Line::new("", PlotPoints::Borrowed(cache_entry.plot_points.as_slice()))
                 .color(pc.color)
-                .width(1.5);
+                .width(1.5_f32);
             plot_ui.line(line);
         }
     }
@@ -2358,7 +2365,7 @@ impl GraphPanel {
         ui.painter().hline(
             rect.x_range(),
             rect.center().y,
-            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
         );
         if response.hovered() || response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
@@ -2369,7 +2376,7 @@ impl GraphPanel {
     fn draw_cursor_line(plot_ui: &mut egui_plot::PlotUi, axis_value: f64) {
         let cursor_line = VLine::new("cursor", axis_value)
             .color(egui::Color32::from_rgb(255, 255, 0))
-            .width(1.0);
+            .width(1.0_f32);
         plot_ui.vline(cursor_line);
     }
 
@@ -2378,7 +2385,7 @@ impl GraphPanel {
         for lap in laps {
             let vline = VLine::new(&lap.name, x_axis.axis_value_at_time(lap.start_time))
                 .color(marker_color)
-                .width(1.0)
+                .width(1.0_f32)
                 .style(egui_plot::LineStyle::dashed_dense());
             plot_ui.vline(vline);
         }
@@ -2727,9 +2734,7 @@ impl GraphPanel {
                     .iter_mut()
                     .find(|pc| pc.channel_id == id)
                 {
-                    pc.display_scale = scale;
-                    pc.display_offset = offset;
-                    pc.display_unit = unit;
+                    set_plotted_channel_display_transform(pc, scale, offset, unit);
                 }
             }
             ContextAction::SaveGlobalPreference(id, preference) => {
@@ -2744,12 +2749,7 @@ impl GraphPanel {
                     .iter_mut()
                     .find(|pc| pc.channel_id == id)
                 {
-                    if let Some(color) = preference.color {
-                        pc.color = egui::Color32::from_rgb(color[0], color[1], color[2]);
-                    }
-                    pc.display_scale = preference.display_scale;
-                    pc.display_offset = preference.display_offset;
-                    pc.display_unit = preference.display_unit;
+                    apply_channel_preference(pc, &preference);
                 }
             }
             ContextAction::ApplyGlobalPreference(id) => {
@@ -2763,12 +2763,7 @@ impl GraphPanel {
                         .iter_mut()
                         .find(|pc| pc.channel_id == id)
                 {
-                    if let Some(color) = preference.color {
-                        pc.color = egui::Color32::from_rgb(color[0], color[1], color[2]);
-                    }
-                    pc.display_scale = preference.display_scale;
-                    pc.display_offset = preference.display_offset;
-                    pc.display_unit = preference.display_unit;
+                    apply_channel_preference(pc, &preference);
                 }
             }
             ContextAction::ClearGlobalPreference(id) => {
@@ -3249,18 +3244,19 @@ impl GraphPanel {
                             .selectable_label(raw_selected, format!("Raw ({raw_unit})"))
                             .clicked()
                         {
-                            pc.display_scale = 1.0;
-                            pc.display_offset = 0.0;
-                            pc.display_unit = None;
+                            set_plotted_channel_display_transform(pc, 1.0, 0.0, None);
                         }
                         for preset in &presets {
                             let selected = (pc.display_scale - preset.scale).abs() < 1e-9
                                 && (pc.display_offset - preset.offset).abs() < 1e-9
                                 && pc.display_unit.as_deref() == Some(preset.unit);
                             if ui.selectable_label(selected, preset.label).clicked() {
-                                pc.display_scale = preset.scale;
-                                pc.display_offset = preset.offset;
-                                pc.display_unit = Some(preset.unit.to_string());
+                                set_plotted_channel_display_transform(
+                                    pc,
+                                    preset.scale,
+                                    preset.offset,
+                                    Some(preset.unit.to_string()),
+                                );
                             }
                         }
                     });
@@ -3458,7 +3454,7 @@ impl GraphPanel {
             .is_some()
         {
             let fill = egui::Color32::from_rgba_premultiplied(70, 110, 170, 80);
-            let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 170, 240));
+            let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 170, 240));
             ui.painter().rect_filled(rect, 4.0, fill);
             ui.painter()
                 .rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Outside);
@@ -4570,6 +4566,44 @@ mod tests {
 
         assert!(base != zoom_changed);
         assert!(base != offset_changed);
+    }
+
+    #[test]
+    fn automatic_y_range_gets_headroom() {
+        let channel = sample_channel(Arc::from(vec![0.0, 1.0]));
+
+        let range = GraphPanel::compute_y_range(&[&channel]).unwrap();
+
+        assert!((range.0 + 0.05).abs() < 1e-9);
+        assert!((range.1 - 1.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn manual_y_range_remains_exact() {
+        let mut channel = sample_channel(Arc::from(vec![0.0, 1.0]));
+        channel.scale_mode = crate::state::ScaleMode::Manual;
+        channel.manual_min = -10.0;
+        channel.manual_max = 20.0;
+
+        let range = GraphPanel::compute_y_range(&[&channel]).unwrap();
+
+        assert_eq!(range, (-10.0, 20.0));
+    }
+
+    #[test]
+    fn mixed_y_range_only_pads_automatic_extrema() {
+        let mut automatic = sample_channel(Arc::from(vec![-2.0, 0.5]));
+        automatic.cached_min = -2.0;
+        automatic.cached_max = 0.5;
+        let mut manual = sample_channel(Arc::from(vec![0.0, 1.0]));
+        manual.scale_mode = crate::state::ScaleMode::Manual;
+        manual.manual_min = 0.0;
+        manual.manual_max = 1.0;
+
+        let range = GraphPanel::compute_y_range(&[&automatic, &manual]).unwrap();
+
+        assert!((range.0 + 2.15).abs() < 1e-9);
+        assert_eq!(range.1, 1.0);
     }
 
     #[test]
