@@ -38,6 +38,10 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
     ])
 }
 
+fn read_i8(data: &[u8], offset: usize) -> i8 {
+    data[offset] as i8
+}
+
 fn read_i16(data: &[u8], offset: usize) -> i16 {
     i16::from_le_bytes([data[offset], data[offset + 1]])
 }
@@ -98,6 +102,7 @@ pub fn normalize_channel_name(name: &str) -> String {
 pub enum DataType {
     Float32,
     Float16,
+    Int8,
     Int16,
     Int32,
     Float64,
@@ -109,6 +114,10 @@ impl DataType {
         match (dtype_a, dtype_code) {
             (0x07, 4) => DataType::Float32,
             (0x07, 2) => DataType::Float16,
+            // For integer channels `dtype_code` is the sample width in bytes.
+            // 1-byte channels are used for low-cardinality state values such as
+            // Gear and Marker.
+            (0x00 | 0x03 | 0x05, 1) => DataType::Int8,
             (0x00 | 0x03 | 0x05, 2) => DataType::Int16,
             (0x00 | 0x03 | 0x05, 4) => DataType::Int32,
             (0x08, 0x08) => DataType::Float64,
@@ -121,6 +130,7 @@ impl DataType {
         match self {
             DataType::Float32 => Some(4),
             DataType::Float16 => Some(2),
+            DataType::Int8 => Some(1),
             DataType::Int16 => Some(2),
             DataType::Int32 => Some(4),
             DataType::Float64 => Some(8),
@@ -132,6 +142,7 @@ impl DataType {
         match self {
             DataType::Float32 => "float32",
             DataType::Float16 => "float16",
+            DataType::Int8 => "int8",
             DataType::Int16 => "int16",
             DataType::Int32 => "int32",
             DataType::Float64 => "float64",
@@ -332,7 +343,7 @@ impl LdFile {
         }
 
         let raw = self.read_raw_samples(offset, actual_count, channel.data_type);
-        Some(self.apply_scaling(&raw, channel))
+        Some(apply_scaling(&raw, channel))
     }
 
     /// Read a range of samples for a channel (by sample indices), with scaling.
@@ -366,7 +377,7 @@ impl LdFile {
         }
 
         let raw = self.read_raw_samples(offset, actual, channel.data_type);
-        Some(self.apply_scaling(&raw, channel))
+        Some(apply_scaling(&raw, channel))
     }
 
     /// Look up a text label for a state/enum channel value.
@@ -396,6 +407,7 @@ impl LdFile {
                     let bits = read_u16(data, pos);
                     f16::from_bits(bits).to_f64()
                 }
+                DataType::Int8 => read_i8(data, pos) as f64,
                 DataType::Int16 => read_i16(data, pos) as f64,
                 DataType::Int32 => read_i32(data, pos) as f64,
                 DataType::Float64 => read_f64(data, pos),
@@ -406,21 +418,6 @@ impl LdFile {
         vals
     }
 
-    fn apply_scaling(&self, raw: &[f64], channel: &ChannelMeta) -> Vec<f64> {
-        let scale_f = channel.scale as f64;
-        let shift_f = channel.shift as f64;
-        let mul_f = channel.mul as f64;
-        let dec_factor = 10.0_f64.powi(-channel.dec_places as i32);
-
-        if scale_f == 0.0 {
-            raw.to_vec()
-        } else {
-            raw.iter()
-                .map(|v| (v / scale_f * dec_factor + shift_f) * mul_f)
-                .collect()
-        }
-    }
-
     fn data(&self) -> &[u8] {
         self.backing.as_slice()
     }
@@ -429,6 +426,33 @@ impl LdFile {
 // ---------------------------------------------------------------------------
 // Internal parsers
 // ---------------------------------------------------------------------------
+
+/// Convert raw samples to engineering units:
+///
+/// ```text
+/// value = raw / scale * 10^(-dec_places) * mul + shift
+/// ```
+///
+/// `shift` is an offset already expressed in engineering units, so it is applied
+/// *after* `mul` rather than being scaled by it. The two orderings agree whenever
+/// `mul == 1` — the common case in M1 logs — but a channel with `mul != 1` and
+/// `shift != 0` comes out offset by `shift * (mul - 1)` if `shift` is folded in
+/// first. Sim-exported ADL logs use `mul = 2` with a non-zero `shift` to pack a
+/// range into int16, so the order is load-bearing there.
+fn apply_scaling(raw: &[f64], channel: &ChannelMeta) -> Vec<f64> {
+    let scale_f = channel.scale as f64;
+    let shift_f = channel.shift as f64;
+    let mul_f = channel.mul as f64;
+    let dec_factor = 10.0_f64.powi(-channel.dec_places as i32);
+
+    if scale_f == 0.0 {
+        raw.to_vec()
+    } else {
+        raw.iter()
+            .map(|v| v / scale_f * dec_factor * mul_f + shift_f)
+            .collect()
+    }
+}
 
 fn parse_session(data: &[u8]) -> Session {
     Session {
@@ -726,5 +750,101 @@ mod tests {
         assert_eq!(entries.get(&1).map(String::as_str), Some("Off"));
         assert_eq!(entries.get(&2).map(String::as_str), Some("On"));
         assert_eq!(next_pos, data.len());
+    }
+
+    fn scaling_channel(shift: i16, mul: i16, scale: i16, dec_places: i16) -> ChannelMeta {
+        ChannelMeta {
+            index: 0,
+            name: String::new(),
+            short_name: String::new(),
+            unit: String::new(),
+            freq: 10,
+            n_data: 0,
+            data_type: DataType::Int16,
+            shift,
+            mul,
+            scale,
+            dec_places,
+            data_ptr: 0,
+            enum_labels: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// A sim-exported ADL log packs 0–100 % into int16 via `shift=50, mul=2,
+    /// dec_places=3`. Folding `shift` in before `mul` reports 50–150 % instead.
+    #[test]
+    fn shift_is_applied_after_the_multiplier() {
+        let chan = scaling_channel(50, 2, 1, 3);
+        let out = apply_scaling(&[-25_000.0, 0.0, 25_000.0], &chan);
+        assert!((out[0] - 0.0).abs() < 1e-9, "got {}", out[0]);
+        assert!((out[1] - 50.0).abs() < 1e-9, "got {}", out[1]);
+        assert!((out[2] - 100.0).abs() < 1e-9, "got {}", out[2]);
+    }
+
+    #[test]
+    fn scaling_uses_scale_and_dec_places() {
+        // Steering Wheel Position: shift=-6, mul=250, scale=9, dec_places=3.
+        let chan = scaling_channel(-6, 250, 9, 3);
+        let out = apply_scaling(&[216.0], &chan);
+        assert!(out[0].abs() < 1e-9, "got {}", out[0]);
+    }
+
+    #[test]
+    fn scaling_is_unchanged_when_mul_is_one() {
+        // Vast majority of M1 channels: the operator order must not matter here.
+        let chan = scaling_channel(32_760, 1, 1, 0);
+        let out = apply_scaling(&[-32_760.0, -30_000.0], &chan);
+        assert!(out[0].abs() < 1e-9, "got {}", out[0]);
+        assert!((out[1] - 2_760.0).abs() < 1e-9, "got {}", out[1]);
+    }
+
+    #[test]
+    fn zero_scale_passes_raw_values_through() {
+        let chan = scaling_channel(50, 2, 0, 3);
+        assert_eq!(apply_scaling(&[7.0, -3.0], &chan), vec![7.0, -3.0]);
+    }
+
+    /// For integer channels `dtype_code` is the sample width in bytes. Gear and
+    /// Marker are logged as 1-byte channels; before Int8 existed they decoded as
+    /// Unknown and the channel failed to load entirely.
+    #[test]
+    fn one_byte_integer_channels_are_recognised() {
+        assert_eq!(DataType::from_codes(0x03, 1), DataType::Int8);
+        assert_eq!(DataType::from_codes(0x00, 1), DataType::Int8);
+        assert_eq!(DataType::from_codes(0x05, 1), DataType::Int8);
+        assert_eq!(DataType::Int8.bytes_per_sample(), Some(1));
+    }
+
+    #[test]
+    fn existing_data_type_codes_are_unaffected() {
+        assert_eq!(DataType::from_codes(0x07, 4), DataType::Float32);
+        assert_eq!(DataType::from_codes(0x07, 2), DataType::Float16);
+        assert_eq!(DataType::from_codes(0x03, 2), DataType::Int16);
+        assert_eq!(DataType::from_codes(0x05, 4), DataType::Int32);
+        assert_eq!(DataType::from_codes(0x08, 0x08), DataType::Float64);
+        // Float16 must keep winning over Int8 for the 0x07 family.
+        assert_eq!(
+            DataType::from_codes(0x07, 1),
+            DataType::Unknown(0x07, 1),
+            "unmapped codes should stay Unknown rather than silently decoding"
+        );
+    }
+
+    /// Int8 is signed: MoTeC logs reverse gear as -1.
+    #[test]
+    fn int8_samples_decode_as_signed() {
+        let mut file = vec![0u8; HEAD_SIZE];
+        file[0] = 0x40; // magic
+        let data_ptr = file.len();
+        file.extend_from_slice(&[0x00, 0x01, 0x07, 0xFF]); // 0, 1, 7, -1
+
+        let mut chan = scaling_channel(0, 1, 1, 0);
+        chan.data_type = DataType::Int8;
+        chan.n_data = 4;
+        chan.data_ptr = data_ptr as u32;
+
+        let ld = LdFile::from_bytes(file).expect("synthetic file should open");
+        let vals = ld.read_channel_data(&chan).expect("Int8 should decode");
+        assert_eq!(vals, vec![0.0, 1.0, 7.0, -1.0]);
     }
 }
