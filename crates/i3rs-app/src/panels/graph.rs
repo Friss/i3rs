@@ -355,14 +355,17 @@ fn graph_stack_scroll_area(ui: &mut egui::Ui) -> egui::ScrollArea {
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
 }
 
-/// A drag source whose row also senses clicks.
+/// Copy of [`egui::Ui::dnd_drag_source`] with `Sense::click_and_drag()`.
 ///
-/// [`egui::Ui::dnd_drag_source`] layers a bare `Sense::drag()` interaction over
-/// the contents it just added. Because that interaction is registered last it
-/// sits on top of anything inside and swallows the press, so a row built with it
-/// can neither be selected by a click nor opened with a secondary click — its
-/// context menu is unreachable too. Sensing `click_and_drag` on the row itself
-/// keeps the dragging behaviour while letting both kinds of click through.
+/// Upstream senses bare `Sense::drag()`, and because that interaction is
+/// registered *after* the contents it wraps, it sits on top of them and swallows
+/// the press — a row built with it can neither be selected by a click nor opened
+/// with a secondary click, leaving its context menu unreachable. Sensing
+/// click-and-drag on the row itself keeps dragging while letting both kinds of
+/// click through.
+///
+/// Otherwise identical to upstream (egui 0.35, `src/ui.rs:2641`); re-diff against
+/// it when upgrading egui.
 fn clickable_drag_source<Payload>(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -390,13 +393,8 @@ where
         response
     } else {
         let response = ui.scope(add_contents).response;
-        let row = ui
-            .interact(response.rect, id, egui::Sense::click_and_drag())
-            .on_hover_cursor(egui::CursorIcon::Grab);
-        if row.drag_started() {
-            egui::DragAndDrop::set_payload(ui.ctx(), payload);
-        }
-        row
+        ui.interact(response.rect, id, egui::Sense::click_and_drag())
+            .on_hover_cursor(egui::CursorIcon::Grab)
     }
 }
 
@@ -2389,33 +2387,74 @@ impl GraphPanel {
             self.tile_heights.clear();
             return;
         }
-        let equal_share = (available_height / tile_count as f32).max(MIN_TILE_HEIGHT);
-        let count_changed = self.tile_heights.len() != tile_count;
-
-        if self.tile_heights.len() < tile_count {
+        // Adding or removing a tile changes how much height there is to go
+        // around, so refit the whole stack. Without this the existing tiles keep
+        // their old heights, the new one is simply appended, and the stack
+        // overflows into the scroll area instead of the graphs shrinking to make
+        // room.
+        if self.tile_heights.len() != tile_count {
+            let equal_share = (available_height / tile_count as f32).max(MIN_TILE_HEIGHT);
             self.tile_heights.resize(tile_count, equal_share);
-        } else if self.tile_heights.len() > tile_count {
-            self.tile_heights.truncate(tile_count);
+            Self::fit_tile_heights(&mut self.tile_heights, available_height);
+        }
+    }
+
+    /// Scale `heights` to sum to `available`, keeping their relative proportions
+    /// so heights the user dragged survive a tile being added or removed.
+    ///
+    /// Tiles that would scale below [`MIN_TILE_HEIGHT`] are pinned to it and the
+    /// rest rescaled into the height that frees up — plain proportional scaling
+    /// plus a clamp overflows the panel whenever one tile already sits near the
+    /// floor, since clamping it back up adds height the others never gave away.
+    fn fit_tile_heights(heights: &mut [f32], available: f32) {
+        let n = heights.len();
+        if n == 0 {
+            return;
+        }
+        let total: f32 = heights.iter().sum();
+        // Degenerate weights, or too many tiles to give each one its floor — the
+        // stack scrolls instead, so equal shares at the floor is the best fit.
+        if total <= 0.0 || available < n as f32 * MIN_TILE_HEIGHT {
+            heights.fill((available / n as f32).max(MIN_TILE_HEIGHT));
+            return;
         }
 
-        // Adding or removing a tile changes how much height there is to go
-        // around, so rescale the whole stack to fill the panel again. Without
-        // this the existing tiles keep their old heights, the new one is simply
-        // appended, and the stack overflows into the scroll area instead of the
-        // graphs shrinking to make room. Scaling (rather than resetting to equal
-        // shares) keeps whatever proportions the user dragged.
-        if count_changed && available_height >= tile_count as f32 * MIN_TILE_HEIGHT {
-            let total: f32 = self.tile_heights.iter().sum();
-            if total > 0.0 {
-                let factor = available_height / total;
-                for height in &mut self.tile_heights {
-                    *height *= factor;
+        let weights = heights.to_vec();
+        let mut pinned = vec![false; n];
+        loop {
+            let free_height =
+                available - pinned.iter().filter(|p| **p).count() as f32 * MIN_TILE_HEIGHT;
+            let free_weight: f32 = weights
+                .iter()
+                .zip(&pinned)
+                .filter(|(_, p)| !**p)
+                .map(|(w, _)| *w)
+                .sum();
+            if free_weight <= 0.0 {
+                heights.fill(MIN_TILE_HEIGHT);
+                return;
+            }
+            let factor = free_height / free_weight;
+
+            // Pinning a tile frees height for the others, so re-solve. Each pass
+            // pins at least one tile, which bounds this at `n` passes.
+            let mut newly_pinned = false;
+            for (i, weight) in weights.iter().enumerate() {
+                if !pinned[i] && weight * factor < MIN_TILE_HEIGHT {
+                    pinned[i] = true;
+                    newly_pinned = true;
                 }
             }
-        }
-
-        for height in &mut self.tile_heights {
-            *height = height.max(MIN_TILE_HEIGHT);
+            if !newly_pinned {
+                for (i, height) in heights.iter_mut().enumerate() {
+                    *height = if pinned[i] {
+                        MIN_TILE_HEIGHT
+                    } else {
+                        weights[i] * factor
+                    };
+                }
+                return;
+            }
         }
     }
 
@@ -3038,7 +3077,7 @@ impl GraphPanel {
                                                     ui.colored_label(pc.color, "■");
                                                     ui.add_sized(
                                                         [MANAGE_NAME_COL_W - 34.0, row_h],
-                                                        egui::Button::new(row_label.clone())
+                                                        egui::Button::new(row_label)
                                                             .selected(row_selected)
                                                             .truncate(),
                                                     );
@@ -4510,24 +4549,27 @@ mod tests {
     use i3rs_core::Lap;
     use std::sync::Arc;
 
-    /// Adding a graph has to shrink the existing tiles to make room, rather than
-    /// appending a tile and overflowing the panel.
+    /// Adding a graph has to shrink the existing tiles to make room rather than
+    /// appending a tile and overflowing the panel; removing one has to give the
+    /// space back.
     #[test]
-    fn adding_a_tile_reflows_existing_tiles_to_fit() {
+    fn changing_the_tile_count_reflows_the_stack_to_fit() {
         let panel_height = 600.0;
         let mut panel = GraphPanel::new(0, "test");
 
         panel.ensure_tile_heights(3, panel_height);
         assert_eq!(panel.tile_heights, vec![200.0, 200.0, 200.0]);
 
-        panel.ensure_tile_heights(4, panel_height);
-        assert_eq!(panel.tile_heights.len(), 4);
-        let total: f32 = panel.tile_heights.iter().sum();
-        assert!(
-            (total - panel_height).abs() < 0.01,
-            "tiles should still fill the panel, got {total} for {:?}",
-            panel.tile_heights
-        );
+        for count in [4, 3, 7, 2] {
+            panel.ensure_tile_heights(count, panel_height);
+            assert_eq!(panel.tile_heights.len(), count);
+            let total: f32 = panel.tile_heights.iter().sum();
+            assert!(
+                (total - panel_height).abs() < 0.01,
+                "{count} tiles should fill the panel, got {total} for {:?}",
+                panel.tile_heights
+            );
+        }
     }
 
     /// Reflowing must not discard proportions the user set by dragging handles.
@@ -4549,16 +4591,28 @@ mod tests {
         );
     }
 
+    /// A tile already near the floor can't absorb its share of the shrink, so the
+    /// height has to come from the tiles that do have slack. Scaling everything
+    /// and then clamping would overflow the panel.
     #[test]
-    fn removing_a_tile_reflows_to_fill_the_panel() {
+    fn a_tile_at_the_floor_does_not_push_the_stack_over() {
         let panel_height = 600.0;
         let mut panel = GraphPanel::new(0, "test");
-        panel.ensure_tile_heights(4, panel_height);
-        panel.ensure_tile_heights(3, panel_height);
+        panel.tile_heights = vec![440.0, MIN_TILE_HEIGHT, MIN_TILE_HEIGHT];
 
-        assert_eq!(panel.tile_heights.len(), 3);
+        panel.ensure_tile_heights(4, panel_height);
+
         let total: f32 = panel.tile_heights.iter().sum();
-        assert!((total - panel_height).abs() < 0.01, "got {total}");
+        assert!(
+            (total - panel_height).abs() < 0.01,
+            "expected an exact fit, got {total} for {:?}",
+            panel.tile_heights
+        );
+        assert!(
+            panel.tile_heights.iter().all(|h| *h >= MIN_TILE_HEIGHT),
+            "no tile may go under the floor, got {:?}",
+            panel.tile_heights
+        );
     }
 
     /// Past the point where every tile can hold its floor the stack scrolls
@@ -4578,9 +4632,9 @@ mod tests {
     }
 
     /// A resize drag is zero-sum, so a stack that already fits stays fitting and
-    /// repeated `ensure_tile_heights` calls are a no-op.
+    /// `ensure_tile_heights` must leave dragged heights alone.
     #[test]
-    fn dragging_a_handle_conserves_total_height() {
+    fn unchanged_tile_count_preserves_dragged_heights() {
         let panel_height = 600.0;
         let mut panel = GraphPanel::new(0, "test");
         panel.ensure_tile_heights(3, panel_height);

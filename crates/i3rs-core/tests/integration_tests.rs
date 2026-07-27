@@ -111,6 +111,44 @@ fn vir_lap_parser_snapshot() {
     assert_eq!(gps_latitude.n_data, 2660);
 }
 
+/// Four channels in this fixture use the 0x06 integer family, which was missing
+/// from the data-type table — they decoded as Unknown and silently failed to
+/// load. GPS Satellites is the readable canary: a satellite count, not garbage.
+#[test]
+fn integer_family_0x06_channels_decode() {
+    let ld = LdFile::open(TEST_LD).unwrap();
+    for name in [
+        "CP Lotus ESP System State",
+        "Lap Beacon Ticks",
+        "Lap GPS Closest Beacon",
+        "GPS Satellites",
+    ] {
+        let channel = ld
+            .channels
+            .iter()
+            .find(|channel| channel.name == name)
+            .unwrap_or_else(|| panic!("{name} channel missing"));
+        let data = ld
+            .read_channel_data(channel)
+            .unwrap_or_else(|| panic!("{name} should decode"));
+        assert_eq!(data.len(), channel.n_data as usize, "{name} sample count");
+    }
+
+    let satellites = ld
+        .channels
+        .iter()
+        .find(|channel| channel.name == "GPS Satellites")
+        .expect("GPS Satellites channel missing");
+    let data = ld.read_channel_data(satellites).expect("should decode");
+    let (min, max) = data
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+    assert!(
+        (4.0..=32.0).contains(&min) && (4.0..=32.0).contains(&max),
+        "satellite count should be a plausible fix, got {min}..{max}"
+    );
+}
+
 #[test]
 fn duration_is_plausible() {
     let ld = LdFile::open(TEST_LD).unwrap();

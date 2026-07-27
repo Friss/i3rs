@@ -114,13 +114,14 @@ impl DataType {
         match (dtype_a, dtype_code) {
             (0x07, 4) => DataType::Float32,
             (0x07, 2) => DataType::Float16,
-            // For integer channels `dtype_code` is the sample width in bytes.
-            // 1-byte channels are used for low-cardinality state values such as
-            // Gear and Marker.
-            (0x00 | 0x03 | 0x05, 1) => DataType::Int8,
-            (0x00 | 0x03 | 0x05, 2) => DataType::Int16,
-            (0x00 | 0x03 | 0x05, 4) => DataType::Int32,
             (0x08, 0x08) => DataType::Float64,
+            // For integer channels `dtype_code` is the sample width in bytes, and
+            // `dtype_a` only picks the family. 1-byte channels carry
+            // low-cardinality state values (Gear, Marker); 0x06 shows up on
+            // counters and indices (GPS Satellites, Lap Beacon Ticks).
+            (0x00 | 0x03 | 0x05 | 0x06, 1) => DataType::Int8,
+            (0x00 | 0x03 | 0x05 | 0x06, 2) => DataType::Int16,
+            (0x00 | 0x03 | 0x05 | 0x06, 4) => DataType::Int32,
             _ => DataType::Unknown(dtype_a, dtype_code),
         }
     }
@@ -342,8 +343,9 @@ impl LdFile {
             return Some(vec![]);
         }
 
-        let raw = self.read_raw_samples(offset, actual_count, channel.data_type);
-        Some(apply_scaling(&raw, channel))
+        let mut vals = self.read_raw_samples(offset, actual_count, channel.data_type);
+        apply_scaling(&mut vals, channel);
+        Some(vals)
     }
 
     /// Read a range of samples for a channel (by sample indices), with scaling.
@@ -376,8 +378,9 @@ impl LdFile {
             return Some(vec![]);
         }
 
-        let raw = self.read_raw_samples(offset, actual, channel.data_type);
-        Some(apply_scaling(&raw, channel))
+        let mut vals = self.read_raw_samples(offset, actual, channel.data_type);
+        apply_scaling(&mut vals, channel);
+        Some(vals)
     }
 
     /// Look up a text label for a state/enum channel value.
@@ -433,24 +436,22 @@ impl LdFile {
 /// value = raw / scale * 10^(-dec_places) * mul + shift
 /// ```
 ///
-/// `shift` is an offset already expressed in engineering units, so it is applied
-/// *after* `mul` rather than being scaled by it. The two orderings agree whenever
-/// `mul == 1` — the common case in M1 logs — but a channel with `mul != 1` and
-/// `shift != 0` comes out offset by `shift * (mul - 1)` if `shift` is folded in
-/// first. Sim-exported ADL logs use `mul = 2` with a non-zero `shift` to pack a
-/// range into int16, so the order is load-bearing there.
-fn apply_scaling(raw: &[f64], channel: &ChannelMeta) -> Vec<f64> {
+/// `shift` is already in engineering units, so it is applied *after* `mul` — see
+/// `docs/ld-file-format.md` for why the order is load-bearing on ADL logs.
+///
+/// Scales in place: a channel can hold ~190k samples, so this avoids allocating a
+/// second buffer the size of the one just decoded.
+fn apply_scaling(values: &mut [f64], channel: &ChannelMeta) {
     let scale_f = channel.scale as f64;
+    if scale_f == 0.0 {
+        return;
+    }
     let shift_f = channel.shift as f64;
     let mul_f = channel.mul as f64;
     let dec_factor = 10.0_f64.powi(-channel.dec_places as i32);
 
-    if scale_f == 0.0 {
-        raw.to_vec()
-    } else {
-        raw.iter()
-            .map(|v| v / scale_f * dec_factor * mul_f + shift_f)
-            .collect()
+    for v in values {
+        *v = *v / scale_f * dec_factor * mul_f + shift_f;
     }
 }
 
@@ -770,12 +771,17 @@ mod tests {
         }
     }
 
+    fn scaled(chan: &ChannelMeta, raw: &[f64]) -> Vec<f64> {
+        let mut vals = raw.to_vec();
+        apply_scaling(&mut vals, chan);
+        vals
+    }
+
     /// A sim-exported ADL log packs 0–100 % into int16 via `shift=50, mul=2,
     /// dec_places=3`. Folding `shift` in before `mul` reports 50–150 % instead.
     #[test]
     fn shift_is_applied_after_the_multiplier() {
-        let chan = scaling_channel(50, 2, 1, 3);
-        let out = apply_scaling(&[-25_000.0, 0.0, 25_000.0], &chan);
+        let out = scaled(&scaling_channel(50, 2, 1, 3), &[-25_000.0, 0.0, 25_000.0]);
         assert!((out[0] - 0.0).abs() < 1e-9, "got {}", out[0]);
         assert!((out[1] - 50.0).abs() < 1e-9, "got {}", out[1]);
         assert!((out[2] - 100.0).abs() < 1e-9, "got {}", out[2]);
@@ -784,44 +790,40 @@ mod tests {
     #[test]
     fn scaling_uses_scale_and_dec_places() {
         // Steering Wheel Position: shift=-6, mul=250, scale=9, dec_places=3.
-        let chan = scaling_channel(-6, 250, 9, 3);
-        let out = apply_scaling(&[216.0], &chan);
+        let out = scaled(&scaling_channel(-6, 250, 9, 3), &[216.0]);
         assert!(out[0].abs() < 1e-9, "got {}", out[0]);
     }
 
     #[test]
     fn scaling_is_unchanged_when_mul_is_one() {
         // Vast majority of M1 channels: the operator order must not matter here.
-        let chan = scaling_channel(32_760, 1, 1, 0);
-        let out = apply_scaling(&[-32_760.0, -30_000.0], &chan);
+        let out = scaled(&scaling_channel(32_760, 1, 1, 0), &[-32_760.0, -30_000.0]);
         assert!(out[0].abs() < 1e-9, "got {}", out[0]);
         assert!((out[1] - 2_760.0).abs() < 1e-9, "got {}", out[1]);
     }
 
     #[test]
     fn zero_scale_passes_raw_values_through() {
-        let chan = scaling_channel(50, 2, 0, 3);
-        assert_eq!(apply_scaling(&[7.0, -3.0], &chan), vec![7.0, -3.0]);
+        let out = scaled(&scaling_channel(50, 2, 0, 3), &[7.0, -3.0]);
+        assert_eq!(out, vec![7.0, -3.0]);
     }
 
-    /// For integer channels `dtype_code` is the sample width in bytes. Gear and
-    /// Marker are logged as 1-byte channels; before Int8 existed they decoded as
-    /// Unknown and the channel failed to load entirely.
+    /// For integer channels `dtype_code` is the sample width in bytes and
+    /// `dtype_a` only picks the family. Two families were missing: 1-byte widths
+    /// (Gear, Marker) and the whole of `0x06` (GPS Satellites, Lap Beacon
+    /// Ticks) — both decoded as Unknown and failed to load, the latter even in
+    /// the checked-in VIR_LAP fixture.
     #[test]
-    fn one_byte_integer_channels_are_recognised() {
-        assert_eq!(DataType::from_codes(0x03, 1), DataType::Int8);
-        assert_eq!(DataType::from_codes(0x00, 1), DataType::Int8);
-        assert_eq!(DataType::from_codes(0x05, 1), DataType::Int8);
-        assert_eq!(DataType::Int8.bytes_per_sample(), Some(1));
-    }
-
-    #[test]
-    fn existing_data_type_codes_are_unaffected() {
+    fn data_type_codes_map_as_expected() {
+        for family in [0x00, 0x03, 0x05, 0x06] {
+            assert_eq!(DataType::from_codes(family, 1), DataType::Int8);
+            assert_eq!(DataType::from_codes(family, 2), DataType::Int16);
+            assert_eq!(DataType::from_codes(family, 4), DataType::Int32);
+        }
         assert_eq!(DataType::from_codes(0x07, 4), DataType::Float32);
         assert_eq!(DataType::from_codes(0x07, 2), DataType::Float16);
-        assert_eq!(DataType::from_codes(0x03, 2), DataType::Int16);
-        assert_eq!(DataType::from_codes(0x05, 4), DataType::Int32);
         assert_eq!(DataType::from_codes(0x08, 0x08), DataType::Float64);
+        assert_eq!(DataType::Int8.bytes_per_sample(), Some(1));
         // Float16 must keep winning over Int8 for the 0x07 family.
         assert_eq!(
             DataType::from_codes(0x07, 1),
