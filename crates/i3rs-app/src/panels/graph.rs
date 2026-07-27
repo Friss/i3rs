@@ -1657,67 +1657,95 @@ impl GraphPanel {
             shared.data_duration.unwrap_or_default(),
         );
 
-        graph_stack_scroll_area(ui)
-            .show(ui, |ui| {
-                let mut responses = Vec::new();
-                for (tile_idx, group) in tile_groups.iter().enumerate() {
-                    let tile_height = self.tile_heights[tile_idx];
-                    let grouped: Vec<&PlottedChannel> = group
-                        .iter()
-                        .map(|&channel_idx| &self.plotted_channels[channel_idx])
-                        .collect();
+        graph_stack_scroll_area(ui).show(ui, |ui| {
+            let mut responses = Vec::new();
+            for (tile_idx, group) in tile_groups.iter().enumerate() {
+                let tile_height = self.tile_heights[tile_idx];
+                let grouped: Vec<&PlottedChannel> = group
+                    .iter()
+                    .map(|&channel_idx| &self.plotted_channels[channel_idx])
+                    .collect();
 
-                    let mut plot = Plot::new(format!("lap_overlay_tile_{}_{}", self.id, tile_idx))
-                        .height(tile_height)
-                        .allow_drag(egui::Vec2b::new(true, false))
-                        .allow_zoom(egui::Vec2b::new(true, false))
-                        .allow_scroll(false)
-                        .show_axes(true)
-                        .show_grid(true)
-                        .y_axis_min_width(36.0)
-                        .link_cursor(cursor_group, egui::Vec2b::new(true, false));
-                    if tile_idx == tile_groups.len() - 1 {
-                        plot = plot.x_axis_label(viewport.axis_label());
+                let mut plot = Plot::new(format!("lap_overlay_tile_{}_{}", self.id, tile_idx))
+                    .height(tile_height)
+                    .allow_drag(egui::Vec2b::new(true, false))
+                    .allow_zoom(egui::Vec2b::new(true, false))
+                    .allow_scroll(false)
+                    .show_axes(true)
+                    .show_grid(true)
+                    .y_axis_min_width(36.0)
+                    .link_cursor(cursor_group, egui::Vec2b::new(true, false));
+                if tile_idx == tile_groups.len() - 1 {
+                    plot = plot.x_axis_label(viewport.axis_label());
+                }
+
+                let y_range = Self::compute_y_range(&grouped);
+                let mut tile_cursor = None;
+                let resp = plot.show(ui, |plot_ui| {
+                    let mut draw_specs = Vec::new();
+                    let (x_min, x_max) = if needs_zoom_reset {
+                        viewport.full_range()
+                    } else if let Some((z_min, z_max)) = zoom_range {
+                        viewport.axis_range_for_time_range(z_min, z_max)
+                    } else {
+                        viewport.full_range()
+                    };
+                    plot_ui.set_plot_bounds_x(x_min..=x_max);
+
+                    if let Some((y_min, y_max)) = y_range {
+                        plot_ui.set_plot_bounds_y(y_min..=y_max);
                     }
 
-                    let y_range = Self::compute_y_range(&grouped);
-                    let mut tile_cursor = None;
-                    let resp = plot.show(ui, |plot_ui| {
-                        let mut draw_specs = Vec::new();
-                        let (x_min, x_max) = if needs_zoom_reset {
-                            viewport.full_range()
-                        } else if let Some((z_min, z_max)) = zoom_range {
-                            viewport.axis_range_for_time_range(z_min, z_max)
-                        } else {
-                            viewport.full_range()
-                        };
-                        plot_ui.set_plot_bounds_x(x_min..=x_max);
+                    let target_width = plot_ui.response().rect.width().max(100.0) as usize;
+                    let lap_render_cache = &mut self.lap_render_cache;
+                    for pc in &grouped {
+                        let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
+                        let preserve_native_samples =
+                            preserve_native_samples_for_channel(pc.channel_id, shared);
+                        let reference_key = LapRenderCacheKey::Reference(pc.channel_id);
+                        ensure_lap_series_cache(
+                            plot_ui,
+                            shared,
+                            lap_render_cache,
+                            reference_key,
+                            LapSeriesRenderParams {
+                                data: &pc.data,
+                                freq,
+                                lap: &viewport.reference_lap,
+                                axis: &viewport.reference_axis,
+                                transform: PlotTransform {
+                                    origin_axis: viewport.reference_origin_axis,
+                                    x_scale: 1.0,
+                                    x_offset: 0.0,
+                                    y_scale: pc.display_scale,
+                                    y_offset: pc.display_offset,
+                                },
+                                target_width,
+                                preserve_native_samples,
+                            },
+                        );
+                        draw_specs.push((reference_key, pc.color, 2.0));
 
-                        if let Some((y_min, y_max)) = y_range {
-                            plot_ui.set_plot_bounds_y(y_min..=y_max);
-                        }
-
-                        let target_width = plot_ui.response().rect.width().max(100.0) as usize;
-                        let lap_render_cache = &mut self.lap_render_cache;
-                        for pc in &grouped {
-                            let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
-                            let preserve_native_samples =
-                                preserve_native_samples_for_channel(pc.channel_id, shared);
-                            let reference_key = LapRenderCacheKey::Reference(pc.channel_id);
+                        for prepared in prepared_overlays.get(&pc.channel_id).into_iter().flatten()
+                        {
+                            let overlay_key = LapRenderCacheKey::Overlay {
+                                channel_id: pc.channel_id,
+                                overlay_idx: prepared.overlay_idx,
+                            };
                             ensure_lap_series_cache(
                                 plot_ui,
                                 shared,
                                 lap_render_cache,
-                                reference_key,
+                                overlay_key,
                                 LapSeriesRenderParams {
-                                    data: &pc.data,
-                                    freq,
-                                    lap: &viewport.reference_lap,
-                                    axis: &viewport.reference_axis,
+                                    data: &prepared.data,
+                                    freq: prepared.freq,
+                                    lap: &prepared.lap,
+                                    axis: &prepared.axis,
                                     transform: PlotTransform {
-                                        origin_axis: viewport.reference_origin_axis,
-                                        x_scale: 1.0,
-                                        x_offset: 0.0,
+                                        origin_axis: prepared.origin_axis,
+                                        x_scale: prepared.scale,
+                                        x_offset: prepared.offset,
                                         y_scale: pc.display_scale,
                                         y_offset: pc.display_offset,
                                     },
@@ -1725,118 +1753,75 @@ impl GraphPanel {
                                     preserve_native_samples,
                                 },
                             );
-                            draw_specs.push((reference_key, pc.color, 2.0));
-
-                            for prepared in
-                                prepared_overlays.get(&pc.channel_id).into_iter().flatten()
-                            {
-                                let overlay_key = LapRenderCacheKey::Overlay {
-                                    channel_id: pc.channel_id,
-                                    overlay_idx: prepared.overlay_idx,
-                                };
-                                ensure_lap_series_cache(
-                                    plot_ui,
-                                    shared,
-                                    lap_render_cache,
-                                    overlay_key,
-                                    LapSeriesRenderParams {
-                                        data: &prepared.data,
-                                        freq: prepared.freq,
-                                        lap: &prepared.lap,
-                                        axis: &prepared.axis,
-                                        transform: PlotTransform {
-                                            origin_axis: prepared.origin_axis,
-                                            x_scale: prepared.scale,
-                                            x_offset: prepared.offset,
-                                            y_scale: pc.display_scale,
-                                            y_offset: pc.display_offset,
-                                        },
-                                        target_width,
-                                        preserve_native_samples,
-                                    },
-                                );
-                                draw_specs.push((overlay_key, prepared.color, prepared.width));
-                            }
+                            draw_specs.push((overlay_key, prepared.color, prepared.width));
                         }
-
-                        let lap_render_cache = &self.lap_render_cache;
-                        for (cache_key, color, width) in draw_specs {
-                            draw_cached_lap_series(
-                                plot_ui,
-                                lap_render_cache,
-                                &cache_key,
-                                color,
-                                width,
-                            );
-                        }
-
-                        if let Some(cursor_time) = cursor_time {
-                            Self::draw_cursor_line(
-                                plot_ui,
-                                viewport.axis_value_for_time(cursor_time),
-                            );
-                        }
-                        if let Some(coord) = plot_ui.pointer_coordinate() {
-                            tile_cursor = viewport.time_from_axis_value(coord.x);
-                        }
-                    });
-
-                    let bounds = resp.transform.bounds();
-                    let pair = (bounds.min()[0], bounds.max()[0]);
-                    if first_bounds.is_none() {
-                        first_bounds = Some(pair);
                     }
-                    if resp.response.hovered() {
-                        hovered_bounds = Some(pair);
-                        hovered_cursor = tile_cursor;
+
+                    let lap_render_cache = &self.lap_render_cache;
+                    for (cache_key, color, width) in draw_specs {
+                        draw_cached_lap_series(plot_ui, lap_render_cache, &cache_key, color, width);
                     }
-                    Self::draw_group_legend(
-                        ui,
-                        resp.response.rect,
-                        &grouped,
-                        &channel_meta,
-                        group,
-                        cursor_time,
-                        Some(viewport.time_range_from_plot_bounds(pair.0, pair.1)),
+
+                    if let Some(cursor_time) = cursor_time {
+                        Self::draw_cursor_line(plot_ui, viewport.axis_value_for_time(cursor_time));
+                    }
+                    if let Some(coord) = plot_ui.pointer_coordinate() {
+                        tile_cursor = viewport.time_from_axis_value(coord.x);
+                    }
+                });
+
+                let bounds = resp.transform.bounds();
+                let pair = (bounds.min()[0], bounds.max()[0]);
+                if first_bounds.is_none() {
+                    first_bounds = Some(pair);
+                }
+                if resp.response.hovered() {
+                    hovered_bounds = Some(pair);
+                    hovered_cursor = tile_cursor;
+                }
+                Self::draw_group_legend(
+                    ui,
+                    resp.response.rect,
+                    &grouped,
+                    &channel_meta,
+                    group,
+                    cursor_time,
+                    Some(viewport.time_range_from_plot_bounds(pair.0, pair.1)),
+                );
+                responses.push((group.clone(), resp.response));
+
+                if tile_idx + 1 < tile_groups.len() {
+                    let delta = self.show_resize_handle(ui).y;
+                    if delta.abs() > 0.0 {
+                        Self::apply_adjacent_tile_resize(&mut self.tile_heights, tile_idx, delta);
+                    }
+                }
+            }
+
+            for (group, response) in &responses {
+                self.handle_tile_group_context_menu(response, group, &channel_meta, shared);
+            }
+
+            if shared.dragging_channel.is_some()
+                && ui.input(|i| i.pointer.any_released())
+                && ui.ui_contains_pointer()
+            {
+                let target_group = responses
+                    .iter()
+                    .find(|(_, resp)| resp.contains_pointer())
+                    .and_then(|(group, _)| group.first())
+                    .and_then(|&idx| self.plotted_channels.get(idx))
+                    .map(|channel| channel.tile_group);
+                if let Some(ch_id) = shared.dragging_channel.take() {
+                    self.add_channel_to_group(
+                        ch_id,
+                        target_group.unwrap_or_else(|| self.next_tile_group()),
+                        shared,
                     );
-                    responses.push((group.clone(), resp.response));
-
-                    if tile_idx + 1 < tile_groups.len() {
-                        let delta = self.show_resize_handle(ui).y;
-                        if delta.abs() > 0.0 {
-                            Self::apply_adjacent_tile_resize(
-                                &mut self.tile_heights,
-                                tile_idx,
-                                delta,
-                            );
-                        }
-                    }
+                    self.needs_zoom_reset = true;
                 }
-
-                for (group, response) in &responses {
-                    self.handle_tile_group_context_menu(response, group, &channel_meta, shared);
-                }
-
-                if shared.dragging_channel.is_some()
-                    && ui.input(|i| i.pointer.any_released())
-                    && ui.ui_contains_pointer()
-                {
-                    let target_group = responses
-                        .iter()
-                        .find(|(_, resp)| resp.contains_pointer())
-                        .and_then(|(group, _)| group.first())
-                        .and_then(|&idx| self.plotted_channels.get(idx))
-                        .map(|channel| channel.tile_group);
-                    if let Some(ch_id) = shared.dragging_channel.take() {
-                        self.add_channel_to_group(
-                            ch_id,
-                            target_group.unwrap_or_else(|| self.next_tile_group()),
-                            shared,
-                        );
-                        self.needs_zoom_reset = true;
-                    }
-                }
-            });
+            }
+        });
 
         if let Some(cursor_time) = hovered_cursor {
             shared.cursor_time = Some(cursor_time);

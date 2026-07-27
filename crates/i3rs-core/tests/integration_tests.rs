@@ -342,12 +342,12 @@ fn known_data_types_are_readable() {
     let ld = LdFile::open(TEST_LD).unwrap();
     let mut types_seen = std::collections::HashSet::new();
     let mut readable_count = 0;
-    let mut unknown_count = 0;
+    let mut unknown = Vec::new();
     for ch in &ld.channels {
         types_seen.insert(ch.data_type.name());
         if ch.data_type.name() == "unknown" {
             // Unknown data types may not be readable — just skip
-            unknown_count += 1;
+            unknown.push((ch.name.clone(), ch.data_type));
             continue;
         }
         let data = ld.read_channel_data(ch);
@@ -375,9 +375,12 @@ fn known_data_types_are_readable() {
         readable_count > 190,
         "only {readable_count} channels readable"
     );
+    // Every data type in this file is decodable — the 0x06 integer family used
+    // to fall through to Unknown. A regression here means a family stopped
+    // mapping, not that the fixture changed.
     assert!(
-        unknown_count > 0,
-        "expected some unknown data types in test data"
+        unknown.is_empty(),
+        "expected every channel to decode, but these did not: {unknown:?}"
     );
     // We should see more than one data type across 199 channels
     assert!(
