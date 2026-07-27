@@ -210,14 +210,23 @@ Raw sample values are converted to engineering units using four scaling paramete
 from the channel metadata:
 
 ```
-converted = ((raw_value / scale) * 10^(-dec_places) + shift) * mul
+converted = (raw_value / scale) * 10^(-dec_places) * mul + shift
 ```
 
 Where:
 - `scale` — divisor (int16, typically 1)
 - `dec_places` — decimal shift as power of 10 (int16, typically 0)
-- `shift` — additive offset (int16, typically 0)
+- `shift` — additive offset, in engineering units (int16, typically 0)
 - `mul` — multiplier (int16, typically 1)
+
+**Operator order matters.** `shift` is an offset already expressed in engineering
+units, so it is applied *after* `mul`, not before. The two orderings agree whenever
+`mul = 1`, which hides the difference in most M1 logs — but a file with `mul != 1`
+and `shift != 0` comes out offset by `shift * (mul - 1)` if `shift` is folded in
+first. Sim-derived logs (ADL device records exported by racing simulators) commonly
+use `mul = 2` with a non-zero `shift` to pack a signed range into int16: e.g.
+`Throttle Pos` with `shift=50, mul=2, scale=1, dec_places=3` stores 0–100 % as raw
+−25000…25000, and the wrong order reports it as 50–150 %.
 
 In practice, most channels in M1 logs have `scale=1, dec_places=0, shift=0, mul=1`,
 meaning the raw float32 values are already in engineering units. The scaling parameters

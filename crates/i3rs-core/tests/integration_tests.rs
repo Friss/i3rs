@@ -111,6 +111,44 @@ fn vir_lap_parser_snapshot() {
     assert_eq!(gps_latitude.n_data, 2660);
 }
 
+/// Four channels in this fixture use the 0x06 integer family, which was missing
+/// from the data-type table — they decoded as Unknown and silently failed to
+/// load. GPS Satellites is the readable canary: a satellite count, not garbage.
+#[test]
+fn integer_family_0x06_channels_decode() {
+    let ld = LdFile::open(TEST_LD).unwrap();
+    for name in [
+        "CP Lotus ESP System State",
+        "Lap Beacon Ticks",
+        "Lap GPS Closest Beacon",
+        "GPS Satellites",
+    ] {
+        let channel = ld
+            .channels
+            .iter()
+            .find(|channel| channel.name == name)
+            .unwrap_or_else(|| panic!("{name} channel missing"));
+        let data = ld
+            .read_channel_data(channel)
+            .unwrap_or_else(|| panic!("{name} should decode"));
+        assert_eq!(data.len(), channel.n_data as usize, "{name} sample count");
+    }
+
+    let satellites = ld
+        .channels
+        .iter()
+        .find(|channel| channel.name == "GPS Satellites")
+        .expect("GPS Satellites channel missing");
+    let data = ld.read_channel_data(satellites).expect("should decode");
+    let (min, max) = data
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+    assert!(
+        (4.0..=32.0).contains(&min) && (4.0..=32.0).contains(&max),
+        "satellite count should be a plausible fix, got {min}..{max}"
+    );
+}
+
 #[test]
 fn duration_is_plausible() {
     let ld = LdFile::open(TEST_LD).unwrap();
@@ -304,12 +342,12 @@ fn known_data_types_are_readable() {
     let ld = LdFile::open(TEST_LD).unwrap();
     let mut types_seen = std::collections::HashSet::new();
     let mut readable_count = 0;
-    let mut unknown_count = 0;
+    let mut unknown = Vec::new();
     for ch in &ld.channels {
         types_seen.insert(ch.data_type.name());
         if ch.data_type.name() == "unknown" {
             // Unknown data types may not be readable — just skip
-            unknown_count += 1;
+            unknown.push((ch.name.clone(), ch.data_type));
             continue;
         }
         let data = ld.read_channel_data(ch);
@@ -337,9 +375,12 @@ fn known_data_types_are_readable() {
         readable_count > 190,
         "only {readable_count} channels readable"
     );
+    // Every data type in this file is decodable — the 0x06 integer family used
+    // to fall through to Unknown. A regression here means a family stopped
+    // mapping, not that the fixture changed.
     assert!(
-        unknown_count > 0,
-        "expected some unknown data types in test data"
+        unknown.is_empty(),
+        "expected every channel to decode, but these did not: {unknown:?}"
     );
     // We should see more than one data type across 199 channels
     assert!(

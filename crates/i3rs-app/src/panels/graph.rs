@@ -332,9 +332,70 @@ const MANAGE_NAME_COL_W: f32 = 240.0;
 const MANAGE_MODE_COL_W: f32 = 80.0;
 const MANAGE_NUM_COL_W: f32 = 70.0;
 
+/// Floor for a single tiled graph's height. Once `tile_count * MIN_TILE_HEIGHT`
+/// exceeds the panel height the tiles stop shrinking and the stack scrolls.
+const MIN_TILE_HEIGHT: f32 = 80.0;
+
 #[derive(Clone, Copy)]
 struct ManageChannelDragPayload {
     channel_id: ChannelId,
+}
+
+/// Scroll area for the main graph stack, with a permanent scrollbar gutter.
+///
+/// `ScrollStyle::solid` makes the bar allocate its own space instead of floating
+/// over the contents, and `AlwaysVisible` keeps that space reserved even when the
+/// tiles fit. Together they stop the plots changing width — and the y-axis on the
+/// right shifting — as tiles are added, removed or resized past the point where
+/// the stack starts to overflow.
+fn graph_stack_scroll_area(ui: &mut egui::Ui) -> egui::ScrollArea {
+    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+}
+
+/// Copy of [`egui::Ui::dnd_drag_source`] with `Sense::click_and_drag()`.
+///
+/// Upstream senses bare `Sense::drag()`, and because that interaction is
+/// registered *after* the contents it wraps, it sits on top of them and swallows
+/// the press — a row built with it can neither be selected by a click nor opened
+/// with a secondary click, leaving its context menu unreachable. Sensing
+/// click-and-drag on the row itself keeps dragging while letting both kinds of
+/// click through.
+///
+/// Otherwise identical to upstream (egui 0.35, `src/ui.rs:2641`); re-diff against
+/// it when upgrading egui.
+fn clickable_drag_source<Payload>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    payload: Payload,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> egui::Response
+where
+    Payload: std::any::Any + Send + Sync,
+{
+    if ui.ctx().is_being_dragged(id) {
+        egui::DragAndDrop::set_payload(ui.ctx(), payload);
+
+        // Paint the row into a floating layer that follows the pointer.
+        let layer_id = egui::LayerId::new(egui::Order::Tooltip, id);
+        let response = ui
+            .scope_builder(egui::UiBuilder::new().layer_id(layer_id), add_contents)
+            .response;
+        if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
+            let delta = pointer_pos - response.rect.center();
+            ui.ctx().transform_layer_shapes(
+                layer_id,
+                egui::emath::TSTransform::from_translation(delta),
+            );
+        }
+        response
+    } else {
+        let response = ui.scope(add_contents).response;
+        ui.interact(response.rect, id, egui::Sense::click_and_drag())
+            .on_hover_cursor(egui::CursorIcon::Grab)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1198,13 +1259,12 @@ impl GraphPanel {
         let mut first_x_bounds: Option<(f64, f64)> = None;
         let mut responses = Vec::new();
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
+        graph_stack_scroll_area(ui)
             .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
             .show(ui, |ui| {
                 for (tile_idx, group) in tile_groups.iter().enumerate() {
                     let plot_id = format!("tile_{}_{}", self.id, tile_idx);
-                    let tile_height = self.tile_heights[tile_idx].max(80.0);
+                    let tile_height = self.tile_heights[tile_idx];
 
                     let mut plot = Plot::new(plot_id)
                         .height(tile_height)
@@ -1333,9 +1393,6 @@ impl GraphPanel {
                     target_group.unwrap_or_else(|| self.next_tile_group()),
                     shared,
                 );
-                if target_group.is_none() {
-                    self.tile_heights.clear();
-                }
                 self.needs_zoom_reset = true;
             }
         }
@@ -1600,68 +1657,95 @@ impl GraphPanel {
             shared.data_duration.unwrap_or_default(),
         );
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let mut responses = Vec::new();
-                for (tile_idx, group) in tile_groups.iter().enumerate() {
-                    let tile_height = self.tile_heights[tile_idx].max(80.0);
-                    let grouped: Vec<&PlottedChannel> = group
-                        .iter()
-                        .map(|&channel_idx| &self.plotted_channels[channel_idx])
-                        .collect();
+        graph_stack_scroll_area(ui).show(ui, |ui| {
+            let mut responses = Vec::new();
+            for (tile_idx, group) in tile_groups.iter().enumerate() {
+                let tile_height = self.tile_heights[tile_idx];
+                let grouped: Vec<&PlottedChannel> = group
+                    .iter()
+                    .map(|&channel_idx| &self.plotted_channels[channel_idx])
+                    .collect();
 
-                    let mut plot = Plot::new(format!("lap_overlay_tile_{}_{}", self.id, tile_idx))
-                        .height(tile_height)
-                        .allow_drag(egui::Vec2b::new(true, false))
-                        .allow_zoom(egui::Vec2b::new(true, false))
-                        .allow_scroll(false)
-                        .show_axes(true)
-                        .show_grid(true)
-                        .y_axis_min_width(36.0)
-                        .link_cursor(cursor_group, egui::Vec2b::new(true, false));
-                    if tile_idx == tile_groups.len() - 1 {
-                        plot = plot.x_axis_label(viewport.axis_label());
+                let mut plot = Plot::new(format!("lap_overlay_tile_{}_{}", self.id, tile_idx))
+                    .height(tile_height)
+                    .allow_drag(egui::Vec2b::new(true, false))
+                    .allow_zoom(egui::Vec2b::new(true, false))
+                    .allow_scroll(false)
+                    .show_axes(true)
+                    .show_grid(true)
+                    .y_axis_min_width(36.0)
+                    .link_cursor(cursor_group, egui::Vec2b::new(true, false));
+                if tile_idx == tile_groups.len() - 1 {
+                    plot = plot.x_axis_label(viewport.axis_label());
+                }
+
+                let y_range = Self::compute_y_range(&grouped);
+                let mut tile_cursor = None;
+                let resp = plot.show(ui, |plot_ui| {
+                    let mut draw_specs = Vec::new();
+                    let (x_min, x_max) = if needs_zoom_reset {
+                        viewport.full_range()
+                    } else if let Some((z_min, z_max)) = zoom_range {
+                        viewport.axis_range_for_time_range(z_min, z_max)
+                    } else {
+                        viewport.full_range()
+                    };
+                    plot_ui.set_plot_bounds_x(x_min..=x_max);
+
+                    if let Some((y_min, y_max)) = y_range {
+                        plot_ui.set_plot_bounds_y(y_min..=y_max);
                     }
 
-                    let y_range = Self::compute_y_range(&grouped);
-                    let mut tile_cursor = None;
-                    let resp = plot.show(ui, |plot_ui| {
-                        let mut draw_specs = Vec::new();
-                        let (x_min, x_max) = if needs_zoom_reset {
-                            viewport.full_range()
-                        } else if let Some((z_min, z_max)) = zoom_range {
-                            viewport.axis_range_for_time_range(z_min, z_max)
-                        } else {
-                            viewport.full_range()
-                        };
-                        plot_ui.set_plot_bounds_x(x_min..=x_max);
+                    let target_width = plot_ui.response().rect.width().max(100.0) as usize;
+                    let lap_render_cache = &mut self.lap_render_cache;
+                    for pc in &grouped {
+                        let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
+                        let preserve_native_samples =
+                            preserve_native_samples_for_channel(pc.channel_id, shared);
+                        let reference_key = LapRenderCacheKey::Reference(pc.channel_id);
+                        ensure_lap_series_cache(
+                            plot_ui,
+                            shared,
+                            lap_render_cache,
+                            reference_key,
+                            LapSeriesRenderParams {
+                                data: &pc.data,
+                                freq,
+                                lap: &viewport.reference_lap,
+                                axis: &viewport.reference_axis,
+                                transform: PlotTransform {
+                                    origin_axis: viewport.reference_origin_axis,
+                                    x_scale: 1.0,
+                                    x_offset: 0.0,
+                                    y_scale: pc.display_scale,
+                                    y_offset: pc.display_offset,
+                                },
+                                target_width,
+                                preserve_native_samples,
+                            },
+                        );
+                        draw_specs.push((reference_key, pc.color, 2.0));
 
-                        if let Some((y_min, y_max)) = y_range {
-                            plot_ui.set_plot_bounds_y(y_min..=y_max);
-                        }
-
-                        let target_width = plot_ui.response().rect.width().max(100.0) as usize;
-                        let lap_render_cache = &mut self.lap_render_cache;
-                        for pc in &grouped {
-                            let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
-                            let preserve_native_samples =
-                                preserve_native_samples_for_channel(pc.channel_id, shared);
-                            let reference_key = LapRenderCacheKey::Reference(pc.channel_id);
+                        for prepared in prepared_overlays.get(&pc.channel_id).into_iter().flatten()
+                        {
+                            let overlay_key = LapRenderCacheKey::Overlay {
+                                channel_id: pc.channel_id,
+                                overlay_idx: prepared.overlay_idx,
+                            };
                             ensure_lap_series_cache(
                                 plot_ui,
                                 shared,
                                 lap_render_cache,
-                                reference_key,
+                                overlay_key,
                                 LapSeriesRenderParams {
-                                    data: &pc.data,
-                                    freq,
-                                    lap: &viewport.reference_lap,
-                                    axis: &viewport.reference_axis,
+                                    data: &prepared.data,
+                                    freq: prepared.freq,
+                                    lap: &prepared.lap,
+                                    axis: &prepared.axis,
                                     transform: PlotTransform {
-                                        origin_axis: viewport.reference_origin_axis,
-                                        x_scale: 1.0,
-                                        x_offset: 0.0,
+                                        origin_axis: prepared.origin_axis,
+                                        x_scale: prepared.scale,
+                                        x_offset: prepared.offset,
                                         y_scale: pc.display_scale,
                                         y_offset: pc.display_offset,
                                     },
@@ -1669,121 +1753,75 @@ impl GraphPanel {
                                     preserve_native_samples,
                                 },
                             );
-                            draw_specs.push((reference_key, pc.color, 2.0));
-
-                            for prepared in
-                                prepared_overlays.get(&pc.channel_id).into_iter().flatten()
-                            {
-                                let overlay_key = LapRenderCacheKey::Overlay {
-                                    channel_id: pc.channel_id,
-                                    overlay_idx: prepared.overlay_idx,
-                                };
-                                ensure_lap_series_cache(
-                                    plot_ui,
-                                    shared,
-                                    lap_render_cache,
-                                    overlay_key,
-                                    LapSeriesRenderParams {
-                                        data: &prepared.data,
-                                        freq: prepared.freq,
-                                        lap: &prepared.lap,
-                                        axis: &prepared.axis,
-                                        transform: PlotTransform {
-                                            origin_axis: prepared.origin_axis,
-                                            x_scale: prepared.scale,
-                                            x_offset: prepared.offset,
-                                            y_scale: pc.display_scale,
-                                            y_offset: pc.display_offset,
-                                        },
-                                        target_width,
-                                        preserve_native_samples,
-                                    },
-                                );
-                                draw_specs.push((overlay_key, prepared.color, prepared.width));
-                            }
+                            draw_specs.push((overlay_key, prepared.color, prepared.width));
                         }
-
-                        let lap_render_cache = &self.lap_render_cache;
-                        for (cache_key, color, width) in draw_specs {
-                            draw_cached_lap_series(
-                                plot_ui,
-                                lap_render_cache,
-                                &cache_key,
-                                color,
-                                width,
-                            );
-                        }
-
-                        if let Some(cursor_time) = cursor_time {
-                            Self::draw_cursor_line(
-                                plot_ui,
-                                viewport.axis_value_for_time(cursor_time),
-                            );
-                        }
-                        if let Some(coord) = plot_ui.pointer_coordinate() {
-                            tile_cursor = viewport.time_from_axis_value(coord.x);
-                        }
-                    });
-
-                    let bounds = resp.transform.bounds();
-                    let pair = (bounds.min()[0], bounds.max()[0]);
-                    if first_bounds.is_none() {
-                        first_bounds = Some(pair);
                     }
-                    if resp.response.hovered() {
-                        hovered_bounds = Some(pair);
-                        hovered_cursor = tile_cursor;
+
+                    let lap_render_cache = &self.lap_render_cache;
+                    for (cache_key, color, width) in draw_specs {
+                        draw_cached_lap_series(plot_ui, lap_render_cache, &cache_key, color, width);
                     }
-                    Self::draw_group_legend(
-                        ui,
-                        resp.response.rect,
-                        &grouped,
-                        &channel_meta,
-                        group,
-                        cursor_time,
-                        Some(viewport.time_range_from_plot_bounds(pair.0, pair.1)),
+
+                    if let Some(cursor_time) = cursor_time {
+                        Self::draw_cursor_line(plot_ui, viewport.axis_value_for_time(cursor_time));
+                    }
+                    if let Some(coord) = plot_ui.pointer_coordinate() {
+                        tile_cursor = viewport.time_from_axis_value(coord.x);
+                    }
+                });
+
+                let bounds = resp.transform.bounds();
+                let pair = (bounds.min()[0], bounds.max()[0]);
+                if first_bounds.is_none() {
+                    first_bounds = Some(pair);
+                }
+                if resp.response.hovered() {
+                    hovered_bounds = Some(pair);
+                    hovered_cursor = tile_cursor;
+                }
+                Self::draw_group_legend(
+                    ui,
+                    resp.response.rect,
+                    &grouped,
+                    &channel_meta,
+                    group,
+                    cursor_time,
+                    Some(viewport.time_range_from_plot_bounds(pair.0, pair.1)),
+                );
+                responses.push((group.clone(), resp.response));
+
+                if tile_idx + 1 < tile_groups.len() {
+                    let delta = self.show_resize_handle(ui).y;
+                    if delta.abs() > 0.0 {
+                        Self::apply_adjacent_tile_resize(&mut self.tile_heights, tile_idx, delta);
+                    }
+                }
+            }
+
+            for (group, response) in &responses {
+                self.handle_tile_group_context_menu(response, group, &channel_meta, shared);
+            }
+
+            if shared.dragging_channel.is_some()
+                && ui.input(|i| i.pointer.any_released())
+                && ui.ui_contains_pointer()
+            {
+                let target_group = responses
+                    .iter()
+                    .find(|(_, resp)| resp.contains_pointer())
+                    .and_then(|(group, _)| group.first())
+                    .and_then(|&idx| self.plotted_channels.get(idx))
+                    .map(|channel| channel.tile_group);
+                if let Some(ch_id) = shared.dragging_channel.take() {
+                    self.add_channel_to_group(
+                        ch_id,
+                        target_group.unwrap_or_else(|| self.next_tile_group()),
+                        shared,
                     );
-                    responses.push((group.clone(), resp.response));
-
-                    if tile_idx + 1 < tile_groups.len() {
-                        let delta = self.show_resize_handle(ui).y;
-                        if delta.abs() > 0.0 {
-                            Self::apply_adjacent_tile_resize(
-                                &mut self.tile_heights,
-                                tile_idx,
-                                delta,
-                            );
-                        }
-                    }
+                    self.needs_zoom_reset = true;
                 }
-
-                for (group, response) in &responses {
-                    self.handle_tile_group_context_menu(response, group, &channel_meta, shared);
-                }
-
-                if shared.dragging_channel.is_some()
-                    && ui.input(|i| i.pointer.any_released())
-                    && ui.ui_contains_pointer()
-                {
-                    let target_group = responses
-                        .iter()
-                        .find(|(_, resp)| resp.contains_pointer())
-                        .and_then(|(group, _)| group.first())
-                        .and_then(|&idx| self.plotted_channels.get(idx))
-                        .map(|channel| channel.tile_group);
-                    if let Some(ch_id) = shared.dragging_channel.take() {
-                        self.add_channel_to_group(
-                            ch_id,
-                            target_group.unwrap_or_else(|| self.next_tile_group()),
-                            shared,
-                        );
-                        if target_group.is_none() {
-                            self.tile_heights.clear();
-                        }
-                        self.needs_zoom_reset = true;
-                    }
-                }
-            });
+            }
+        });
 
         if let Some(cursor_time) = hovered_cursor {
             shared.cursor_time = Some(cursor_time);
@@ -2334,14 +2372,74 @@ impl GraphPanel {
             self.tile_heights.clear();
             return;
         }
-        let default_height = (available_height / tile_count as f32).max(80.0);
-        if self.tile_heights.len() < tile_count {
-            self.tile_heights.resize(tile_count, default_height);
-        } else if self.tile_heights.len() > tile_count {
-            self.tile_heights.truncate(tile_count);
+        // Adding or removing a tile changes how much height there is to go
+        // around, so refit the whole stack. Without this the existing tiles keep
+        // their old heights, the new one is simply appended, and the stack
+        // overflows into the scroll area instead of the graphs shrinking to make
+        // room.
+        if self.tile_heights.len() != tile_count {
+            let equal_share = (available_height / tile_count as f32).max(MIN_TILE_HEIGHT);
+            self.tile_heights.resize(tile_count, equal_share);
+            Self::fit_tile_heights(&mut self.tile_heights, available_height);
         }
-        for height in &mut self.tile_heights {
-            *height = height.max(80.0);
+    }
+
+    /// Scale `heights` to sum to `available`, keeping their relative proportions
+    /// so heights the user dragged survive a tile being added or removed.
+    ///
+    /// Tiles that would scale below [`MIN_TILE_HEIGHT`] are pinned to it and the
+    /// rest rescaled into the height that frees up — plain proportional scaling
+    /// plus a clamp overflows the panel whenever one tile already sits near the
+    /// floor, since clamping it back up adds height the others never gave away.
+    fn fit_tile_heights(heights: &mut [f32], available: f32) {
+        let n = heights.len();
+        if n == 0 {
+            return;
+        }
+        let total: f32 = heights.iter().sum();
+        // Degenerate weights, or too many tiles to give each one its floor — the
+        // stack scrolls instead, so equal shares at the floor is the best fit.
+        if total <= 0.0 || available < n as f32 * MIN_TILE_HEIGHT {
+            heights.fill((available / n as f32).max(MIN_TILE_HEIGHT));
+            return;
+        }
+
+        let weights = heights.to_vec();
+        let mut pinned = vec![false; n];
+        loop {
+            let free_height =
+                available - pinned.iter().filter(|p| **p).count() as f32 * MIN_TILE_HEIGHT;
+            let free_weight: f32 = weights
+                .iter()
+                .zip(&pinned)
+                .filter(|(_, p)| !**p)
+                .map(|(w, _)| *w)
+                .sum();
+            if free_weight <= 0.0 {
+                heights.fill(MIN_TILE_HEIGHT);
+                return;
+            }
+            let factor = free_height / free_weight;
+
+            // Pinning a tile frees height for the others, so re-solve. Each pass
+            // pins at least one tile, which bounds this at `n` passes.
+            let mut newly_pinned = false;
+            for (i, weight) in weights.iter().enumerate() {
+                if !pinned[i] && weight * factor < MIN_TILE_HEIGHT {
+                    pinned[i] = true;
+                    newly_pinned = true;
+                }
+            }
+            if !newly_pinned {
+                for (i, height) in heights.iter_mut().enumerate() {
+                    *height = if pinned[i] {
+                        MIN_TILE_HEIGHT
+                    } else {
+                        weights[i] * factor
+                    };
+                }
+                return;
+            }
         }
     }
 
@@ -2349,9 +2447,8 @@ impl GraphPanel {
         if upper_idx + 1 >= tile_heights.len() {
             return;
         }
-        let min_height = 80.0;
-        let max_down = tile_heights[upper_idx + 1] - min_height;
-        let max_up = tile_heights[upper_idx] - min_height;
+        let max_down = tile_heights[upper_idx + 1] - MIN_TILE_HEIGHT;
+        let max_up = tile_heights[upper_idx] - MIN_TILE_HEIGHT;
         let applied = delta.clamp(-max_up, max_down);
         tile_heights[upper_idx] += applied;
         tile_heights[upper_idx + 1] -= applied;
@@ -2685,7 +2782,6 @@ impl GraphPanel {
         channel.tile_group = self.next_tile_group();
         self.plotted_channels.push(channel);
         self.normalize_tile_groups();
-        self.tile_heights.clear();
     }
 
     fn sync_manage_channels_state(&mut self) {
@@ -2954,7 +3050,8 @@ impl GraphPanel {
                                     ));
                                     let raw_unit = resolve_channel_meta(pc.channel_id, shared).1;
                                     ui.horizontal(|ui| {
-                                        let drag_response = ui.dnd_drag_source(
+                                        let row_response = clickable_drag_source(
+                                            ui,
                                             drag_id,
                                             ManageChannelDragPayload {
                                                 channel_id: pc.channel_id,
@@ -2965,22 +3062,21 @@ impl GraphPanel {
                                                     ui.colored_label(pc.color, "■");
                                                     ui.add_sized(
                                                         [MANAGE_NAME_COL_W - 34.0, row_h],
-                                                        egui::Button::new(row_label.clone())
+                                                        egui::Button::new(row_label)
                                                             .selected(row_selected)
                                                             .truncate(),
-                                                    )
-                                                })
-                                                .inner
+                                                    );
+                                                });
                                             },
                                         );
 
-                                        if drag_response.inner.clicked() {
+                                        if row_response.clicked() {
                                             pending_selection = Some(
                                                 ManageChannelsSelection::Channel(pc.channel_id),
                                             );
                                         }
 
-                                        drag_response.inner.context_menu(|ui| {
+                                        row_response.context_menu(|ui| {
                                             let mut action = None;
                                             Self::show_channel_menu(
                                                 ui,
@@ -3012,6 +3108,17 @@ impl GraphPanel {
                                                 ManageChannelsSelection::Channel(pc.channel_id),
                                             );
                                             edit_request = Some(pc.channel_id);
+                                        }
+                                        if ui
+                                            .add(egui::Button::new(
+                                                egui::RichText::new("X").small(),
+                                            ))
+                                            .on_hover_text("Remove channel from this graph")
+                                            .clicked()
+                                        {
+                                            pending_actions.push(ManageChannelsAction::Remove(
+                                                pc.channel_id,
+                                            ));
                                         }
                                     });
 
@@ -4419,13 +4526,114 @@ impl NormalizedNameExt for str {
 mod tests {
     use super::{
         ActiveGraphXAxis, GraphAxisFingerprint, GraphPanel, GraphRenderFingerprint,
-        LapRenderFingerprint, OverlaySource, PlotXRange, SampleRange,
+        LapRenderFingerprint, MIN_TILE_HEIGHT, OverlaySource, PlotXRange, SampleRange,
         display_transform_fingerprint, integrate_speed_series, is_monotonic_non_decreasing,
         native_plot_points_for_range, overlay_axis_offset, time_from_monotonic_axis,
     };
     use crate::state::{ChannelId, PlottedChannel, YAxis};
     use i3rs_core::Lap;
     use std::sync::Arc;
+
+    /// Adding a graph has to shrink the existing tiles to make room rather than
+    /// appending a tile and overflowing the panel; removing one has to give the
+    /// space back.
+    #[test]
+    fn changing_the_tile_count_reflows_the_stack_to_fit() {
+        let panel_height = 600.0;
+        let mut panel = GraphPanel::new(0, "test");
+
+        panel.ensure_tile_heights(3, panel_height);
+        assert_eq!(panel.tile_heights, vec![200.0, 200.0, 200.0]);
+
+        for count in [4, 3, 7, 2] {
+            panel.ensure_tile_heights(count, panel_height);
+            assert_eq!(panel.tile_heights.len(), count);
+            let total: f32 = panel.tile_heights.iter().sum();
+            assert!(
+                (total - panel_height).abs() < 0.01,
+                "{count} tiles should fill the panel, got {total} for {:?}",
+                panel.tile_heights
+            );
+        }
+    }
+
+    /// Reflowing must not discard proportions the user set by dragging handles.
+    #[test]
+    fn reflow_preserves_user_dragged_proportions() {
+        let panel_height = 600.0;
+        let mut panel = GraphPanel::new(0, "test");
+        panel.tile_heights = vec![300.0, 150.0, 150.0];
+
+        panel.ensure_tile_heights(4, panel_height);
+
+        let total: f32 = panel.tile_heights.iter().sum();
+        assert!((total - panel_height).abs() < 0.01, "got {total}");
+        // The first tile stayed twice the height of its two original neighbours.
+        assert!(
+            (panel.tile_heights[0] / panel.tile_heights[1] - 2.0).abs() < 0.01,
+            "expected 2:1 ratio to survive, got {:?}",
+            panel.tile_heights
+        );
+    }
+
+    /// A tile already near the floor can't absorb its share of the shrink, so the
+    /// height has to come from the tiles that do have slack. Scaling everything
+    /// and then clamping would overflow the panel.
+    #[test]
+    fn a_tile_at_the_floor_does_not_push_the_stack_over() {
+        let panel_height = 600.0;
+        let mut panel = GraphPanel::new(0, "test");
+        panel.tile_heights = vec![440.0, MIN_TILE_HEIGHT, MIN_TILE_HEIGHT];
+
+        panel.ensure_tile_heights(4, panel_height);
+
+        let total: f32 = panel.tile_heights.iter().sum();
+        assert!(
+            (total - panel_height).abs() < 0.01,
+            "expected an exact fit, got {total} for {:?}",
+            panel.tile_heights
+        );
+        assert!(
+            panel.tile_heights.iter().all(|h| *h >= MIN_TILE_HEIGHT),
+            "no tile may go under the floor, got {:?}",
+            panel.tile_heights
+        );
+    }
+
+    /// Past the point where every tile can hold its floor the stack scrolls
+    /// instead, so heights stop shrinking.
+    #[test]
+    fn tiles_stop_shrinking_at_the_minimum_height() {
+        let panel_height = 300.0;
+        let mut panel = GraphPanel::new(0, "test");
+        panel.ensure_tile_heights(10, panel_height);
+
+        assert_eq!(panel.tile_heights.len(), 10);
+        assert!(
+            panel.tile_heights.iter().all(|h| *h >= MIN_TILE_HEIGHT),
+            "no tile may go under the floor, got {:?}",
+            panel.tile_heights
+        );
+    }
+
+    /// A resize drag is zero-sum, so a stack that already fits stays fitting and
+    /// `ensure_tile_heights` must leave dragged heights alone.
+    #[test]
+    fn unchanged_tile_count_preserves_dragged_heights() {
+        let panel_height = 600.0;
+        let mut panel = GraphPanel::new(0, "test");
+        panel.ensure_tile_heights(3, panel_height);
+
+        GraphPanel::apply_adjacent_tile_resize(&mut panel.tile_heights, 0, 50.0);
+        assert_eq!(panel.tile_heights, vec![250.0, 150.0, 200.0]);
+
+        let before = panel.tile_heights.clone();
+        panel.ensure_tile_heights(3, panel_height);
+        assert_eq!(
+            panel.tile_heights, before,
+            "an unchanged tile count must not disturb dragged heights"
+        );
+    }
 
     #[test]
     fn integrates_kmh_speed_into_distance() {
