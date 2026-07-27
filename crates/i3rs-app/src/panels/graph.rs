@@ -332,9 +332,72 @@ const MANAGE_NAME_COL_W: f32 = 240.0;
 const MANAGE_MODE_COL_W: f32 = 80.0;
 const MANAGE_NUM_COL_W: f32 = 70.0;
 
+/// Floor for a single tiled graph's height. Once `tile_count * MIN_TILE_HEIGHT`
+/// exceeds the panel height the tiles stop shrinking and the stack scrolls.
+const MIN_TILE_HEIGHT: f32 = 80.0;
+
 #[derive(Clone, Copy)]
 struct ManageChannelDragPayload {
     channel_id: ChannelId,
+}
+
+/// Scroll area for the main graph stack, with a permanent scrollbar gutter.
+///
+/// `ScrollStyle::solid` makes the bar allocate its own space instead of floating
+/// over the contents, and `AlwaysVisible` keeps that space reserved even when the
+/// tiles fit. Together they stop the plots changing width — and the y-axis on the
+/// right shifting — as tiles are added, removed or resized past the point where
+/// the stack starts to overflow.
+fn graph_stack_scroll_area(ui: &mut egui::Ui) -> egui::ScrollArea {
+    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+}
+
+/// A drag source whose row also senses clicks.
+///
+/// [`egui::Ui::dnd_drag_source`] layers a bare `Sense::drag()` interaction over
+/// the contents it just added. Because that interaction is registered last it
+/// sits on top of anything inside and swallows the press, so a row built with it
+/// can neither be selected by a click nor opened with a secondary click — its
+/// context menu is unreachable too. Sensing `click_and_drag` on the row itself
+/// keeps the dragging behaviour while letting both kinds of click through.
+fn clickable_drag_source<Payload>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    payload: Payload,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) -> egui::Response
+where
+    Payload: std::any::Any + Send + Sync,
+{
+    if ui.ctx().is_being_dragged(id) {
+        egui::DragAndDrop::set_payload(ui.ctx(), payload);
+
+        // Paint the row into a floating layer that follows the pointer.
+        let layer_id = egui::LayerId::new(egui::Order::Tooltip, id);
+        let response = ui
+            .scope_builder(egui::UiBuilder::new().layer_id(layer_id), add_contents)
+            .response;
+        if let Some(pointer_pos) = ui.ctx().pointer_interact_pos() {
+            let delta = pointer_pos - response.rect.center();
+            ui.ctx().transform_layer_shapes(
+                layer_id,
+                egui::emath::TSTransform::from_translation(delta),
+            );
+        }
+        response
+    } else {
+        let response = ui.scope(add_contents).response;
+        let row = ui
+            .interact(response.rect, id, egui::Sense::click_and_drag())
+            .on_hover_cursor(egui::CursorIcon::Grab);
+        if row.drag_started() {
+            egui::DragAndDrop::set_payload(ui.ctx(), payload);
+        }
+        row
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1198,13 +1261,12 @@ impl GraphPanel {
         let mut first_x_bounds: Option<(f64, f64)> = None;
         let mut responses = Vec::new();
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
+        graph_stack_scroll_area(ui)
             .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
             .show(ui, |ui| {
                 for (tile_idx, group) in tile_groups.iter().enumerate() {
                     let plot_id = format!("tile_{}_{}", self.id, tile_idx);
-                    let tile_height = self.tile_heights[tile_idx].max(80.0);
+                    let tile_height = self.tile_heights[tile_idx];
 
                     let mut plot = Plot::new(plot_id)
                         .height(tile_height)
@@ -1333,9 +1395,6 @@ impl GraphPanel {
                     target_group.unwrap_or_else(|| self.next_tile_group()),
                     shared,
                 );
-                if target_group.is_none() {
-                    self.tile_heights.clear();
-                }
                 self.needs_zoom_reset = true;
             }
         }
@@ -1600,12 +1659,11 @@ impl GraphPanel {
             shared.data_duration.unwrap_or_default(),
         );
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
+        graph_stack_scroll_area(ui)
             .show(ui, |ui| {
                 let mut responses = Vec::new();
                 for (tile_idx, group) in tile_groups.iter().enumerate() {
-                    let tile_height = self.tile_heights[tile_idx].max(80.0);
+                    let tile_height = self.tile_heights[tile_idx];
                     let grouped: Vec<&PlottedChannel> = group
                         .iter()
                         .map(|&channel_idx| &self.plotted_channels[channel_idx])
@@ -1777,9 +1835,6 @@ impl GraphPanel {
                             target_group.unwrap_or_else(|| self.next_tile_group()),
                             shared,
                         );
-                        if target_group.is_none() {
-                            self.tile_heights.clear();
-                        }
                         self.needs_zoom_reset = true;
                     }
                 }
@@ -2334,14 +2389,33 @@ impl GraphPanel {
             self.tile_heights.clear();
             return;
         }
-        let default_height = (available_height / tile_count as f32).max(80.0);
+        let equal_share = (available_height / tile_count as f32).max(MIN_TILE_HEIGHT);
+        let count_changed = self.tile_heights.len() != tile_count;
+
         if self.tile_heights.len() < tile_count {
-            self.tile_heights.resize(tile_count, default_height);
+            self.tile_heights.resize(tile_count, equal_share);
         } else if self.tile_heights.len() > tile_count {
             self.tile_heights.truncate(tile_count);
         }
+
+        // Adding or removing a tile changes how much height there is to go
+        // around, so rescale the whole stack to fill the panel again. Without
+        // this the existing tiles keep their old heights, the new one is simply
+        // appended, and the stack overflows into the scroll area instead of the
+        // graphs shrinking to make room. Scaling (rather than resetting to equal
+        // shares) keeps whatever proportions the user dragged.
+        if count_changed && available_height >= tile_count as f32 * MIN_TILE_HEIGHT {
+            let total: f32 = self.tile_heights.iter().sum();
+            if total > 0.0 {
+                let factor = available_height / total;
+                for height in &mut self.tile_heights {
+                    *height *= factor;
+                }
+            }
+        }
+
         for height in &mut self.tile_heights {
-            *height = height.max(80.0);
+            *height = height.max(MIN_TILE_HEIGHT);
         }
     }
 
@@ -2349,9 +2423,8 @@ impl GraphPanel {
         if upper_idx + 1 >= tile_heights.len() {
             return;
         }
-        let min_height = 80.0;
-        let max_down = tile_heights[upper_idx + 1] - min_height;
-        let max_up = tile_heights[upper_idx] - min_height;
+        let max_down = tile_heights[upper_idx + 1] - MIN_TILE_HEIGHT;
+        let max_up = tile_heights[upper_idx] - MIN_TILE_HEIGHT;
         let applied = delta.clamp(-max_up, max_down);
         tile_heights[upper_idx] += applied;
         tile_heights[upper_idx + 1] -= applied;
@@ -2685,7 +2758,6 @@ impl GraphPanel {
         channel.tile_group = self.next_tile_group();
         self.plotted_channels.push(channel);
         self.normalize_tile_groups();
-        self.tile_heights.clear();
     }
 
     fn sync_manage_channels_state(&mut self) {
@@ -2954,7 +3026,8 @@ impl GraphPanel {
                                     ));
                                     let raw_unit = resolve_channel_meta(pc.channel_id, shared).1;
                                     ui.horizontal(|ui| {
-                                        let drag_response = ui.dnd_drag_source(
+                                        let row_response = clickable_drag_source(
+                                            ui,
                                             drag_id,
                                             ManageChannelDragPayload {
                                                 channel_id: pc.channel_id,
@@ -2968,19 +3041,18 @@ impl GraphPanel {
                                                         egui::Button::new(row_label.clone())
                                                             .selected(row_selected)
                                                             .truncate(),
-                                                    )
-                                                })
-                                                .inner
+                                                    );
+                                                });
                                             },
                                         );
 
-                                        if drag_response.inner.clicked() {
+                                        if row_response.clicked() {
                                             pending_selection = Some(
                                                 ManageChannelsSelection::Channel(pc.channel_id),
                                             );
                                         }
 
-                                        drag_response.inner.context_menu(|ui| {
+                                        row_response.context_menu(|ui| {
                                             let mut action = None;
                                             Self::show_channel_menu(
                                                 ui,
@@ -3012,6 +3084,17 @@ impl GraphPanel {
                                                 ManageChannelsSelection::Channel(pc.channel_id),
                                             );
                                             edit_request = Some(pc.channel_id);
+                                        }
+                                        if ui
+                                            .add(egui::Button::new(
+                                                egui::RichText::new("X").small(),
+                                            ))
+                                            .on_hover_text("Remove channel from this graph")
+                                            .clicked()
+                                        {
+                                            pending_actions.push(ManageChannelsAction::Remove(
+                                                pc.channel_id,
+                                            ));
                                         }
                                     });
 
@@ -4419,13 +4502,99 @@ impl NormalizedNameExt for str {
 mod tests {
     use super::{
         ActiveGraphXAxis, GraphAxisFingerprint, GraphPanel, GraphRenderFingerprint,
-        LapRenderFingerprint, OverlaySource, PlotXRange, SampleRange,
+        LapRenderFingerprint, MIN_TILE_HEIGHT, OverlaySource, PlotXRange, SampleRange,
         display_transform_fingerprint, integrate_speed_series, is_monotonic_non_decreasing,
         native_plot_points_for_range, overlay_axis_offset, time_from_monotonic_axis,
     };
     use crate::state::{ChannelId, PlottedChannel, YAxis};
     use i3rs_core::Lap;
     use std::sync::Arc;
+
+    /// Adding a graph has to shrink the existing tiles to make room, rather than
+    /// appending a tile and overflowing the panel.
+    #[test]
+    fn adding_a_tile_reflows_existing_tiles_to_fit() {
+        let panel_height = 600.0;
+        let mut panel = GraphPanel::new(0, "test");
+
+        panel.ensure_tile_heights(3, panel_height);
+        assert_eq!(panel.tile_heights, vec![200.0, 200.0, 200.0]);
+
+        panel.ensure_tile_heights(4, panel_height);
+        assert_eq!(panel.tile_heights.len(), 4);
+        let total: f32 = panel.tile_heights.iter().sum();
+        assert!(
+            (total - panel_height).abs() < 0.01,
+            "tiles should still fill the panel, got {total} for {:?}",
+            panel.tile_heights
+        );
+    }
+
+    /// Reflowing must not discard proportions the user set by dragging handles.
+    #[test]
+    fn reflow_preserves_user_dragged_proportions() {
+        let panel_height = 600.0;
+        let mut panel = GraphPanel::new(0, "test");
+        panel.tile_heights = vec![300.0, 150.0, 150.0];
+
+        panel.ensure_tile_heights(4, panel_height);
+
+        let total: f32 = panel.tile_heights.iter().sum();
+        assert!((total - panel_height).abs() < 0.01, "got {total}");
+        // The first tile stayed twice the height of its two original neighbours.
+        assert!(
+            (panel.tile_heights[0] / panel.tile_heights[1] - 2.0).abs() < 0.01,
+            "expected 2:1 ratio to survive, got {:?}",
+            panel.tile_heights
+        );
+    }
+
+    #[test]
+    fn removing_a_tile_reflows_to_fill_the_panel() {
+        let panel_height = 600.0;
+        let mut panel = GraphPanel::new(0, "test");
+        panel.ensure_tile_heights(4, panel_height);
+        panel.ensure_tile_heights(3, panel_height);
+
+        assert_eq!(panel.tile_heights.len(), 3);
+        let total: f32 = panel.tile_heights.iter().sum();
+        assert!((total - panel_height).abs() < 0.01, "got {total}");
+    }
+
+    /// Past the point where every tile can hold its floor the stack scrolls
+    /// instead, so heights stop shrinking.
+    #[test]
+    fn tiles_stop_shrinking_at_the_minimum_height() {
+        let panel_height = 300.0;
+        let mut panel = GraphPanel::new(0, "test");
+        panel.ensure_tile_heights(10, panel_height);
+
+        assert_eq!(panel.tile_heights.len(), 10);
+        assert!(
+            panel.tile_heights.iter().all(|h| *h >= MIN_TILE_HEIGHT),
+            "no tile may go under the floor, got {:?}",
+            panel.tile_heights
+        );
+    }
+
+    /// A resize drag is zero-sum, so a stack that already fits stays fitting and
+    /// repeated `ensure_tile_heights` calls are a no-op.
+    #[test]
+    fn dragging_a_handle_conserves_total_height() {
+        let panel_height = 600.0;
+        let mut panel = GraphPanel::new(0, "test");
+        panel.ensure_tile_heights(3, panel_height);
+
+        GraphPanel::apply_adjacent_tile_resize(&mut panel.tile_heights, 0, 50.0);
+        assert_eq!(panel.tile_heights, vec![250.0, 150.0, 200.0]);
+
+        let before = panel.tile_heights.clone();
+        panel.ensure_tile_heights(3, panel_height);
+        assert_eq!(
+            panel.tile_heights, before,
+            "an unchanged tile count must not disturb dragged heights"
+        );
+    }
 
     #[test]
     fn integrates_kmh_speed_into_distance() {
