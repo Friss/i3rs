@@ -331,7 +331,7 @@ impl LdFile {
         self.data().len()
     }
 
-    /// Latest recorded sample timestamp plus one period of the finest sample grid.
+    /// First finest-grid boundary after the latest recorded sample timestamp.
     /// Include channels that outlast the fastest channel without adding a full
     /// slow-channel period of padding.
     pub fn duration_secs(&self) -> f64 {
@@ -343,10 +343,12 @@ impl LdFile {
         if max_freq == 0 {
             return 0.0;
         }
-        channels
-            .map(|ch| (ch.n_data - 1) as f64 / ch.freq as f64)
-            .fold(0.0_f64, f64::max)
-            + 1.0 / max_freq as f64
+        // Integer arithmetic avoids rounding down a sample already on the grid.
+        let end_tick = channels
+            .map(|ch| (ch.n_data - 1) as u64 * max_freq as u64 / ch.freq as u64 + 1)
+            .max()
+            .unwrap_or(0);
+        end_tick as f64 / max_freq as f64
     }
 
     pub fn find_channel_by_name(&self, name: &str) -> Option<&ChannelMeta> {
@@ -983,6 +985,15 @@ mod tests {
         slow.n_data = 5;
         ld.channels.push(slow);
         assert_eq!(ld.duration_secs(), 4.01);
+
+        // A different sample grid may end within the final finest-grid period.
+        // Round to the next boundary rather than adding another whole period.
+        let mut beacon = ld.channels[0].clone();
+        beacon.freq = 68;
+        beacon.n_data = 266439; // last sample at 3918.205882... seconds
+        ld.channels[0].n_data = 391821;
+        ld.channels.push(beacon);
+        assert_eq!(ld.duration_secs(), 3918.21);
     }
 
     #[test]
