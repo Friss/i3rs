@@ -13,7 +13,7 @@ use super::utils::{
     DisplayTransformFingerprint, build_plotted_channel_info, create_plotted_channel,
     display_transform_fingerprint, interp_at_time, refresh_plotted_channel,
     resolve_plotted_channel_display_meta, segmented_channel_button,
-    show_plotted_channel_display_menu, transform_channel_value,
+    show_plotted_channel_display_menu,
 };
 
 #[derive(PartialEq, Eq)]
@@ -535,13 +535,18 @@ impl MixtureMapPanel {
         }
 
         if let Some(cursor_time) = shared.cursor_time
-            && let (Some(x_val), Some(y_val)) = (
-                interp_at_time(&x_ch.data, x_freq, cursor_time),
-                interp_at_time(&y_ch.data, y_freq, cursor_time),
+            && let Some((x_val, y_val, _)) = mixture_sample(
+                (&x_ch.data, x_freq, x_ch.display_scale, x_ch.display_offset),
+                (&y_ch.data, y_freq, y_ch.display_scale, y_ch.display_offset),
+                (&v_ch.data, v_freq, v_ch.display_scale, v_ch.display_offset),
+                cursor_time,
+                (t0, t1),
+                self.sensor_delay,
+                self.minimum_y,
             )
+            && (heatmap.x_min..=heatmap.x_max).contains(&x_val)
+            && (heatmap.y_min..=heatmap.y_max).contains(&y_val)
         {
-            let x_val = transform_channel_value(x_ch, x_val);
-            let y_val = transform_channel_value(y_ch, y_val);
             let x_frac = normalized_fraction(x_val, heatmap.x_min, heatmap.x_max);
             let y_frac = normalized_fraction(y_val, heatmap.y_min, heatmap.y_max);
             let cx = plot_rect.min.x + x_frac as f32 * plot_rect.width();
@@ -580,6 +585,51 @@ struct AxisConfig {
     dec_places: i16,
 }
 
+fn normalized_sensor_delay(delay: f64) -> f64 {
+    if delay.is_finite() {
+        delay.clamp(0.0, 5.0)
+    } else {
+        0.0
+    }
+}
+
+/// The graph and cursor use the same delayed, transformed, filtered sample.
+fn mixture_sample(
+    x: (&[f64], u16, f64, f64),
+    y: (&[f64], u16, f64, f64),
+    value: (&[f64], u16, f64, f64),
+    time: f64,
+    range: (f64, f64),
+    sensor_delay: f64,
+    minimum_y: Option<f64>,
+) -> Option<(f64, f64, f64)> {
+    let delay = normalized_sensor_delay(sensor_delay);
+    if !time.is_finite()
+        || !range.0.is_finite()
+        || !range.1.is_finite()
+        || time < range.0.max(0.0)
+        || time >= range.1 - delay
+    {
+        return None;
+    }
+    let sample = |(data, freq, scale, offset): (&[f64], u16, f64, f64), t: f64| {
+        if freq == 0 || t >= data.len() as f64 / freq as f64 {
+            return None;
+        }
+        let v = interp_at_time(data, freq, t)? * scale + offset;
+        v.is_finite().then_some(v)
+    };
+    let (x, y, value) = (
+        sample(x, time)?,
+        sample(y, time + delay)?,
+        sample(value, time)?,
+    );
+    if minimum_y.is_some_and(|min| y < min) {
+        return None;
+    }
+    Some((x, y, value))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_heatmap(
     x_data: &[f64],
@@ -611,11 +661,7 @@ fn compute_heatmap(
         })
         .collect();
 
-    let sensor_delay = if sensor_delay.is_finite() {
-        sensor_delay.clamp(0., 5.)
-    } else {
-        0.
-    };
+    let sensor_delay = normalized_sensor_delay(sensor_delay);
     let start = (t0.max(0.) * target_freq as f64).ceil() as usize;
     let duration = (x_data.len() as f64 / x_freq.max(1) as f64)
         .min(v_data.len() as f64 / v_freq.max(1) as f64)
@@ -641,25 +687,15 @@ fn compute_heatmap(
     let mut i = start;
     while i < end {
         let t = i as f64 / target_freq as f64;
-        if let (Some(x), Some(y), Some(v)) = (
-            interp_at_time(x_data, x_freq, t),
-            interp_at_time(y_data, y_freq, t + sensor_delay),
-            interp_at_time(v_data, v_freq, t),
-        ) && x.is_finite()
-            && y.is_finite()
-            && v.is_finite()
-        {
-            let x = x * x_scale + x_offset;
-            let y = y * y_scale + y_offset;
-            let v = v * v_scale + v_offset;
-            if !x.is_finite()
-                || !y.is_finite()
-                || !v.is_finite()
-                || minimum_y.is_some_and(|min| y < min)
-            {
-                i += step;
-                continue;
-            }
+        if let Some((x, y, v)) = mixture_sample(
+            (x_data, x_freq, x_scale, x_offset),
+            (y_data, y_freq, y_scale, y_offset),
+            (v_data, v_freq, v_scale, v_offset),
+            t,
+            (t0, t1),
+            sensor_delay,
+            minimum_y,
+        ) {
             if x < x_min {
                 x_min = x;
             }
@@ -830,6 +866,67 @@ fn heat_color(frac: f32) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cursor_matches_delayed_points_and_excludes_filtered_or_out_of_range_samples() {
+        let x = [1000.0; 4];
+        let y = [1.0, 2.0, 3.0, 4.0];
+        let v = [0.0, 10.0, 20.0, 30.0];
+        let map = super::compute_heatmap(
+            &x,
+            1,
+            &y,
+            1,
+            &v,
+            1,
+            1,
+            0.0,
+            4.0,
+            2,
+            None,
+            1.0,
+            0.0,
+            2.0,
+            10.0,
+            1.0,
+            0.0,
+            1.0,
+            Some(15.0),
+        );
+        let cursor = |time, range| {
+            super::mixture_sample(
+                (&x, 1, 1.0, 0.0),
+                (&y, 1, 2.0, 10.0),
+                (&v, 1, 1.0, 0.0),
+                time,
+                range,
+                1.0,
+                Some(15.0),
+            )
+        };
+        assert_eq!(map.triples.len(), 2);
+        for &(x, y, v, t) in &map.triples {
+            assert_eq!(cursor(t, (0.0, 4.0)), Some((x, y, v)));
+        }
+        assert_eq!(cursor(1.0, (0.0, 4.0)), Some((1000.0, 16.0, 10.0)));
+        assert_eq!(cursor(0.0, (0.0, 4.0)), None); // below transformed Y threshold
+        assert_eq!(cursor(1.0, (2.0, 4.0)), None); // before selection
+        assert_eq!(cursor(3.0, (0.0, 4.0)), None); // delayed Y outside selection
+        assert_eq!(cursor(4.0, (0.0, 10.0)), None); // outside recorded data
+        assert_eq!(cursor(f64::NAN, (0.0, 4.0)), None);
+        assert_eq!(
+            super::mixture_sample(
+                (&x, 1, 1.0, 0.0),
+                (&[1.0, f64::NAN, 3.0, 4.0], 1, 1.0, 0.0),
+                (&v, 1, 1.0, 0.0),
+                0.0,
+                (0.0, 4.0),
+                1.0,
+                None,
+            ),
+            None
+        );
+    }
+
     #[test]
     #[ignore = "requires local i2 comparison recording"]
     fn i2_outlap_mixture_sample_count() {

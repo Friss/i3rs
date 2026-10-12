@@ -313,19 +313,6 @@ impl HistogramPanel {
                 let (name, unit, freq, _, _) = resolve_plotted_channel_display_meta(pc, shared);
                 let series_label = histogram_series_label(&name, &unit);
 
-                // Share bin edges between all laps. Locked X is a real bin range,
-                // not just a camera setting; out-of-range values are not clamped.
-                let bounds = if self.lock_x_range && self.x_max > self.x_min {
-                    (self.x_min, self.x_max)
-                } else {
-                    finite_bounds(
-                        pc.data
-                            .iter()
-                            .copied()
-                            .filter(|v| v.is_finite())
-                            .map(|v| transform_channel_value(pc, v)),
-                    )
-                };
                 let ranges: Vec<_> = if self.per_lap && !shared.laps.is_empty() {
                     shared
                         .laps
@@ -339,6 +326,19 @@ impl HistogramPanel {
                             .zoom_range
                             .unwrap_or((0.0, shared.data_duration.unwrap_or(0.0))),
                     )]
+                };
+                // Share bin edges across the displayed ranges, excluding samples
+                // outside them. Locked X is a real bin range, not a camera setting.
+                let bounds = if self.lock_x_range && self.x_max > self.x_min {
+                    (self.x_min, self.x_max)
+                } else {
+                    selected_bounds(
+                        &pc.data,
+                        freq,
+                        ranges.iter().map(|(_, range)| *range),
+                        pc.display_scale,
+                        pc.display_offset,
+                    )
                 };
                 for (lap_idx, (lap_name, range)) in ranges.into_iter().enumerate() {
                     let color_meta = self
@@ -464,6 +464,18 @@ impl HistogramPanel {
     }
 }
 
+fn selected_bounds(
+    data: &[f64],
+    freq: u16,
+    ranges: impl Iterator<Item = (f64, f64)>,
+    scale: f64,
+    offset: f64,
+) -> (f64, f64) {
+    finite_bounds(ranges.flat_map(|range| {
+        sample_range(data.len(), freq, range).map(move |i| data[i] * scale + offset)
+    }))
+}
+
 fn finite_bounds(values: impl Iterator<Item = f64>) -> (f64, f64) {
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for v in values.filter(|v| v.is_finite()) {
@@ -566,6 +578,23 @@ fn bins_to_bar_chart(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_bounds_follow_selected_samples_and_share_edges_across_laps() {
+        let data = [-1000.0, 1.0, 2.0, f64::NAN, 1000.0, 3.0, 4.0, 2000.0];
+        let bounds = selected_bounds(&data, 1, [(1.0, 3.0)].into_iter(), 2.0, 10.0);
+        assert_eq!(bounds, (12.0, 14.0));
+        let bounds = selected_bounds(&data, 1, [(1.0, 4.0), (5.0, 7.0)].into_iter(), 2.0, 10.0);
+        assert_eq!(bounds, (12.0, 18.0));
+        let first = histogram_bins(&[(12.0, 0.0), (14.0, 0.0)], 2, bounds, None);
+        let second = histogram_bins(&[(16.0, 0.0), (18.0, 0.0)], 2, bounds, None);
+        assert_eq!(first[0].counts, [2, 0]);
+        assert_eq!(second[0].counts, [0, 2]);
+        assert_eq!(
+            selected_bounds(&data, 1, [(3.0, 4.0)].into_iter(), 1.0, 0.0),
+            (0.0, 1.0)
+        );
+    }
+
     #[test]
     fn shared_bin_edges_and_percentages_preserve_counts() {
         let samples = [

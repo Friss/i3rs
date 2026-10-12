@@ -331,9 +331,9 @@ impl LdFile {
         self.data().len()
     }
 
-    /// Session endpoint on the finest recorded sample grid.
-    /// Slow channels include a final partial sample period; extending each of
-    /// those to a full period would add up to a second of padding.
+    /// Latest recorded sample timestamp plus one period of the finest sample grid.
+    /// Include channels that outlast the fastest channel without adding a full
+    /// slow-channel period of padding.
     pub fn duration_secs(&self) -> f64 {
         let channels = self
             .channels
@@ -344,9 +344,9 @@ impl LdFile {
             return 0.0;
         }
         channels
-            .filter(|ch| ch.freq == max_freq)
-            .map(|ch| ch.duration_secs())
+            .map(|ch| (ch.n_data - 1) as f64 / ch.freq as f64)
             .fold(0.0_f64, f64::max)
+            + 1.0 / max_freq as f64
     }
 
     pub fn find_channel_by_name(&self, name: &str) -> Option<&ChannelMeta> {
@@ -611,7 +611,7 @@ fn channel_invalid_ranges(
     let mut ranges = Vec::new();
     let mut invalid_start = None;
     let mut previous = 0;
-    for record in records[..count * 6].chunks_exact(6) {
+    for record in records[..count * 6].as_chunks::<6>().0 {
         let flag = read_u16(record, 0);
         let index = read_u32(record, 2);
         // Reject the whole malformed block, never partially mask channel data.
@@ -983,6 +983,24 @@ mod tests {
         slow.n_data = 5;
         ld.channels.push(slow);
         assert_eq!(ld.duration_secs(), 4.01);
+    }
+
+    #[test]
+    fn session_endpoint_includes_channels_that_outlast_the_fastest_channel() {
+        let mut ld = LdFile::from_bytes(extended_fixture()).unwrap();
+        ld.channels[0].freq = 100;
+        ld.channels[0].n_data = 1000;
+        let mut slow = ld.channels[0].clone();
+        slow.freq = 1;
+        slow.n_data = 100;
+        ld.channels.push(slow);
+        assert_eq!(ld.duration_secs(), 99.01);
+
+        // Empty and zero-frequency channels cannot supply a timestamp or grid.
+        ld.channels[0].n_data = 0;
+        assert_eq!(ld.duration_secs(), 100.0);
+        ld.channels[1].freq = 0;
+        assert_eq!(ld.duration_secs(), 0.0);
     }
 
     #[test]
