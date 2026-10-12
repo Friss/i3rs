@@ -28,6 +28,8 @@ struct ScatterCache {
     fingerprint: ScatterFingerprint,
     points: Vec<ScatterPoint>,
     plot_points: Vec<PlotPoint>,
+    /// Unpadded ((x_min, x_max), (y_min, y_max)) of `plot_points`.
+    data_bounds: Option<((f64, f64), (f64, f64))>,
 }
 
 #[derive(Clone, Copy)]
@@ -241,9 +243,7 @@ impl ScatterPanel {
             .unwrap_or(egui::Color32::WHITE);
 
         // Get time range for visible data
-        let (t0, t1) = shared
-            .zoom_range
-            .unwrap_or_else(|| (0.0, shared.data_duration.unwrap_or(0.0)));
+        let (t0, t1) = shared.analysis_range();
 
         let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
         let fingerprint = ScatterFingerprint {
@@ -263,21 +263,24 @@ impl ScatterPanel {
             .is_none_or(|c| c.fingerprint != fingerprint)
         {
             let points = build_scatter_points(x_ch, x_freq, y_ch, y_freq, target_freq, t0, t1);
-            let plot_points = points.iter().map(|p| PlotPoint::new(p.x, p.y)).collect();
+            let plot_points: Vec<_> = points.iter().map(|p| PlotPoint::new(p.x, p.y)).collect();
+            let data_bounds = data_bounds(&plot_points);
             self.cache = Some(ScatterCache {
                 fingerprint,
                 points,
                 plot_points,
+                data_bounds,
             });
         }
-        let points = &self.cache.as_ref().unwrap().points;
+        let cache = self.cache.as_ref().unwrap();
+        let points = &cache.points;
         ui.label(format!(
             "{} samples · range follows lap / zoom",
             points.len()
         ));
-        let plot_points = &self.cache.as_ref().unwrap().plot_points;
+        let plot_points = &cache.plot_points;
 
-        let allowed_bounds = padded_bounds(plot_points, self.bounds_padding_frac).map(
+        let allowed_bounds = padded_bounds(cache.data_bounds, self.bounds_padding_frac).map(
             |((x_min, x_max), (y_min, y_max))| {
                 PlotBounds::from_min_max([x_min, y_min], [x_max, y_max])
             },
@@ -380,13 +383,12 @@ impl ScatterPanel {
         });
 
         if let Some(cursor_time) = clicked_cursor_time {
-            shared.playback_active = false;
-            shared.cursor_time = Some(cursor_time);
+            shared.seek(cursor_time);
         }
     }
 }
 
-fn padded_bounds(points: &[PlotPoint], padding_frac: f64) -> Option<((f64, f64), (f64, f64))> {
+fn data_bounds(points: &[PlotPoint]) -> Option<((f64, f64), (f64, f64))> {
     let mut x_min = f64::INFINITY;
     let mut x_max = f64::NEG_INFINITY;
     let mut y_min = f64::INFINITY;
@@ -399,10 +401,15 @@ fn padded_bounds(points: &[PlotPoint], padding_frac: f64) -> Option<((f64, f64),
         y_max = y_max.max(point.y);
     }
 
-    if !x_min.is_finite() || !x_max.is_finite() || !y_min.is_finite() || !y_max.is_finite() {
-        return None;
-    }
+    (x_min.is_finite() && x_max.is_finite() && y_min.is_finite() && y_max.is_finite())
+        .then_some(((x_min, x_max), (y_min, y_max)))
+}
 
+fn padded_bounds(
+    bounds: Option<((f64, f64), (f64, f64))>,
+    padding_frac: f64,
+) -> Option<((f64, f64), (f64, f64))> {
+    let ((x_min, x_max), (y_min, y_max)) = bounds?;
     let x_pad = axis_padding(x_min, x_max, padding_frac);
     let y_pad = axis_padding(y_min, y_max, padding_frac);
     Some((
@@ -515,30 +522,19 @@ fn build_scatter_points(
     let start_sample = (t0.max(0.0) * target_freq as f64).ceil() as usize;
     let end_sample = (t1 * target_freq as f64).ceil() as usize;
     let end_sample = end_sample
-        .min((x_channel.data.len() as f64 * target_freq as f64 / x_freq.max(1) as f64) as usize)
-        .min((y_channel.data.len() as f64 * target_freq as f64 / y_freq.max(1) as f64) as usize);
+        .min((x_channel.data.len() as f64 * target_freq as f64 / x_freq as f64) as usize)
+        .min((y_channel.data.len() as f64 * target_freq as f64 / y_freq as f64) as usize);
 
-    let mut points = Vec::new();
-    let mut i = start_sample;
-    while i < end_sample {
-        let t = i as f64 / target_freq as f64;
-        if let (Some(x), Some(y)) = (
-            interp_at_time(&x_channel.data, x_freq, t),
-            interp_at_time(&y_channel.data, y_freq, t),
-        ) && x.is_finite()
-            && y.is_finite()
-        {
-            let x = transform_channel_value(x_channel, x);
-            let y = transform_channel_value(y_channel, y);
-            if !x.is_finite() || !y.is_finite() {
-                i += 1;
-                continue;
-            }
-            points.push(ScatterPoint { x, y, time: t });
-        }
-        i += 1;
-    }
-    points
+    (start_sample..end_sample)
+        .filter_map(|i| {
+            let time = i as f64 / target_freq as f64;
+            let x =
+                transform_channel_value(x_channel, interp_at_time(&x_channel.data, x_freq, time)?);
+            let y =
+                transform_channel_value(y_channel, interp_at_time(&y_channel.data, y_freq, time)?);
+            (x.is_finite() && y.is_finite()).then_some(ScatterPoint { x, y, time })
+        })
+        .collect()
 }
 
 fn nearest_scatter_point(

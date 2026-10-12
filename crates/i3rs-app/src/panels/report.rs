@@ -42,21 +42,7 @@ impl ReportPanel {
 
     pub fn copy_visible_channels(&mut self, shared: &SharedState) {
         for info in &shared.display_channel_registry {
-            let id = shared
-                .ld_file
-                .as_ref()
-                .and_then(|ld| ld.find_channel_by_name(&info.name))
-                .map(|ch| ChannelId::Physical(ch.index))
-                .or_else(|| {
-                    shared
-                        .math_channels
-                        .iter()
-                        .position(|ch| ch.name == info.name)
-                        .map(ChannelId::Math)
-                });
-            if let Some(id) = id {
-                self.add_channel(id, shared);
-            }
+            self.add_channel(info.channel_id, shared);
         }
     }
 

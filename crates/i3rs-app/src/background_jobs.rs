@@ -58,7 +58,6 @@ pub struct DecodedPhysicalChannel {
     pub channel_idx: usize,
     pub data: Vec<f64>,
     pub stats: ChannelStats,
-    pub freq: u16,
 }
 
 pub struct EvaluatedMathChannel {
@@ -163,7 +162,6 @@ fn perform_decode_physical_channel(
         channel_idx,
         data,
         stats,
-        freq: channel.freq,
     })
 }
 
@@ -190,89 +188,25 @@ fn perform_evaluate_math_channel(
 }
 
 #[cfg(target_arch = "wasm32")]
-const WASM_COOPERATIVE_CHUNK: usize = 4_096;
-
-#[cfg(target_arch = "wasm32")]
 async fn yield_to_browser() {
     gloo_timers::future::TimeoutFuture::new(0).await;
 }
 
 #[cfg(target_arch = "wasm32")]
-fn find_gps_channel<'a>(ld: &'a LdFile, suffixes: &[&str]) -> Option<&'a i3rs_core::ChannelMeta> {
-    ld.channels.iter().find(|channel| {
-        let normalized = i3rs_core::normalize_channel_name(&channel.name);
-        normalized.contains("gps") && suffixes.iter().any(|suffix| normalized.contains(suffix))
-    })
-}
-
-#[cfg(target_arch = "wasm32")]
 async fn perform_build_track_data_cooperative(ld: Arc<LdFile>) -> Option<TrackData> {
     let _perf = crate::perf_metrics::scope("track-map draw");
-    let lat_ch = find_gps_channel(&ld, &["latitude", "lat"])?;
-    let lon_ch = find_gps_channel(&ld, &["longitude", "lon", "long"])?;
-
+    // The same phases as `extract_gps_track`, yielding to the browser between them.
+    let (lat_ch, lon_ch) = i3rs_core::track::gps_channels(&ld)?;
     yield_to_browser().await;
     let lat_data = ld.read_channel_data(lat_ch)?;
     yield_to_browser().await;
     let lon_data = ld.read_channel_data(lon_ch)?;
-
-    let n = lat_data.len().min(lon_data.len());
-    if n == 0 {
-        return None;
-    }
-
-    let freq = lat_ch.freq;
-    let mut lat_sum = 0.0;
-    let mut lat_count = 0usize;
-    let mut lon_sum = 0.0;
-    let mut lon_count = 0usize;
-
-    for start in (0..n).step_by(WASM_COOPERATIVE_CHUNK) {
-        let end = (start + WASM_COOPERATIVE_CHUNK).min(n);
-        for idx in start..end {
-            let lat = lat_data[idx];
-            if lat.is_finite() {
-                lat_sum += lat;
-                lat_count += 1;
-            }
-            let lon = lon_data[idx];
-            if lon.is_finite() {
-                lon_sum += lon;
-                lon_count += 1;
-            }
-        }
-        yield_to_browser().await;
-    }
-
-    let mean_lat = lat_sum / lat_count.max(1) as f64;
-    let mean_lon = lon_sum / lon_count.max(1) as f64;
-    let cos_lat = mean_lat.to_radians().cos();
-
-    let mut x = Vec::with_capacity(n);
-    let mut y = Vec::with_capacity(n);
-    let mut time = Vec::with_capacity(n);
-
-    for start in (0..n).step_by(WASM_COOPERATIVE_CHUNK) {
-        let end = (start + WASM_COOPERATIVE_CHUNK).min(n);
-        for idx in start..end {
-            let lat = lat_data[idx];
-            let lon = lon_data[idx];
-            if lat.is_finite() && lon.is_finite() {
-                x.push((lon - mean_lon) * cos_lat);
-                y.push(lat - mean_lat);
-            } else if let (Some(&prev_x), Some(&prev_y)) = (x.last(), y.last()) {
-                x.push(prev_x);
-                y.push(prev_y);
-            } else {
-                x.push(0.0);
-                y.push(0.0);
-            }
-            time.push(idx as f64 / freq as f64);
-        }
-        yield_to_browser().await;
-    }
-
-    Some(TrackData::from_normalized_parts(x, y, time, freq))
+    yield_to_browser().await;
+    let mut track =
+        i3rs_core::track::gps_track_from_samples(&lat_data, lat_ch.freq, &lon_data, lon_ch.freq)?;
+    yield_to_browser().await;
+    i3rs_core::track::attach_corrected_distance(&mut track, &ld);
+    Some(track)
 }
 
 #[cfg(target_arch = "wasm32")]

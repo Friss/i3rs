@@ -239,27 +239,48 @@ pub struct SectorTime {
 /// Searches for channels matching "GPS Latitude" and "GPS Longitude" (case-insensitive,
 /// underscore/space/dot normalized). Returns None if either channel is missing.
 pub fn extract_gps_track(ld: &LdFile) -> Option<TrackData> {
-    let lat_ch = find_gps_channel(ld, &["latitude", "lat"])?;
-    let lon_ch = find_gps_channel(ld, &["longitude", "lon", "long"])?;
-
+    let (lat_ch, lon_ch) = gps_channels(ld)?;
     let lat_data = ld.read_channel_data(lat_ch)?;
     let lon_data = ld.read_channel_data(lon_ch)?;
+    let mut track = gps_track_from_samples(&lat_data, lat_ch.freq, &lon_data, lon_ch.freq)?;
+    attach_corrected_distance(&mut track, ld);
+    Some(track)
+}
 
-    if lat_ch.freq == 0 || lon_ch.freq == 0 {
+/// The latitude and longitude channels, when the log has both.
+pub fn gps_channels(ld: &LdFile) -> Option<(&crate::ChannelMeta, &crate::ChannelMeta)> {
+    Some((
+        find_gps_channel(ld, &["latitude", "lat"])?,
+        find_gps_channel(ld, &["longitude", "lon", "long"])?,
+    ))
+}
+
+/// Build a normalized track from decoded GPS samples, resampling longitude to
+/// the latitude rate.
+pub fn gps_track_from_samples(
+    lat: &[f64],
+    lat_freq: u16,
+    lon: &[f64],
+    lon_freq: u16,
+) -> Option<TrackData> {
+    if lat_freq == 0 || lon_freq == 0 {
         return None;
     }
-    let lon_at_lat_rate: Vec<f64> = (0..lat_data.len())
+    let lon_at_lat_rate: Vec<f64> = (0..lat.len())
         .map(|i| {
-            crate::analysis::sample_at_time(&lon_data, lon_ch.freq, i as f64 / lat_ch.freq as f64)
+            crate::analysis::sample_at_time(lon, lon_freq, i as f64 / lat_freq as f64)
                 .unwrap_or(f64::NAN)
         })
         .collect();
-    let mut track = normalize_gps_samples(&lat_data, &lon_at_lat_rate, lat_ch.freq)?;
+    normalize_gps_samples(lat, &lon_at_lat_rate, lat_freq)
+}
+
+/// Attach corrected speed and the distance integrated from it.
+pub fn attach_corrected_distance(track: &mut TrackData, ld: &LdFile) {
     track.corrected_speed = crate::distance::corrected_speed_from_ld(ld);
     track.distance = track.corrected_speed.as_ref().and_then(|(speed, freq)| {
         crate::distance::integrate_speed_series(speed, *freq, "m/s").map(|d| (d, *freq))
     });
-    Some(track)
 }
 
 fn normalize_gps_samples(lat: &[f64], lon: &[f64], freq: u16) -> Option<TrackData> {
@@ -313,6 +334,24 @@ pub struct DistanceSection {
     pub end_mm: u32,
     pub track_length_mm: u32,
 }
+
+impl DistanceSection {
+    /// Both boundaries lie on a non-empty model and differ from each other.
+    pub fn is_valid(&self) -> bool {
+        self.track_length_mm > 0
+            && self.start_mm <= self.track_length_mm
+            && self.end_mm <= self.track_length_mm
+            && self.start_mm != self.end_mm
+    }
+}
+
+/// Laps whose measured length is within this fraction of a distance model's
+/// length are stretched to the model length.
+pub const DISTANCE_STRETCH_TOLERANCE: f64 = 0.05;
+
+/// Approximate metres per degree of latitude (normalized GPS coordinates are degrees).
+const METERS_PER_DEGREE: f64 = 111_320.0;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DistanceTrackDefinition {
     pub version: u32,
@@ -407,15 +446,10 @@ fn distance_section_interval(
     let end = crate::sample_at_time(data, *freq, lap.end_time)?;
     let length = end - start;
     let model = section.track_length_mm as f64 / 1000.0;
-    if length <= 0.0
-        || model <= 0.0
-        || section.start_mm > section.track_length_mm
-        || section.end_mm > section.track_length_mm
-        || section.start_mm == section.end_mm
-    {
+    if length <= 0.0 || !section.is_valid() {
         return None;
     }
-    let scale = if ((length - model) / model).abs() <= 0.05 {
+    let scale = if ((length - model) / model).abs() <= DISTANCE_STRETCH_TOLERANCE {
         length / model
     } else {
         1.0
@@ -498,14 +532,11 @@ pub fn import_track_definition(
     track: &TrackData,
     definition: &TrackDefinition,
 ) -> Result<Vec<Sector>, String> {
-    if definition.sections.iter().any(|s| {
-        s.distance.as_ref().is_some_and(|d| {
-            d.track_length_mm == 0
-                || d.start_mm > d.track_length_mm
-                || d.end_mm > d.track_length_mm
-                || d.start_mm == d.end_mm
-        })
-    }) {
+    if definition
+        .sections
+        .iter()
+        .any(|s| s.distance.as_ref().is_some_and(|d| !d.is_valid()))
+    {
         return Err("Invalid distance section boundary".into());
     }
     if definition.version != 1 {
@@ -518,7 +549,7 @@ pub fn import_track_definition(
         }
         let (x, y) = ((p[1] - lon) * scale, p[0] - lat);
         let idx = find_nearest_sample(track, x, y);
-        let distance = (track.x[idx] - x).hypot(track.y[idx] - y) * 111_320.0;
+        let distance = (track.x[idx] - x).hypot(track.y[idx] - y) * METERS_PER_DEGREE;
         if !distance.is_finite() || distance > 100.0 {
             return Err(
                 "Section boundary is more than 100 m from this recording's GPS trace".into(),
@@ -535,14 +566,6 @@ pub fn import_track_definition(
         .map(|s| {
             if s.name.trim().is_empty() {
                 return Err("Sections must have names".into());
-            }
-            if s.distance.as_ref().is_some_and(|d| {
-                d.track_length_mm == 0
-                    || d.start_mm > d.track_length_mm
-                    || d.end_mm > d.track_length_mm
-                    || d.start_mm == d.end_mm
-            }) {
-                return Err("Invalid distance section boundary".into());
             }
             let start_index = locate(s.start)?;
             let end_index = locate(s.end)?;
@@ -824,9 +847,9 @@ fn find_crossing_time(track: &TrackData, target_index: usize, lap: &Lap) -> Opti
             best = Some((dist2, t0 + f * (t1 - t0)));
         }
     }
-    // Normalized coordinates are degrees (~111 km/degree). Require a passage
-    // within 30 m; a partial lap that never visits this section has no time.
-    best.filter(|(d, _)| *d <= (30.0_f64 / 111_320.0).powi(2))
+    // Normalized coordinates are degrees. Require a passage within 30 m; a
+    // partial lap that never visits this section has no time.
+    best.filter(|(d, _)| *d <= (30.0 / METERS_PER_DEGREE).powi(2))
         .map(|(_, t)| t)
 }
 
@@ -965,6 +988,30 @@ mod tests {
         }
         let distant = normalize_gps_samples(&[37.0, 37.001], &[-80.0, -80.001], 1).unwrap();
         assert!(import_track_definition(&distant, &definition).is_err());
+    }
+
+    #[test]
+    fn decoded_gps_builder_aligns_rates_and_preserves_origin_and_missing_fixes() {
+        let track = gps_track_from_samples(
+            &[36.0, 36.001, 0.0, 36.003],
+            1,
+            &[-79.0, -79.0, -78.999, -78.999, 0.0, 0.0, -78.997],
+            2,
+        )
+        .unwrap();
+        assert_eq!(track.time, [0.0, 1.0, 2.0, 3.0]);
+        assert!(track.x[2].is_nan() && track.y[2].is_nan());
+        assert!(track.x[0] < track.x[1] && track.x[1] < track.x[3]);
+        let sections = [Sector {
+            name: "Straight".into(),
+            start_index: 0,
+            end_index: 3,
+            distance: None,
+        }];
+        let definition = export_track_definition(&track, &sections, "Test".into()).unwrap();
+        assert_eq!(definition.sections[0].start, [36.0, -79.0]);
+        assert_eq!(definition.sections[0].end, [36.003, -78.997]);
+        assert!(gps_track_from_samples(&[36.0], 0, &[-79.0], 1).is_none());
     }
 
     #[test]

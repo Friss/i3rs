@@ -16,6 +16,29 @@ static EMPTY_ENUM_LABELS: LazyLock<Arc<HashMap<i64, String>>> =
     LazyLock::new(|| Arc::new(HashMap::new()));
 static EMPTY_SAMPLES: LazyLock<Arc<[f64]>> = LazyLock::new(|| Arc::from(Vec::<f64>::new()));
 
+/// Discrete (enum/state) channels show labels and are never interpolated.
+pub fn uses_discrete_values(name: &str, enum_labels: &HashMap<i64, String>) -> bool {
+    !enum_labels.is_empty() || i3rs_core::is_state_channel(name)
+}
+
+/// Format a value using file-parsed enum labels, falling back to hardcoded labels.
+pub fn format_enum_value(
+    name: &str,
+    enum_labels: &HashMap<i64, String>,
+    value: f64,
+) -> Option<String> {
+    if !value.is_finite() {
+        return Some("---".into());
+    }
+    if !enum_labels.is_empty() {
+        let v = value.round() as i64;
+        if let Some(label) = enum_labels.get(&v) {
+            return Some(label.clone());
+        }
+    }
+    i3rs_core::format_state_value(name, value)
+}
+
 #[derive(Clone, Copy)]
 pub struct DisplayUnitPreset {
     pub label: &'static str,
@@ -207,9 +230,8 @@ pub fn channel_picker(
 
 /// Sample positions in [start, end). Never include a position before a beacon.
 pub fn sample_range(len: usize, freq: u16, range: (f64, f64)) -> std::ops::Range<usize> {
-    let start = (range.0 * freq as f64).ceil().max(0.0) as usize;
-    let end = (range.1 * freq as f64).ceil().max(0.0) as usize;
-    start.min(len)..end.min(len).max(start.min(len))
+    let window = i3rs_core::analysis::sample_window_for_time(freq, len, range.0, range.1);
+    window.start_sample..window.end_sample
 }
 
 /// Load raw channel data from a ChannelId, returning the immutable shared sample buffer.
@@ -322,6 +344,7 @@ pub fn build_plotted_channel_info(
     let (name, unit, freq, dec_places, enum_labels) =
         resolve_plotted_channel_display_meta(channel, shared);
     PlottedChannelInfo {
+        channel_id: channel.channel_id,
         name,
         unit,
         freq,

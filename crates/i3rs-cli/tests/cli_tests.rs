@@ -220,6 +220,80 @@ fn cli_extract_preserves_native_samples_for_enum_channels() {
 }
 
 #[test]
+fn native_extraction_and_histogram_exclude_samples_before_an_off_grid_start() {
+    let ld = i3rs_core::LdFile::open(TEST_LD).unwrap();
+    let channel = ld.find_channel_by_name("Engine Speed").unwrap();
+    let hz = channel.freq as f64;
+    let selection = format!("{}:{}", 0.5 / hz, 2.5 / hz);
+    let output = run_cli(&[
+        "extract",
+        TEST_LD,
+        "--channel",
+        "Engine Speed",
+        "--time",
+        &selection,
+        "--resample",
+        "native",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let samples = value["segments"][0]["channels"][0]["samples"]
+        .as_array()
+        .unwrap();
+    assert_eq!(samples.len(), 2);
+    assert_eq!(samples[0]["absolute_time"].as_f64().unwrap(), 1.0 / hz);
+    assert_eq!(samples[1]["absolute_time"].as_f64().unwrap(), 2.0 / hz);
+
+    let output = run_cli(&[
+        "histogram",
+        TEST_LD,
+        "--channel",
+        "Engine Speed",
+        "--lap",
+        "Lap 1",
+        "--bins",
+        "2",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let lap = i3rs_core::detect_laps(&ld)
+        .into_iter()
+        .find(|l| l.name == "Lap 1")
+        .unwrap();
+    let expected = ld
+        .read_channel_data(channel)
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(i, value)| {
+            let time = *i as f64 / hz;
+            time >= lap.start_time && time < lap.end_time && value.is_finite()
+        })
+        .count() as u64;
+    assert_eq!(
+        value["bins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bin| bin["count"].as_u64().unwrap())
+            .sum::<u64>(),
+        expected
+    );
+}
+
+#[test]
 fn cli_laps_json_reports_detected_laps() {
     let output = run_cli(&["laps", TEST_LD, "--format", "json"]);
     assert!(

@@ -706,14 +706,7 @@ pub fn create_default_worksheets(
     if let Some(sheet) = build_rpm_histo_worksheet(ld, shared) {
         worksheets.push(sheet);
     }
-    let has_gps = ld
-        .channels
-        .iter()
-        .any(|c| normalize_channel_name(&c.name).contains("gps latitude"))
-        && ld
-            .channels
-            .iter()
-            .any(|c| normalize_channel_name(&c.name).contains("gps longitude"));
+    let has_gps = i3rs_core::track::gps_channels(ld).is_some();
     if has_gps {
         let mut map = TrackMapPanel::new(next_panel_id(shared), "Track Report");
         map.home_worksheet = worksheets.len();

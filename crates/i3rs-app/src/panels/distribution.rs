@@ -37,68 +37,55 @@ impl ColorBands {
     pub fn len(self) -> usize {
         self.valid().count + 3
     }
+    /// Width of one normal band.
+    fn step(self) -> f64 {
+        let b = self.valid();
+        let divisions = if b.centered {
+            b.count.saturating_sub(1).max(1)
+        } else {
+            b.count
+        };
+        (b.max - b.min) / divisions as f64
+    }
+    /// Outer edges of the normal bands; centered bands extend half a step past min/max.
+    fn edges(self) -> (f64, f64) {
+        let b = self.valid();
+        let half = if b.centered { self.step() * 0.5 } else { 0.0 };
+        (b.min - half, b.max + half)
+    }
     pub fn index(self, value: f64) -> usize {
         let b = self.valid();
         if !value.is_finite() {
             return b.count + 2;
         }
-        let step = (b.max - b.min)
-            / if b.centered {
-                b.count.saturating_sub(1).max(1)
-            } else {
-                b.count
-            } as f64;
-        let lower = b.min - if b.centered { step * 0.5 } else { 0.0 };
-        let upper = b.max + if b.centered { step * 0.5 } else { 0.0 };
+        let (lower, upper) = self.edges();
         if value < lower {
             return 0;
         }
         if value > upper {
             return b.count + 1;
         }
-        (((value - lower) / step).floor() as usize).min(b.count - 1) + 1
+        (((value - lower) / self.step()).floor() as usize).min(b.count - 1) + 1
     }
     pub fn label(self, index: usize) -> String {
         let b = self.valid();
+        let (lower, upper) = self.edges();
+        let step = self.step();
         if index == 0 {
-            return format!(
-                "< {:.1}",
-                b.min
-                    - if b.centered {
-                        (b.max - b.min) / b.count.saturating_sub(1).max(1) as f64 / 2.
-                    } else {
-                        0.
-                    }
-            );
+            format!("< {lower:.1}")
+        } else if index == b.count + 1 {
+            format!("> {upper:.1}")
+        } else if index > b.count + 1 {
+            "Missing".into()
+        } else if b.centered {
+            format!("{:.1}", b.min + (index - 1) as f64 * step)
+        } else {
+            format!(
+                "{:.1}–{:.1}",
+                b.min + (index - 1) as f64 * step,
+                b.min + index as f64 * step
+            )
         }
-        if index == b.count + 1 {
-            return format!(
-                "> {:.1}",
-                b.max
-                    + if b.centered {
-                        (b.max - b.min) / b.count.saturating_sub(1).max(1) as f64 / 2.
-                    } else {
-                        0.
-                    }
-            );
-        }
-        if index > b.count + 1 {
-            return "Missing".into();
-        }
-        let step = (b.max - b.min)
-            / if b.centered {
-                b.count.saturating_sub(1).max(1)
-            } else {
-                b.count
-            } as f64;
-        if b.centered {
-            return format!("{:.1}", b.min + (index - 1) as f64 * step);
-        }
-        format!(
-            "{:.1}–{:.1}",
-            b.min + (index - 1) as f64 * step,
-            b.min + index as f64 * step
-        )
     }
     pub fn color(self, index: usize) -> egui::Color32 {
         let b = self.valid();

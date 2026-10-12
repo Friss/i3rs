@@ -84,12 +84,8 @@ fn beacon_boundaries(data: &[f64], freq: u16, session_end: f64) -> Vec<f64> {
         let fraction = millis as f64 / 1000.0;
         // Allow half a millisecond for quantization of the event timestamp.
         let time = (lower - fraction - 0.0005).ceil() + fraction;
-        if time >= 0.0
-            && time <= upper + 0.0005
-            && time < session_end
-            && boundaries.last().is_none_or(|previous| time > *previous)
-        {
-            boundaries.push(time);
+        if time >= 0.0 && time <= upper + 0.0005 {
+            push_boundary(&mut boundaries, time, session_end);
         }
     }
     boundaries
@@ -117,13 +113,7 @@ fn detect_from_lap_time_running(ld: &LdFile) -> Option<Vec<Lap>> {
             // Interpolate exact crossing time from the post-reset timer value
             let sample_time = i as f64 / freq;
             let crossing_time = (sample_time - data[i]).max(0.0);
-            if crossing_time < session_end
-                && boundaries
-                    .last()
-                    .is_none_or(|previous| crossing_time > *previous)
-            {
-                boundaries.push(crossing_time);
-            }
+            push_boundary(&mut boundaries, crossing_time, session_end);
         }
     }
 
@@ -160,8 +150,8 @@ fn detect_from_lap_number(ld: &LdFile) -> Vec<Lap> {
             continue;
         }
         let v = val as i64;
-        if prev.is_some_and(|previous| v != previous) && (i as f64 / freq) < session_end {
-            boundaries.push(i as f64 / freq);
+        if prev.is_some_and(|previous| v != previous) {
+            push_boundary(&mut boundaries, i as f64 / freq, session_end);
         }
         prev = Some(v);
     }
@@ -177,6 +167,13 @@ fn detect_from_lap_number(ld: &LdFile) -> Vec<Lap> {
     }
 
     boundaries_to_laps(&boundaries, session_end)
+}
+
+/// Keep boundaries inside the session and strictly increasing.
+fn push_boundary(boundaries: &mut Vec<f64>, time: f64, session_end: f64) {
+    if time < session_end && boundaries.last().is_none_or(|previous| time > *previous) {
+        boundaries.push(time);
+    }
 }
 
 /// Convert a list of boundary times into labeled laps.

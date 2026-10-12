@@ -137,6 +137,9 @@ pub fn resolve_alias_target(reference: &str, aliases: &HashMap<String, String>) 
 
 /// Resample a channel to a target frequency using linear interpolation.
 fn resample(data: &[f64], src_freq: u16, target_freq: u16, target_len: usize) -> Vec<f64> {
+    if src_freq == 0 || target_freq == 0 {
+        return vec![f64::NAN; target_len];
+    }
     if src_freq == target_freq && data.len() == target_len {
         return data.to_vec();
     }
@@ -144,25 +147,12 @@ fn resample(data: &[f64], src_freq: u16, target_freq: u16, target_len: usize) ->
         return vec![0.0; target_len];
     }
 
-    let mut out = Vec::with_capacity(target_len);
-    let ratio = src_freq as f64 / target_freq as f64;
-
-    for i in 0..target_len {
-        let src_idx = i as f64 * ratio;
-        let lo = src_idx.floor() as usize;
-        let hi = lo + 1;
-        let frac = src_idx - lo as f64;
-
-        let val = if lo >= data.len() {
-            f64::NAN
-        } else if hi >= data.len() || frac == 0.0 {
-            data[lo]
-        } else {
-            data[lo] * (1.0 - frac) + data[hi] * frac
-        };
-        out.push(val);
-    }
-    out
+    (0..target_len)
+        .map(|i| {
+            let position = i as f64 * src_freq as f64 / target_freq as f64;
+            crate::analysis::sample_at_position(data, position).unwrap_or(f64::NAN)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -738,6 +728,20 @@ mod tests {
             },
         );
         m
+    }
+
+    #[test]
+    fn resampling_keeps_exact_samples_next_to_missing_data() {
+        let mut data = vec![f64::NAN; 31];
+        data[29] = 42.0;
+        // 58/14 * 7 is slightly above 29 in floating point. This is still
+        // exactly source sample 29, not an interpolation into missing sample 30.
+        let result = resample(&data, 7, 14, 62);
+        assert_eq!(result[58], 42.0);
+        assert!(result[57].is_nan() && result[59].is_nan());
+        // Unequal lengths bypass the same-rate copy path.
+        assert_eq!(resample(&data, 7, 7, 32)[29], 42.0);
+        assert!(resample(&data, 0, 14, 62).iter().all(|v| v.is_nan()));
     }
 
     #[test]

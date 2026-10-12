@@ -9,11 +9,14 @@ use i3rs_core::{
     find_nearest_sample_in_range,
 };
 
+use i3rs_core::Lap;
+use i3rs_core::distance::MPS_PER_MPH;
+
 use super::utils::{
-    create_plotted_channel, resolve_plotted_channel_display_meta, sample_range,
-    transform_channel_value,
+    DisplayTransformFingerprint, create_plotted_channel, display_transform_fingerprint,
+    resolve_plotted_channel_display_meta, sample_range, transform_channel_value,
 };
-use crate::state::{CHANNEL_COLORS, SharedState};
+use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState};
 
 pub struct TrackMapPanel {
     pub id: u64,
@@ -39,6 +42,7 @@ pub struct TrackMapPanel {
     track_line_cache: Option<CachedTrackLine>,
     cursor_marker_cache: Option<CachedTrackMarker>,
     sector_marker_cache: Option<CachedSectorMarkers>,
+    annotation_cache: Option<CachedAnnotations>,
     /// Search filter for the color channel dropdown.
     color_filter: String,
     /// Whether this panel is currently in a popped-out OS window.
@@ -129,6 +133,7 @@ impl TrackMapPanel {
             track_line_cache: None,
             cursor_marker_cache: None,
             sector_marker_cache: None,
+            annotation_cache: None,
             color_filter: String::new(),
             is_popped_out: false,
             pop_out_requested: false,
@@ -214,9 +219,9 @@ impl TrackMapPanel {
         let editing = self.editing_sectors;
 
         let annotations = if self.show_annotations {
-            section_annotations(&track, shared)
+            self.section_annotations(&track, shared)
         } else {
-            Vec::new()
+            Arc::from([])
         };
         let range_changed = self
             .track_line_cache
@@ -298,11 +303,8 @@ impl TrackMapPanel {
                     },
                     y,
                 );
-                let text = label
-                    .replace("\nCorr Speed ", " · ")
-                    .replace("\nGear ", " · G");
                 let galley = painter.layout_no_wrap(
-                    text,
+                    label.to_string(),
                     egui::FontId::proportional(9.),
                     egui::Color32::LIGHT_GRAY,
                 );
@@ -508,16 +510,21 @@ impl TrackMapPanel {
         track: &TrackData,
         sectors: &[Sector],
     ) {
-        let fingerprint = SectorMarkersFingerprint {
-            track_ptr: track as *const TrackData as usize,
-            track_len: track.x.len(),
-            sectors: sectors.to_vec(),
-        };
-        let cached = cache
-            .get_or_insert_with(|| CachedSectorMarkers::build(track, sectors, fingerprint.clone()));
-        if cached.fingerprint != fingerprint {
-            *cached = CachedSectorMarkers::build(track, sectors, fingerprint);
+        let track_ptr = track as *const TrackData as usize;
+        let current = cache.as_ref().is_some_and(|c| {
+            c.fingerprint.track_ptr == track_ptr
+                && c.fingerprint.track_len == track.x.len()
+                && c.fingerprint.sectors == sectors
+        });
+        if !current {
+            let fingerprint = SectorMarkersFingerprint {
+                track_ptr,
+                track_len: track.x.len(),
+                sectors: sectors.to_vec(),
+            };
+            *cache = Some(CachedSectorMarkers::build(track, sectors, fingerprint));
         }
+        let cached = cache.as_ref().unwrap();
 
         for marker in &cached.markers {
             let points = Points::new(&marker.name, PlotPoints::Borrowed(marker.points.as_slice()))
@@ -652,20 +659,43 @@ impl TrackMapPanel {
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.show_annotations, "Section labels and speed / gear");
             ui.add(egui::DragValue::new(&mut self.section_count).range(2..=20).prefix("Sections "));
-            if ui.button("Split selected lap").on_hover_text("Create generic sections of equal distance; rename them below").clicked()
-                && let Some(track) = &self.track_data {
-                let lap = shared.selected_lap.and_then(|i| shared.laps.get(i));
-                if let Some(lap) = lap {
-                    shared.sectors = i3rs_core::split_lap_into_sectors(track,lap,self.section_count);
-                    self.status = Some(if shared.sectors.is_empty() { "Not enough valid GPS movement in this lap" } else { "Sections created; rename them below or edit their boundaries on the map" }.into());
-                } else { self.status = Some("Select a complete lap before splitting sections".into()); }
+            if ui
+                .button("Split selected lap")
+                .on_hover_text("Create generic sections of equal distance; rename them below")
+                .clicked()
+                && let Some(track) = &self.track_data
+            {
+                let result = selected_lap(shared, "Select a complete lap before splitting sections")
+                    .map(|lap| i3rs_core::split_lap_into_sectors(track, lap, self.section_count));
+                let ok = if result.as_ref().is_ok_and(Vec::is_empty) {
+                    "Not enough valid GPS movement in this lap"
+                } else {
+                    "Sections created; rename them below or edit their boundaries on the map"
+                };
+                self.apply_sections(shared, result, ok);
             }
-            if ui.button("VIR Full sections").on_hover_text("Apply the 33 named distance sections from the VIR Full model to the selected complete lap").clicked() {
-                let result = self.track_data.as_ref().ok_or("GPS track is unavailable".to_string()).and_then(|track| {
-                    let lap = shared.selected_lap.and_then(|i|shared.laps.get(i)).ok_or("Select a complete VIR lap first".to_string())?;
-                    i3rs_core::track::sectors_from_distance_definition(track,lap,&i3rs_core::track::vir_full_definition())
-                });
-                match result { Ok(sectors) => {shared.sectors=sectors; self.status=Some("VIR Full: 33 distance sections; laps within 5% stretch to 5337.5 m".into());}, Err(e)=>self.status=Some(e) }
+            if ui
+                .button("VIR Full sections")
+                .on_hover_text("Apply the named distance sections from the VIR Full model to the selected complete lap")
+                .clicked()
+            {
+                let vir = i3rs_core::track::vir_full_definition();
+                let result = self
+                    .track_data
+                    .as_ref()
+                    .ok_or_else(|| "GPS track is unavailable".to_string())
+                    .and_then(|track| {
+                        let lap = selected_lap(shared, "Select a complete VIR lap first")?;
+                        i3rs_core::track::sectors_from_distance_definition(track, lap, &vir)
+                    });
+                let ok = format!(
+                    "{}: {} distance sections; laps within {:.0}% stretch to {} m",
+                    vir.name,
+                    vir.sections.len(),
+                    i3rs_core::track::DISTANCE_STRETCH_TOLERANCE * 100.0,
+                    vir.length_m
+                );
+                self.apply_sections(shared, result, &ok);
             }
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -677,10 +707,7 @@ impl TrackMapPanel {
                             let track = self.track_data.as_ref().ok_or("GPS track is unavailable")?;
                             i3rs_core::import_track_definition(track, &definition)
                         });
-                    match result {
-                        Ok(sectors) => { shared.sectors = sectors; self.status = Some("Sections imported".into()); }
-                        Err(error) => self.status = Some(error),
-                    }
+                    self.apply_sections(shared, result, "Sections imported");
                 }
                 if ui.add_enabled(!shared.sectors.is_empty(),egui::Button::new("Export sections…")).clicked()
                     && let Some(track) = &self.track_data
@@ -716,6 +743,66 @@ impl TrackMapPanel {
         }
     }
 
+    fn section_annotations(
+        &mut self,
+        track: &Arc<TrackData>,
+        shared: &SharedState,
+    ) -> Arc<[(PlotPoint, String)]> {
+        let lap = shared.selected_lap.and_then(|i| shared.laps.get(i));
+        let gear = shared
+            .ld_file
+            .as_ref()
+            .and_then(|ld| ld.find_channel_by_name("Gear"))
+            .and_then(|c| create_plotted_channel(ChannelId::Physical(c.index), shared, 0));
+        let track_ptr = Arc::as_ptr(track) as usize;
+        let lap_key = lap.map(|l| (l.start_time.to_bits(), l.end_time.to_bits()));
+        let gear_key = gear.as_ref().map(|ch| {
+            (
+                ch.data.as_ptr() as usize,
+                ch.data.len(),
+                display_transform_fingerprint(ch),
+            )
+        });
+        if let Some(cached) = &self.annotation_cache
+            && cached.track_ptr == track_ptr
+            && cached.lap == lap_key
+            && cached.sectors == shared.sectors
+            && cached.gear == gear_key
+        {
+            return Arc::clone(&cached.labels);
+        }
+        let labels: Arc<[_]> = match lap {
+            Some(lap) => {
+                build_section_annotations(track, lap, &shared.sectors, gear.as_ref(), shared).into()
+            }
+            None => Arc::from([]),
+        };
+        self.annotation_cache = Some(CachedAnnotations {
+            track_ptr,
+            lap: lap_key,
+            sectors: shared.sectors.clone(),
+            gear: gear_key,
+            labels: Arc::clone(&labels),
+        });
+        labels
+    }
+
+    /// Replace the sections with `result`, reporting `ok` or the error as status.
+    fn apply_sections(
+        &mut self,
+        shared: &mut SharedState,
+        result: Result<Vec<Sector>, String>,
+        ok: &str,
+    ) {
+        match result {
+            Ok(sectors) => {
+                shared.sectors = sectors;
+                self.status = Some(ok.into());
+            }
+            Err(error) => self.status = Some(error),
+        }
+    }
+
     fn invalidate_color_cache(&mut self) {
         self.cached_colors = None;
         self.cached_color_range = None;
@@ -727,6 +814,7 @@ impl TrackMapPanel {
         self.track_line_cache = None;
         self.cursor_marker_cache = None;
         self.sector_marker_cache = None;
+        self.annotation_cache = None;
     }
 
     fn draw_color_legend(ui: &mut egui::Ui, vmin: f64, vmax: f64) {
@@ -831,15 +919,7 @@ impl TrackMapPanel {
                                 .selectable_label(shared.selected_lap == Some(li), &lap.name)
                                 .clicked()
                             {
-                                shared.selected_lap = Some(li);
-                                shared.zoom_range = Some((lap.start_time, lap.end_time));
-                                if shared
-                                    .cursor_time
-                                    .is_none_or(|t| t < lap.start_time || t >= lap.end_time)
-                                {
-                                    shared.cursor_time = Some(lap.start_time);
-                                }
-                                shared.zoom_from_timeline = true;
+                                shared.select_lap(Some(li));
                             }
                             for (si, st) in row.iter().enumerate() {
                                 if !st.time_secs.is_finite() {
@@ -1000,66 +1080,44 @@ impl CachedSectorMarkers {
     }
 }
 
-fn section_annotations(track: &TrackData, shared: &SharedState) -> Vec<(PlotPoint, String)> {
-    let Some(lap) = shared.selected_lap.and_then(|i| shared.laps.get(i)) else {
-        return Vec::new();
-    };
-    let Some(ld) = &shared.ld_file else {
-        return Vec::new();
-    };
-    let gear = ld.find_channel_by_name("Gear").and_then(|c| {
-        create_plotted_channel(crate::state::ChannelId::Physical(c.index), shared, 0)
-    });
-    shared
-        .sectors
+/// Section labels with speed/gear ranges, rebuilt only when their inputs change.
+struct CachedAnnotations {
+    track_ptr: usize,
+    lap: Option<(u64, u64)>,
+    sectors: Vec<Sector>,
+    gear: Option<(usize, usize, DisplayTransformFingerprint)>,
+    labels: Arc<[(PlotPoint, String)]>,
+}
+
+fn build_section_annotations(
+    track: &TrackData,
+    lap: &Lap,
+    sectors: &[Sector],
+    gear: Option<&PlottedChannel>,
+    shared: &SharedState,
+) -> Vec<(PlotPoint, String)> {
+    let gear = gear.map(|ch| (ch, resolve_plotted_channel_display_meta(ch, shared)));
+    sectors
         .iter()
         .filter_map(|s| {
             let (start, end) = i3rs_core::sector_interval(s, lap, track)?;
+            // A section that wraps past the beacon covers both ends of the lap.
+            let ranges = if end > start {
+                vec![(start, end)]
+            } else {
+                vec![(start, lap.end_time), (lap.start_time, end)]
+            };
             let mut label = s.name.clone();
-            if let Some((speed, freq)) = &track.corrected_speed {
-                let ranges = if end > start {
-                    vec![(start, end)]
-                } else {
-                    vec![(start, lap.end_time), (lap.start_time, end)]
-                };
-                let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
-                for range in ranges {
-                    for i in sample_range(speed.len(), *freq, range) {
-                        let value = speed[i] / 0.44704;
-                        if value.is_finite() {
-                            min = min.min(value);
-                            max = max.max(value);
-                        }
-                    }
-                }
-                if min.is_finite() {
-                    label.push_str(&format!("\nCorr Speed {min:.1}–{max:.1} mph"));
-                }
+            if let Some((speed, freq)) = &track.corrected_speed
+                && let Some((min, max)) = finite_range(speed, *freq, &ranges, |v| v / MPS_PER_MPH)
+            {
+                label.push_str(&format!(" · {min:.1}–{max:.1} mph"));
             }
-            for (kind, channel) in [("Gear", gear.as_ref())] {
-                let Some(ch) = channel else {
-                    continue;
-                };
-                let meta = resolve_plotted_channel_display_meta(ch, shared);
-                let ranges = if end > start {
-                    vec![(start, end)]
-                } else {
-                    vec![(start, lap.end_time), (lap.start_time, end)]
-                };
-                let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
-                for range in ranges {
-                    for i in sample_range(ch.data.len(), meta.2, range) {
-                        let value = transform_channel_value(ch, ch.data[i]);
-                        if value.is_finite() {
-                            min = min.min(value);
-                            max = max.max(value);
-                        }
-                    }
-                }
-                if min.is_finite() {
-                    let dec = if kind == "Gear" { 0 } else { 1 };
-                    label.push_str(&format!("\n{kind} {min:.dec$}–{max:.dec$} {}", meta.1));
-                }
+            if let Some((ch, (_, unit, freq, _, _))) = &gear
+                && let Some((min, max)) =
+                    finite_range(&ch.data, *freq, &ranges, |v| transform_channel_value(ch, v))
+            {
+                label.push_str(&format!(" · G{min:.0}–{max:.0} {unit}"));
             }
             Some((
                 PlotPoint::new(*track.x.get(s.start_index)?, *track.y.get(s.start_index)?),
@@ -1067,6 +1125,31 @@ fn section_annotations(track: &TrackData, shared: &SharedState) -> Vec<(PlotPoin
             ))
         })
         .collect()
+}
+
+/// Finite min/max of `map(sample)` over the samples in `ranges`.
+fn finite_range(
+    data: &[f64],
+    freq: u16,
+    ranges: &[(f64, f64)],
+    map: impl Fn(f64) -> f64,
+) -> Option<(f64, f64)> {
+    let (min, max) = ranges
+        .iter()
+        .flat_map(|&range| sample_range(data.len(), freq, range))
+        .map(|i| map(data[i]))
+        .filter(|v| v.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        });
+    min.is_finite().then_some((min, max))
+}
+
+fn selected_lap<'a>(shared: &'a SharedState, missing: &str) -> Result<&'a Lap, String> {
+    shared
+        .selected_lap
+        .and_then(|i| shared.laps.get(i))
+        .ok_or_else(|| missing.to_string())
 }
 
 fn delta_color(delta: f64) -> egui::Color32 {
@@ -1085,6 +1168,69 @@ mod tests {
 
     fn sample_panel() -> TrackMapPanel {
         TrackMapPanel::new(1, "Track")
+    }
+
+    #[test]
+    fn annotations_reuse_labels_and_refresh_after_gear_decode_lap_or_section_changes() {
+        let mut panel = sample_panel();
+        let mut shared = SharedState::new();
+        let mut ld = i3rs_core::LdFile::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/VIR_LAP.ld"
+        ))
+        .unwrap();
+        let gear_index = ld.find_channel_by_name("Gear").unwrap().index;
+        ld.channels[gear_index].freq = 1;
+        shared.ld_file = Some(Arc::new(ld));
+        shared.laps = vec![Lap {
+            name: "Lap 1".into(),
+            number: 1,
+            start_time: 0.0,
+            end_time: 4.0,
+        }];
+        shared.selected_lap = Some(0);
+        shared.sectors = vec![Sector {
+            name: "Straight".into(),
+            start_index: 0,
+            end_index: 2,
+            distance: Some(i3rs_core::track::DistanceSection {
+                start_mm: 0,
+                end_mm: 20_000,
+                track_length_mm: 40_000,
+            }),
+        }];
+        let mut track = TrackData::from_normalized_parts(
+            vec![0.0; 5],
+            vec![0.0; 5],
+            vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            1,
+        );
+        track.distance = Some((vec![0.0, 10.0, 20.0, 30.0, 40.0], 1));
+        track.corrected_speed = Some((vec![10.0, 20.0, 30.0, 40.0, 50.0], 1));
+        let track = Arc::new(track);
+        let before = panel.section_annotations(&track, &shared);
+        assert_eq!(before.len(), 1);
+        assert!(!before[0].1.contains(" · G"));
+        assert!(Arc::ptr_eq(
+            &before,
+            &panel.section_annotations(&track, &shared)
+        ));
+        let gear = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let stats = crate::state::compute_channel_stats(&gear);
+        shared.store_decoded_physical_channel(gear_index, gear, stats);
+        let decoded = panel.section_annotations(&track, &shared);
+        assert!(decoded[0].1.contains(" · G1–2"));
+        assert!(!Arc::ptr_eq(&before, &decoded));
+        shared.sectors[0].name = "Renamed".into();
+        let renamed = panel.section_annotations(&track, &shared);
+        assert!(renamed[0].1.starts_with("Renamed"));
+        shared.laps[0].start_time = 2.0;
+        let next_lap = panel.section_annotations(&track, &shared);
+        assert!(next_lap[0].1.contains(" · G3–4"));
+        shared.selected_lap = None;
+        assert!(panel.section_annotations(&track, &shared).is_empty());
+        panel.clear_cache();
+        assert!(panel.annotation_cache.is_none());
     }
 
     #[test]

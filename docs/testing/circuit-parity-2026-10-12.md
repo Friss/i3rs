@@ -9,6 +9,87 @@ corrected front-wheel speed/distance, full-rate oil scatter, lambda-delay alignm
 and centered load bands. The latest evidence and limits are below; earlier passes
 are retained as a dated record and their old totals are superseded here.
 
+## Cleanup review and skipped-item follow-up — 12 October 2026
+
+Reviewed the uncommitted cleanup across 20 files, including the streaming graph
+reducer, annotation and scatter caches, shared speed/GPS builders, gauge and
+workspace helpers. Retained that work and corrected three concrete issues:
+
+- **Exact math samples beside missing data:** converting a resampling index to
+  seconds and back could produce `29.000000000000004` instead of sample 29 at
+  7 → 14 Hz. Interpolating into a missing neighbor then returned NaN for a valid
+  sample. Time queries and math resampling now share the interpolation routine
+  at the sample-position level; math computes its position directly. The new
+  regression failed before the fix. Zero-rate resampling remains NaN.
+- **Undecodable speed sources:** the common metadata selector now rejects
+  unsupported data types, empty channels and zero rates before selecting a
+  source. A broken `Corr Speed` or wheel channel can no longer suppress a valid
+  lower-priority speed channel or keep the asynchronous graph decode retrying.
+- **Sections during asynchronous restore:** recording checks now run before a
+  workspace waits for math channels. Raw indices from the previous recording
+  cannot remain active during that wait. Legacy indices also require a known,
+  matching recording path; two absent paths do not establish identity. Portable
+  definitions continue to be remapped after GPS becomes available. The pending
+  restore regression failed before the fix.
+
+The skipped **CLI lap-window rounding** is addressed deliberately. Both the GUI
+and CLI now call the core helper for native samples in `[start, end)`. Both
+bounds round up, with timestamp comparisons correcting floating-point round
+trips at exact boundaries. A sample before an off-grid start is excluded from
+native extraction, lap statistics, histograms and lap-scoped math statistics.
+This can change their counts and values by removing the preceding sample; the
+JSON schema and explicitly requested resampling are unchanged. See the
+[CLI reference](../cli-analysis.md). Graph clipping still retains adjacent
+samples where needed to draw a segment through the viewport edge.
+
+Disposition of the remaining skipped items:
+
+| Item | Decision and reason |
+| --- | --- |
+| 100k-point native graph floor | Keep: lap views retain original samples, and dense overviews already have an explicit full-resolution override. |
+| Uncapped scatter and mixture Samples views | Keep: their sample counts and point selection are part of the validated analysis behavior. |
+| Replacing runtime section indices with portable boundaries | Defer the model rewrite: workspace/export definitions already store geographic and optional distance boundaries and remap them per recording. Fixed the restore gap above and retained the cross-recording regression. |
+| One shared session-distance computation | Defer: graph distance is already cached in SharedState and TrackData is built once per session. Graphs permit explicit distance/math-channel overrides, while track sections use corrected speed. Sharing those policies blindly would change behavior; a common physical-source cache can be separated later if profiling warrants it. |
+| Bundled track-definition registry | Defer until another bundled definition exists. VIR is currently the only one, and its status text already comes from the definition. |
+| Core/app histogram and inverse-axis helpers | Keep separate: their endpoint, grouping, interpolation and clamping contracts differ. |
+| Track-line rebuild on zoom | Keep: bounded to low-rate GPS geometry and outside the dense telemetry hot path. |
+| Public downsample_minmax utility | Keep for API compatibility and benchmark comparison; it is not the production graph reducer. |
+
+Validation: **188 workspace tests**, all **9 local recording/parity tests**,
+Rust **1.99 Clippy** with warnings denied, formatting, the **wasm32 check**,
+and the native **release build** pass. Added coverage includes cache reuse and refresh after Gear decode, lap and
+section changes; mixed-rate GPS with lost fixes and exportable geographic origin;
+CLI selection boundaries; exact resampling; unavailable speed fallback; and safe
+legacy section restoration.
+
+The ignored graph benchmark previously materialized points before passing them
+to the reducer, so it did not exercise the new streaming path. It now measures
+the production iterator path. Six alternating before/after release runs use the
+same egui 0.36.2 benchmark, six 100 Hz channels, 1200 × 800 logical pixels, and
+25 measured frames after five warmups. Values below are medians across runs.
+
+| Scenario | Points, both versions | Preparation before → after | Cached CPU draw before → after |
+| --- | ---: | ---: | ---: |
+| 134.114 s adaptive view | 80,472 | 0.095 → 0.049 ms | 1.412 → 1.408 ms |
+| 3918.210 s adaptive overview | 27,896 | 9.199 → 4.203 ms | 0.628 → 0.635 ms |
+| 3918.210 s all-native view | 2,350,926 | 3.147 → 1.867 ms | 47.103 → 47.078 ms |
+
+The dense overview prepares about **54% faster**, retaining the same displayed
+point count. Cached drawing is essentially unchanged. This measures CPU plot
+construction/tessellation, not GPU frame rate or whole-application latency.
+The streaming reducer avoids the temporary full visible-point array per trace.
+The five core Criterion benchmarks were also compared in three alternating
+before/after pairs (20 samples, 0.5 s warmup, 1 s measurement). Math evaluation
+went from 2.744 to 2.577 ms, about 6% faster. Median changes in the other routines
+were +0.03% for decoding, −0.18% for min/max downsampling, +0.60% for FFT, and
++0.92% for track lookup. An initial unpaired pass showed 2–3% shifts in unchanged
+routines; those were not reproduced in the alternating comparison. No material
+regression appeared in this benchmark set.
+
+Machine-local evidence is in `target/i2-comparison/cleanup-*.txt`,
+`cleanup-paired-benchmarks.json`, and `cleanup-core-paired.json`; the raw
+recordings remain untracked.
+
 ## GUI dependency upgrade — completed 12 October 2026
 
 Upgraded the compatible GUI set together: **egui/eframe 0.36.2**, **egui_plot

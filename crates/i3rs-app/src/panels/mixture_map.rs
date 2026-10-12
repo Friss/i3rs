@@ -247,9 +247,26 @@ impl MixtureMapPanel {
             return;
         }
 
-        let (t0, t1) = shared
-            .zoom_range
-            .unwrap_or_else(|| (0.0, shared.data_duration.unwrap_or(0.0)));
+        let (t0, t1) = shared.analysis_range();
+
+        let x_series = (
+            &x_ch.data[..],
+            x_freq,
+            x_ch.display_scale,
+            x_ch.display_offset,
+        );
+        let y_series = (
+            &y_ch.data[..],
+            y_freq,
+            y_ch.display_scale,
+            y_ch.display_offset,
+        );
+        let v_series = (
+            &v_ch.data[..],
+            v_freq,
+            v_ch.display_scale,
+            v_ch.display_offset,
+        );
 
         let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
         let fingerprint = HeatmapFingerprint {
@@ -273,23 +290,13 @@ impl MixtureMapPanel {
         {
             let y_axis = axis_config(&y_name, &y_unit, y_dec_places);
             let heatmap = compute_heatmap(
-                &x_ch.data,
-                x_freq,
-                &y_ch.data,
-                y_freq,
-                &v_ch.data,
-                v_freq,
+                x_series,
+                y_series,
+                v_series,
                 target_freq,
-                t0,
-                t1,
+                (t0, t1),
                 self.bins,
                 y_axis.fixed_range,
-                x_ch.display_scale,
-                x_ch.display_offset,
-                y_ch.display_scale,
-                y_ch.display_offset,
-                v_ch.display_scale,
-                v_ch.display_offset,
                 self.sensor_delay,
                 self.minimum_y,
             );
@@ -314,10 +321,6 @@ impl MixtureMapPanel {
                 self.color_bands.controls(ui);
             }
         });
-        let mut band_counts = vec![0_usize; self.color_bands.len()];
-        for &(_, _, v, _) in &heatmap.triples {
-            band_counts[self.color_bands.index(v)] += 1;
-        }
         let available = ui.available_rect_before_wrap();
         let margin = 50.0;
         let plot_rect = egui::Rect::from_min_max(
@@ -334,26 +337,29 @@ impl MixtureMapPanel {
             egui::Sense::click(),
         );
 
+        let to_screen = |x: f64, y: f64| {
+            egui::pos2(
+                plot_rect.left()
+                    + normalized_fraction(x, heatmap.x_min, heatmap.x_max) as f32
+                        * plot_rect.width(),
+                plot_rect.bottom()
+                    - normalized_fraction(y, heatmap.y_min, heatmap.y_max) as f32
+                        * plot_rect.height(),
+            )
+        };
+        let mut band_counts = vec![0_usize; self.color_bands.len()];
         let cell_w = plot_rect.width() / self.bins as f32;
         let cell_h = plot_rect.height() / self.bins as f32;
         let legend_steps = legend_step_count(&v_unit, heatmap.value_range);
 
         if self.scatter_mode {
             for &(x, y, value, _) in &heatmap.triples {
+                let band = self.color_bands.index(value);
+                band_counts[band] += 1;
                 if y < heatmap.y_min || y > heatmap.y_max {
                     continue;
                 }
-                let px = plot_rect.left()
-                    + normalized_fraction(x, heatmap.x_min, heatmap.x_max) as f32
-                        * plot_rect.width();
-                let py = plot_rect.bottom()
-                    - normalized_fraction(y, heatmap.y_min, heatmap.y_max) as f32
-                        * plot_rect.height();
-                painter.circle_filled(
-                    egui::pos2(px, py),
-                    1.75,
-                    self.color_bands.color(self.color_bands.index(value)),
-                );
+                painter.circle_filled(to_screen(x, y), 1.75, self.color_bands.color(band));
             }
         } else {
             for yi in 0..self.bins {
@@ -504,19 +510,12 @@ impl MixtureMapPanel {
                     .triples
                     .iter()
                     .filter_map(|&(x, y, _, time)| {
-                        let px = plot_rect.left()
-                            + normalized_fraction(x, heatmap.x_min, heatmap.x_max) as f32
-                                * plot_rect.width();
-                        let py = plot_rect.bottom()
-                            - normalized_fraction(y, heatmap.y_min, heatmap.y_max) as f32
-                                * plot_rect.height();
-                        let d = (pos - egui::pos2(px, py)).length_sq();
+                        let d = (pos - to_screen(x, y)).length_sq();
                         (d < 100.0).then_some((d, time))
                     })
                     .min_by(|a, b| a.0.total_cmp(&b.0));
                 if let Some((_, time)) = nearest {
-                    shared.playback_active = false;
-                    shared.cursor_time = Some(time);
+                    shared.seek(time);
                 }
             } else {
                 let xi = (((pos.x - plot_rect.left()) / plot_rect.width()) * self.bins as f32)
@@ -528,17 +527,16 @@ impl MixtureMapPanel {
                     .clamp(0.0, self.bins.saturating_sub(1) as f32)
                     as usize;
                 if let Some(time) = heatmap.cells[yi * self.bins + xi].representative_time {
-                    shared.playback_active = false;
-                    shared.cursor_time = Some(time);
+                    shared.seek(time);
                 }
             }
         }
 
         if let Some(cursor_time) = shared.cursor_time
             && let Some((x_val, y_val, _)) = mixture_sample(
-                (&x_ch.data, x_freq, x_ch.display_scale, x_ch.display_offset),
-                (&y_ch.data, y_freq, y_ch.display_scale, y_ch.display_offset),
-                (&v_ch.data, v_freq, v_ch.display_scale, v_ch.display_offset),
+                x_series,
+                y_series,
+                v_series,
                 cursor_time,
                 (t0, t1),
                 self.sensor_delay,
@@ -547,12 +545,8 @@ impl MixtureMapPanel {
             && (heatmap.x_min..=heatmap.x_max).contains(&x_val)
             && (heatmap.y_min..=heatmap.y_max).contains(&y_val)
         {
-            let x_frac = normalized_fraction(x_val, heatmap.x_min, heatmap.x_max);
-            let y_frac = normalized_fraction(y_val, heatmap.y_min, heatmap.y_max);
-            let cx = plot_rect.min.x + x_frac as f32 * plot_rect.width();
-            let cy = plot_rect.max.y - y_frac as f32 * plot_rect.height();
             painter.circle_stroke(
-                egui::pos2(cx, cy),
+                to_screen(x_val, y_val),
                 6.0,
                 egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
             );
@@ -585,7 +579,7 @@ struct AxisConfig {
     dec_places: i16,
 }
 
-fn normalized_sensor_delay(delay: f64) -> f64 {
+pub(crate) fn normalized_sensor_delay(delay: f64) -> f64 {
     if delay.is_finite() {
         delay.clamp(0.0, 5.0)
     } else {
@@ -593,11 +587,14 @@ fn normalized_sensor_delay(delay: f64) -> f64 {
     }
 }
 
+/// A channel's samples, frequency, display scale and display offset.
+type Series<'a> = (&'a [f64], u16, f64, f64);
+
 /// The graph and cursor use the same delayed, transformed, filtered sample.
 fn mixture_sample(
-    x: (&[f64], u16, f64, f64),
-    y: (&[f64], u16, f64, f64),
-    value: (&[f64], u16, f64, f64),
+    x: Series,
+    y: Series,
+    value: Series,
     time: f64,
     range: (f64, f64),
     sensor_delay: f64,
@@ -612,7 +609,7 @@ fn mixture_sample(
     {
         return None;
     }
-    let sample = |(data, freq, scale, offset): (&[f64], u16, f64, f64), t: f64| {
+    let sample = |(data, freq, scale, offset): Series, t: f64| {
         if freq == 0 || t >= data.len() as f64 / freq as f64 {
             return None;
         }
@@ -632,26 +629,17 @@ fn mixture_sample(
 
 #[allow(clippy::too_many_arguments)]
 fn compute_heatmap(
-    x_data: &[f64],
-    x_freq: u16,
-    y_data: &[f64],
-    y_freq: u16,
-    v_data: &[f64],
-    v_freq: u16,
+    x: Series,
+    y: Series,
+    value: Series,
     target_freq: u16,
-    t0: f64,
-    t1: f64,
+    (t0, t1): (f64, f64),
     bins: usize,
     y_fixed_range: Option<(f64, f64)>,
-    x_scale: f64,
-    x_offset: f64,
-    y_scale: f64,
-    y_offset: f64,
-    v_scale: f64,
-    v_offset: f64,
     sensor_delay: f64,
     minimum_y: Option<f64>,
 ) -> Heatmap {
+    let ((x_data, x_freq, ..), (y_data, y_freq, ..), (v_data, v_freq, ..)) = (x, y, value);
     let mut cells: Vec<HeatmapCell> = (0..bins * bins)
         .map(|_| HeatmapCell {
             sum: 0.0,
@@ -683,19 +671,9 @@ fn compute_heatmap(
     let mut v_max = f64::MIN;
 
     // Count every valid sample; display aggregation must not alter statistics.
-    let step = 1;
-    let mut i = start;
-    while i < end {
+    for i in start..end {
         let t = i as f64 / target_freq as f64;
-        if let Some((x, y, v)) = mixture_sample(
-            (x_data, x_freq, x_scale, x_offset),
-            (y_data, y_freq, y_scale, y_offset),
-            (v_data, v_freq, v_scale, v_offset),
-            t,
-            (t0, t1),
-            sensor_delay,
-            minimum_y,
-        ) {
+        if let Some((x, y, v)) = mixture_sample(x, y, value, t, (t0, t1), sensor_delay, minimum_y) {
             if x < x_min {
                 x_min = x;
             }
@@ -716,7 +694,6 @@ fn compute_heatmap(
             }
             triples.push((x, y, v, t));
         }
-        i += step;
     }
 
     if triples.is_empty() {
@@ -872,23 +849,13 @@ mod tests {
         let y = [1.0, 2.0, 3.0, 4.0];
         let v = [0.0, 10.0, 20.0, 30.0];
         let map = super::compute_heatmap(
-            &x,
+            (&x, 1, 1.0, 0.0),
+            (&y, 1, 2.0, 10.0),
+            (&v, 1, 1.0, 0.0),
             1,
-            &y,
-            1,
-            &v,
-            1,
-            1,
-            0.0,
-            4.0,
+            (0.0, 4.0),
             2,
             None,
-            1.0,
-            0.0,
-            2.0,
-            10.0,
-            1.0,
-            0.0,
             1.0,
             Some(15.0),
         );
@@ -947,23 +914,13 @@ mod tests {
         ] {
             let (lambda, lf) = load(name);
             let map = super::compute_heatmap(
-                &rpm,
-                rf,
-                &lambda,
-                lf,
-                &throttle,
-                tf,
+                (&rpm, rf, 1., 0.),
+                (&lambda, lf, 1., 0.),
+                (&throttle, tf, 1., 0.),
                 20,
-                0.,
-                351.680,
+                (0., 351.680),
                 32,
                 Some((0.7, 1.2)),
-                1.,
-                0.,
-                1.,
-                0.,
-                1.,
-                0.,
                 0.15,
                 Some(0.5),
             );
@@ -979,23 +936,13 @@ mod tests {
     #[test]
     fn display_bounds_do_not_filter_statistics_and_delay_stays_inside_range() {
         let map = super::compute_heatmap(
-            &[1000.; 4],
+            (&[1000.; 4], 1, 1., 0.),
+            (&[1., 2., 3., 4.], 1, 1., 0.),
+            (&[0., 10., 20., 30.], 1, 1., 0.),
             1,
-            &[1., 2., 3., 4.],
-            1,
-            &[0., 10., 20., 30.],
-            1,
-            1,
-            0.,
-            4.,
+            (0., 4.),
             2,
             Some((0.7, 1.2)),
-            1.,
-            0.,
-            1.,
-            0.,
-            1.,
-            0.,
             1.,
             None,
         );

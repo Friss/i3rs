@@ -30,6 +30,16 @@ struct HistogramChannelFingerprint {
     color: [u8; 4],
 }
 
+impl HistogramChannelFingerprint {
+    fn of(pc: &PlottedChannel) -> Self {
+        Self {
+            data_ptr: pc.data.as_ptr() as usize,
+            display_transform: display_transform_fingerprint(pc),
+            color: pc.color.to_array(),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq)]
 struct HistogramFingerprint {
     channels: Vec<HistogramChannelFingerprint>,
@@ -269,19 +279,18 @@ impl HistogramPanel {
             Vec::new()
         };
 
+        // Locked X is a real bin range, not just a camera setting.
+        let locked_x_range =
+            (self.lock_x_range && self.x_max > self.x_min).then_some((self.x_min, self.x_max));
+
         // Cache histogram computation
         let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
-        let channel_fingerprints: Vec<HistogramChannelFingerprint> = self
-            .channels
-            .iter()
-            .map(|pc| HistogramChannelFingerprint {
-                data_ptr: pc.data.as_ptr() as usize,
-                display_transform: display_transform_fingerprint(pc),
-                color: [pc.color.r(), pc.color.g(), pc.color.b(), pc.color.a()],
-            })
-            .collect();
         let fingerprint = HistogramFingerprint {
-            channels: channel_fingerprints,
+            channels: self
+                .channels
+                .iter()
+                .map(HistogramChannelFingerprint::of)
+                .collect(),
             zoom_key,
             bin_count: self.bin_count,
             per_lap: self.per_lap,
@@ -290,16 +299,11 @@ impl HistogramPanel {
                 .iter()
                 .map(|l| (l.start_time.to_bits(), l.end_time.to_bits()))
                 .collect(),
-            bounds: (self.lock_x_range && self.x_max > self.x_min)
-                .then_some((self.x_min.to_bits(), self.x_max.to_bits())),
+            bounds: locked_x_range.map(|(lo, hi)| (lo.to_bits(), hi.to_bits())),
             color_channel: self
                 .color_channel
                 .as_ref()
-                .map(|pc| HistogramChannelFingerprint {
-                    data_ptr: pc.data.as_ptr() as usize,
-                    display_transform: display_transform_fingerprint(pc),
-                    color: [pc.color.r(), pc.color.g(), pc.color.b(), pc.color.a()],
-                }),
+                .map(HistogramChannelFingerprint::of),
             bands: self.color_bands.key(),
         };
 
@@ -309,6 +313,11 @@ impl HistogramPanel {
             .is_none_or(|c| c.fingerprint != fingerprint)
         {
             let mut charts = Vec::new();
+            let color_meta = self
+                .color_channel
+                .as_ref()
+                .map(|c| resolve_plotted_channel_display_meta(c, shared));
+            let bands = self.color_channel.as_ref().map(|_| self.color_bands);
             for (ch_idx, pc) in self.channels.iter().enumerate() {
                 let (name, unit, freq, _, _) = resolve_plotted_channel_display_meta(pc, shared);
                 let series_label = histogram_series_label(&name, &unit);
@@ -320,18 +329,11 @@ impl HistogramPanel {
                         .map(|l| (l.name.clone(), (l.start_time, l.end_time)))
                         .collect()
                 } else {
-                    vec![(
-                        String::new(),
-                        shared
-                            .zoom_range
-                            .unwrap_or((0.0, shared.data_duration.unwrap_or(0.0))),
-                    )]
+                    vec![(String::new(), shared.analysis_range())]
                 };
                 // Share bin edges across the displayed ranges, excluding samples
-                // outside them. Locked X is a real bin range, not a camera setting.
-                let bounds = if self.lock_x_range && self.x_max > self.x_min {
-                    (self.x_min, self.x_max)
-                } else {
+                // outside them.
+                let bounds = locked_x_range.unwrap_or_else(|| {
                     selected_bounds(
                         &pc.data,
                         freq,
@@ -339,12 +341,8 @@ impl HistogramPanel {
                         pc.display_scale,
                         pc.display_offset,
                     )
-                };
+                });
                 for (lap_idx, (lap_name, range)) in ranges.into_iter().enumerate() {
-                    let color_meta = self
-                        .color_channel
-                        .as_ref()
-                        .map(|c| resolve_plotted_channel_display_meta(c, shared));
                     let samples: Vec<_> = sample_range(pc.data.len(), freq, range)
                         .map(|i| {
                             let value = transform_channel_value(pc, pc.data[i]);
@@ -359,7 +357,6 @@ impl HistogramPanel {
                             (value, band_value.unwrap_or(f64::NAN))
                         })
                         .collect();
-                    let bands = self.color_channel.as_ref().map(|_| self.color_bands);
                     for (band_idx, bins) in histogram_bins(&samples, self.bin_count, bounds, bands)
                         .into_iter()
                         .enumerate()
@@ -396,11 +393,6 @@ impl HistogramPanel {
 
         let cached = self.cache.as_ref().unwrap();
 
-        let locked_x_range = if self.lock_x_range && self.x_max > self.x_min {
-            Some((self.x_min, self.x_max))
-        } else {
-            None
-        };
         let percentage = self.percentage;
         let sample_count: u64 = cached.charts.iter().flat_map(|(b, _, _)| &b.counts).sum();
         ui.label(format!("{sample_count} samples"));

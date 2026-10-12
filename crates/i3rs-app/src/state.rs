@@ -1,12 +1,14 @@
 //! Shared application state accessible by all panels.
 
 use eframe::egui;
-use i3rs_core::{Lap, LdFile, LdxFile, Sector, TrackData, format_state_value, is_state_channel};
+use i3rs_core::{Lap, LdFile, LdxFile, Sector, TrackData};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use crate::panels::utils::{format_enum_value, sample_range, uses_discrete_values};
 
 /// Identifies a channel: either a physical channel from the .ld file or a math channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,6 +62,7 @@ pub struct PlottedChannel {
 
 /// Info about a plotted channel, registered by graph panels each frame for the readout panel.
 pub struct PlottedChannelInfo {
+    pub channel_id: ChannelId,
     pub name: String,
     pub unit: String,
     pub freq: u16,
@@ -75,25 +78,29 @@ pub struct PlottedChannelInfo {
 impl PlottedChannelInfo {
     /// Returns true when the channel should be treated as discrete state data.
     pub fn uses_discrete_values(&self) -> bool {
-        !self.enum_labels.is_empty() || is_state_channel(&self.name)
+        uses_discrete_values(&self.name, &self.enum_labels)
     }
 
     /// Format a value using file-parsed enum labels, falling back to hardcoded labels.
     pub fn format_value(&self, value: f64) -> Option<String> {
-        if !value.is_finite() {
-            return Some("---".into());
-        }
-        if !self.enum_labels.is_empty() {
-            let v = value.round() as i64;
-            if let Some(label) = self.enum_labels.get(&v) {
-                return Some(label.clone());
-            }
-        }
-        format_state_value(&self.name, value)
+        format_enum_value(&self.name, &self.enum_labels, value)
     }
 
     pub fn transform_value(&self, value: f64) -> f64 {
         value * self.display_scale + self.display_offset
+    }
+
+    /// Statistics of `data` in display units (a negative scale swaps min and max).
+    fn display_stats(&self, data: &[f64]) -> ChannelStats {
+        let mut stats = compute_channel_stats(data);
+        stats.min = self.transform_value(stats.min);
+        stats.max = self.transform_value(stats.max);
+        if self.display_scale < 0.0 {
+            std::mem::swap(&mut stats.min, &mut stats.max);
+        }
+        stats.avg = self.transform_value(stats.avg);
+        stats.stddev *= self.display_scale.abs();
+        stats
     }
 }
 
@@ -154,8 +161,6 @@ pub struct ChannelStats {
 pub struct DecodedChannel {
     pub data: Arc<[f64]>,
     pub stats: ChannelStats,
-    #[allow(dead_code)]
-    pub freq: u16,
 }
 
 /// Compute min, max, avg, stddev for a slice of finite f64 values.
@@ -282,102 +287,100 @@ pub struct CachedChannelStats {
 
 /// Cache for report panel statistics, invalidated when channels or laps change.
 pub struct ReportCache {
-    /// Fingerprint: (channel_name, data_ptr, data_len, unit, scale_bits, offset_bits).
-    fingerprint: Vec<(String, usize, usize, String, u64, u64)>,
+    channels: Vec<ReportChannelKey>,
     laps: Vec<(String, u64, u64)>,
     pub stats: Vec<CachedChannelStats>,
-    frequencies: Vec<u16>,
 }
 
-fn lap_fingerprint(laps: &[Lap]) -> Vec<(String, u64, u64)> {
-    laps.iter()
-        .map(|l| (l.name.clone(), l.start_time.to_bits(), l.end_time.to_bits()))
-        .collect()
+/// Every channel property that affects the cached statistics or their display.
+#[derive(PartialEq)]
+struct ReportChannelKey {
+    name: String,
+    data_ptr: usize,
+    data_len: usize,
+    unit: String,
+    scale_bits: u64,
+    offset_bits: u64,
+    freq: u16,
+    dec_places: i16,
+    color: egui::Color32,
+}
+
+impl ReportChannelKey {
+    fn of(info: &PlottedChannelInfo) -> Self {
+        Self {
+            name: info.name.clone(),
+            data_ptr: info.data.as_ptr() as usize,
+            data_len: info.data.len(),
+            unit: info.unit.clone(),
+            scale_bits: info.display_scale.to_bits(),
+            offset_bits: info.display_offset.to_bits(),
+            freq: info.freq,
+            dec_places: info.dec_places,
+            color: info.color,
+        }
+    }
+
+    fn matches(&self, info: &PlottedChannelInfo) -> bool {
+        self.name == info.name
+            && self.data_ptr == info.data.as_ptr() as usize
+            && self.data_len == info.data.len()
+            && self.unit == info.unit
+            && self.scale_bits == info.display_scale.to_bits()
+            && self.offset_bits == info.display_offset.to_bits()
+            && self.freq == info.freq
+            && self.dec_places == info.dec_places
+            && self.color == info.color
+    }
+}
+
+fn lap_matches(cached: &(String, u64, u64), lap: &Lap) -> bool {
+    cached.0 == lap.name
+        && cached.1 == lap.start_time.to_bits()
+        && cached.2 == lap.end_time.to_bits()
 }
 
 impl ReportCache {
     pub fn new() -> Self {
         Self {
-            fingerprint: Vec::new(),
+            channels: Vec::new(),
             laps: Vec::new(),
             stats: Vec::new(),
-            frequencies: Vec::new(),
         }
     }
 
     /// Returns true if the cache is still valid for the current display state.
     pub fn is_valid(&self, registry: &[PlottedChannelInfo], laps: &[Lap]) -> bool {
-        if self.laps != lap_fingerprint(laps) || self.fingerprint.len() != registry.len() {
-            return false;
-        }
-        for (i, info) in registry.iter().enumerate() {
-            let ptr = info.data.as_ptr() as usize;
-            let (ref name, cached_ptr, cached_len, ref unit, scale_bits, offset_bits) =
-                self.fingerprint[i];
-            if name != &info.name
-                || cached_ptr != ptr
-                || cached_len != info.data.len()
-                || unit != &info.unit
-                || scale_bits != info.display_scale.to_bits()
-                || offset_bits != info.display_offset.to_bits()
-                || self.stats[i].dec_places != info.dec_places
-                || self.stats[i].color != info.color
-                || self.frequencies[i] != info.freq
-            {
-                return false;
-            }
-        }
-        true
+        self.laps.len() == laps.len()
+            && self.channels.len() == registry.len()
+            && self.laps.iter().zip(laps).all(|(c, l)| lap_matches(c, l))
+            && self
+                .channels
+                .iter()
+                .zip(registry)
+                .all(|(k, i)| k.matches(i))
     }
 
     /// Rebuild the cache from current display state and laps.
     pub fn rebuild(&mut self, registry: &[PlottedChannelInfo], laps: &[Lap]) {
-        self.fingerprint = registry
+        self.channels = registry.iter().map(ReportChannelKey::of).collect();
+        self.laps = laps
             .iter()
-            .map(|info| {
-                (
-                    info.name.clone(),
-                    info.data.as_ptr() as usize,
-                    info.data.len(),
-                    info.unit.clone(),
-                    info.display_scale.to_bits(),
-                    info.display_offset.to_bits(),
-                )
-            })
+            .map(|l| (l.name.clone(), l.start_time.to_bits(), l.end_time.to_bits()))
             .collect();
-        self.laps = lap_fingerprint(laps);
-        self.frequencies = registry.iter().map(|info| info.freq).collect();
         self.stats.clear();
 
         for info in registry {
-            let mut session = compute_channel_stats(&info.data);
-            session.min = info.transform_value(session.min);
-            session.max = info.transform_value(session.max);
-            if info.display_scale < 0.0 {
-                std::mem::swap(&mut session.min, &mut session.max);
-            }
-            session.avg = info.transform_value(session.avg);
-            session.stddev *= info.display_scale.abs();
-            let freq = info.freq;
-            let mut per_lap = Vec::with_capacity(laps.len());
-
-            for lap in laps {
-                let start_sample = (lap.start_time * freq as f64).ceil() as usize;
-                let end_sample = (lap.end_time * freq as f64).ceil() as usize;
-                let start = start_sample.min(info.data.len());
-                let end = end_sample.min(info.data.len());
-                if start < end {
-                    let mut stats = compute_channel_stats(&info.data[start..end]);
-                    stats.min = info.transform_value(stats.min);
-                    stats.max = info.transform_value(stats.max);
-                    if info.display_scale < 0.0 {
-                        std::mem::swap(&mut stats.min, &mut stats.max);
-                    }
-                    stats.avg = info.transform_value(stats.avg);
-                    stats.stddev *= info.display_scale.abs();
-                    per_lap.push((lap.name.clone(), stats));
-                }
-            }
+            let session = info.display_stats(&info.data);
+            let per_lap = laps
+                .iter()
+                .filter_map(|lap| {
+                    let range =
+                        sample_range(info.data.len(), info.freq, (lap.start_time, lap.end_time));
+                    (!range.is_empty())
+                        .then(|| (lap.name.clone(), info.display_stats(&info.data[range])))
+                })
+                .collect();
 
             self.stats.push(CachedChannelStats {
                 name: info.name.clone(),
@@ -622,6 +625,37 @@ impl SharedState {
         }
     }
 
+    /// The zoomed range, or the whole session when nothing is zoomed.
+    pub fn analysis_range(&self) -> (f64, f64) {
+        self.zoom_range
+            .unwrap_or((0.0, self.data_duration.unwrap_or(0.0)))
+    }
+
+    /// Move the cursor to `start` unless it already lies in `[start, end)`.
+    pub fn clamp_cursor_to(&mut self, (start, end): (f64, f64)) {
+        if self.cursor_time.is_none_or(|t| t < start || t >= end) {
+            self.cursor_time = Some(start);
+        }
+    }
+
+    /// Select a lap (or the whole session) and zoom every panel to it.
+    pub fn select_lap(&mut self, lap: Option<usize>) {
+        self.selected_lap = lap;
+        self.zoom_from_timeline = true;
+        self.zoom_range = lap
+            .and_then(|index| self.laps.get(index))
+            .map(|lap| (lap.start_time, lap.end_time));
+        if let Some(range) = self.zoom_range {
+            self.clamp_cursor_to(range);
+        }
+    }
+
+    /// An explicit cursor jump (e.g. a click) stops playback.
+    pub fn seek(&mut self, time: f64) {
+        self.playback_active = false;
+        self.cursor_time = Some(time);
+    }
+
     /// Hovering a stationary pointer must not override the playback clock.
     pub fn set_hover_cursor(&mut self, time: f64) {
         if !self.playback_active {
@@ -633,9 +667,7 @@ impl SharedState {
         if !self.playback_active {
             return;
         }
-        let (start, end) = self
-            .zoom_range
-            .unwrap_or((0.0, self.data_duration.unwrap_or(0.0)));
+        let (start, end) = self.analysis_range();
         if !start.is_finite() || !end.is_finite() || end <= start {
             self.playback_active = false;
             return;
@@ -696,7 +728,6 @@ impl SharedState {
         channel_idx: usize,
         data: Vec<f64>,
         stats: ChannelStats,
-        freq: u16,
     ) {
         self.pending_channel_decodes
             .borrow_mut()
@@ -706,7 +737,6 @@ impl SharedState {
             Arc::new(DecodedChannel {
                 data: Arc::from(data),
                 stats,
-                freq,
             }),
         );
     }

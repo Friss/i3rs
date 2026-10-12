@@ -6,7 +6,10 @@ use std::sync::Arc;
 
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
-use i3rs_core::{Lap, LdFile, detect_laps, format_state_value, is_state_channel};
+use i3rs_core::distance::{
+    SpeedSource, corrected_speed_source, distance_unit_to_meters, integrate_speed_series,
+};
+use i3rs_core::{Lap, LdFile, detect_laps};
 
 use crate::state::{
     CHANNEL_COLORS, ChannelId, ChannelPreference, DistanceAxisCache, GraphMode, GraphXAxis,
@@ -16,32 +19,15 @@ use crate::state::{
 use super::graph_line::display_trace_points;
 
 use super::gauge::{
-    GaugeChannel, GaugeDrawContext, GaugeStyle, best_gauge_grid, default_style_for_name, draw_gauge,
+    GaugeChannel, GaugeReading, GaugeStyle, best_gauge_grid, default_style_for_name, draw_gauge,
 };
 use super::utils::{
     ChannelDisplayMeta, DisplayTransformFingerprint, apply_channel_preference,
     build_plotted_channel_info, create_plotted_channel, display_transform_fingerprint,
-    refresh_plotted_channel, resolve_channel_meta, resolve_plotted_channel_display_meta,
-    set_plotted_channel_display_transform,
+    format_enum_value, refresh_plotted_channel, resolve_channel_meta,
+    resolve_plotted_channel_display_meta, set_plotted_channel_display_transform,
+    uses_discrete_values,
 };
-
-/// Format a value using file-parsed enum labels, falling back to hardcoded labels.
-fn format_enum_value(name: &str, enum_labels: &HashMap<i64, String>, value: f64) -> Option<String> {
-    if !value.is_finite() {
-        return Some("---".into());
-    }
-    if !enum_labels.is_empty() {
-        let v = value.round() as i64;
-        if let Some(label) = enum_labels.get(&v) {
-            return Some(label.clone());
-        }
-    }
-    format_state_value(name, value)
-}
-
-fn uses_discrete_values(name: &str, enum_labels: &HashMap<i64, String>) -> bool {
-    !enum_labels.is_empty() || is_state_channel(name)
-}
 
 /// Build a freq map for a set of plotted channels (used to pass into closures).
 fn build_freq_map(channels: &[&PlottedChannel], shared: &SharedState) -> HashMap<ChannelId, u16> {
@@ -175,44 +161,31 @@ struct LapSeriesRenderParams<'a> {
     transform: PlotTransform,
 }
 
-fn native_plot_points_for_range(
-    data: &[f64],
-    freq: u16,
-    samples: SampleRange,
-    axis: &ActiveGraphXAxis,
-    x_range: PlotXRange,
-    y_scale: f64,
-    y_offset: f64,
-) -> Vec<egui_plot::PlotPoint> {
-    native_lap_plot_points_for_range(
-        data,
-        freq,
-        samples,
-        axis,
-        x_range,
-        PlotTransform {
+impl PlotTransform {
+    /// Display scale/offset on Y; X is the raw axis value.
+    fn y_only(y_scale: f64, y_offset: f64) -> Self {
+        Self {
             origin_axis: 0.0,
             x_scale: 1.0,
             x_offset: 0.0,
             y_scale,
             y_offset,
-        },
-    )
+        }
+    }
 }
 
-fn native_lap_plot_points_for_range(
-    data: &[f64],
+/// Native samples in `x_range`, produced lazily so dense views can be reduced
+/// without materializing every visible point first.
+fn visible_plot_points<'a>(
+    data: &'a [f64],
     freq: u16,
     samples: SampleRange,
-    axis: &ActiveGraphXAxis,
+    axis: &'a ActiveGraphXAxis,
     x_range: PlotXRange,
     transform: PlotTransform,
-) -> Vec<egui_plot::PlotPoint> {
-    if freq == 0 || samples.is_empty() || samples.start >= data.len() {
-        return Vec::new();
-    }
+) -> impl ExactSizeIterator<Item = egui_plot::PlotPoint> + 'a {
     let end = samples.end.min(data.len());
-    let x_at = |idx: usize| {
+    let x_at = move |idx: usize| {
         (axis.axis_value_at_time(idx as f64 / freq as f64) - transform.origin_axis)
             * transform.x_scale
             + transform.x_offset
@@ -233,18 +206,49 @@ fn native_lap_plot_points_for_range(
         }
         lo
     };
-    let visible_start = partition(x_range.min, false)
-        .saturating_sub(1)
-        .max(samples.start);
-    let visible_end = partition(x_range.max, true).saturating_add(1).min(end);
-    (visible_start..visible_end)
-        .map(|idx| {
-            egui_plot::PlotPoint::new(
-                x_at(idx),
-                data[idx] * transform.y_scale + transform.y_offset,
-            )
-        })
-        .collect()
+    let visible = if freq == 0 || samples.is_empty() || samples.start >= data.len() {
+        0..0
+    } else {
+        let visible_start = partition(x_range.min, false)
+            .saturating_sub(1)
+            .max(samples.start);
+        let visible_end = partition(x_range.max, true).saturating_add(1).min(end);
+        visible_start..visible_end.max(visible_start)
+    };
+    visible.map(move |idx| {
+        egui_plot::PlotPoint::new(
+            x_at(idx),
+            data[idx] * transform.y_scale + transform.y_offset,
+        )
+    })
+}
+
+/// Physical pixel columns available for display reduction (0 draws every sample).
+fn reduction_columns(plot_ui: &egui_plot::PlotUi, full_resolution: bool) -> usize {
+    if full_resolution {
+        0
+    } else {
+        (plot_ui.transform().frame().width() * plot_ui.response().ctx.pixels_per_point()).ceil()
+            as usize
+    }
+}
+
+/// Draw a trace as separate lines, breaking at invalid (non-finite) points.
+fn draw_gapped_line<'a>(
+    plot_ui: &mut egui_plot::PlotUi<'a>,
+    points: &'a [egui_plot::PlotPoint],
+    color: egui::Color32,
+    width: f32,
+) {
+    for segment in points.split(|point| !point.x.is_finite() || !point.y.is_finite()) {
+        if !segment.is_empty() {
+            plot_ui.line(
+                Line::new("", PlotPoints::Borrowed(segment))
+                    .color(color)
+                    .width(width),
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1016,34 +1020,7 @@ impl GraphPanel {
             .spacing([spacing, spacing])
             .show(ui, |ui| {
                 for (idx, gauge) in self.embedded_gauges.iter_mut().enumerate() {
-                    let (name, unit, freq, dec_places, enum_labels) =
-                        resolve_plotted_channel_display_meta(&gauge.channel, shared);
-                    let discrete = !enum_labels.is_empty() || i3rs_core::is_state_channel(&name);
-                    let raw_value = shared
-                        .cursor_time
-                        .map(|t| {
-                            super::cursor_readout::value_at_time(
-                                &gauge.channel.data,
-                                freq,
-                                t,
-                                discrete,
-                            )
-                        })
-                        .filter(|value| value.is_finite());
-                    let value = raw_value.map(|v| {
-                        if discrete {
-                            v
-                        } else {
-                            v * gauge.channel.display_scale + gauge.channel.display_offset
-                        }
-                    });
-                    let mut min = gauge.channel.cached_min * gauge.channel.display_scale
-                        + gauge.channel.display_offset;
-                    let mut max = gauge.channel.cached_max * gauge.channel.display_scale
-                        + gauge.channel.display_offset;
-                    if gauge.channel.display_scale < 0.0 {
-                        std::mem::swap(&mut min, &mut max);
-                    }
+                    let reading = GaugeReading::new(&gauge.channel, shared);
 
                     let (rect, response) = ui.allocate_exact_size(
                         egui::vec2(gauge_size, gauge_size),
@@ -1061,15 +1038,7 @@ impl GraphPanel {
                     });
 
                     let painter = ui.painter_at(rect);
-                    let ctx = GaugeDrawContext {
-                        name: &name,
-                        unit: &unit,
-                        value,
-                        min,
-                        max,
-                        dec_places,
-                        color: gauge.channel.color,
-                    };
+                    let ctx = reading.draw_context(gauge.channel.color);
                     draw_gauge(&painter, rect, gauge.style, &ctx);
 
                     if (idx + 1) % cols == 0 {
@@ -1963,13 +1932,7 @@ impl GraphPanel {
             }
 
             let fingerprint = GraphRenderFingerprint {
-                pixel_columns: if full_resolution {
-                    0
-                } else {
-                    (plot_ui.transform().frame().width()
-                        * plot_ui.response().ctx.pixels_per_point())
-                    .ceil() as usize
-                },
+                pixel_columns: reduction_columns(plot_ui, full_resolution),
                 freq,
                 data_ptr: pc.data.as_ptr() as usize,
                 data_len: pc.data.len(),
@@ -1997,20 +1960,18 @@ impl GraphPanel {
                     end: pc.data.len(),
                 };
                 // Start with original samples; dense overview reduction retains actual extrema and gaps.
-                cache_entry.plot_points = native_plot_points_for_range(
-                    &pc.data,
-                    freq,
-                    samples,
-                    x_axis,
-                    PlotXRange {
-                        min: x_min,
-                        max: x_max,
-                    },
-                    pc.display_scale,
-                    pc.display_offset,
-                );
                 cache_entry.plot_points = display_trace_points(
-                    std::mem::take(&mut cache_entry.plot_points),
+                    visible_plot_points(
+                        &pc.data,
+                        freq,
+                        samples,
+                        x_axis,
+                        PlotXRange {
+                            min: x_min,
+                            max: x_max,
+                        },
+                        PlotTransform::y_only(pc.display_scale, pc.display_offset),
+                    ),
                     x_min,
                     x_max,
                     fingerprint.pixel_columns,
@@ -2020,25 +1981,8 @@ impl GraphPanel {
 
         let render_cache = &*render_cache;
         for pc in channels {
-            let Some(cache_entry) = render_cache.get(&pc.channel_id) else {
-                continue;
-            };
-            if cache_entry.plot_points.is_empty() {
-                continue;
-            }
-
-            for segment in cache_entry
-                .plot_points
-                .split(|point| !point.x.is_finite() || !point.y.is_finite())
-            {
-                if segment.is_empty() {
-                    continue;
-                }
-                plot_ui.line(
-                    Line::new("", PlotPoints::Borrowed(segment))
-                        .color(pc.color)
-                        .width(1.5),
-                );
+            if let Some(cache_entry) = render_cache.get(&pc.channel_id) {
+                draw_gapped_line(plot_ui, &cache_entry.plot_points, pc.color, 1.5);
             }
         }
     }
@@ -2431,16 +2375,21 @@ impl GraphPanel {
         }
     }
 
+    /// Display options shared by the whole-graph and tile-group context menus.
+    fn show_context_menu_header(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.full_resolution, "Draw every sample")
+            .on_hover_text("Disable display reduction for dense overviews. Values and statistics always use full data.");
+        ui.separator();
+        if ui.button("Manage Channels...").clicked() {
+            self.show_manage_channels_window = true;
+            ui.close();
+        }
+        ui.separator();
+    }
+
     fn handle_context_menu(&mut self, response: &egui::Response, shared: &mut SharedState) {
         response.context_menu(|ui| {
-            ui.checkbox(&mut self.full_resolution, "Draw every sample")
-                .on_hover_text("Disable display reduction for dense overviews. Values and statistics always use full data.");
-            ui.separator();
-            if ui.button("Manage Channels...").clicked() {
-                self.show_manage_channels_window = true;
-                ui.close();
-            }
-            ui.separator();
+            self.show_context_menu_header(ui);
             ui.label("Channels:");
             ui.separator();
 
@@ -2472,14 +2421,7 @@ impl GraphPanel {
             .collect();
 
         response.context_menu(|ui| {
-            ui.checkbox(&mut self.full_resolution, "Draw every sample")
-                .on_hover_text("Disable display reduction for dense overviews. Values and statistics always use full data.");
-            ui.separator();
-            if ui.button("Manage Channels...").clicked() {
-                self.show_manage_channels_window = true;
-                ui.close();
-            }
-            ui.separator();
+            self.show_context_menu_header(ui);
             ui.label("Channels");
             ui.separator();
 
@@ -4005,12 +3947,7 @@ fn ensure_lap_series_cache(
     let x_min = bounds.min()[0];
     let x_max = bounds.max()[0];
     let fingerprint = LapRenderFingerprint {
-        pixel_columns: if full_resolution {
-            0
-        } else {
-            (plot_ui.transform().frame().width() * plot_ui.response().ctx.pixels_per_point()).ceil()
-                as usize
-        },
+        pixel_columns: reduction_columns(plot_ui, full_resolution),
         freq,
         data_ptr: data.as_ptr() as usize,
         data_len: data.len(),
@@ -4039,24 +3976,23 @@ fn ensure_lap_series_cache(
             start: start_sample,
             end: end_sample,
         };
-        cache_entry.fingerprint = fingerprint;
-        cache_entry.plot_points = native_lap_plot_points_for_range(
-            data,
-            freq,
-            samples,
-            axis,
-            PlotXRange {
-                min: x_min,
-                max: x_max,
-            },
-            transform,
-        );
         cache_entry.plot_points = display_trace_points(
-            std::mem::take(&mut cache_entry.plot_points),
+            visible_plot_points(
+                data,
+                freq,
+                samples,
+                axis,
+                PlotXRange {
+                    min: x_min,
+                    max: x_max,
+                },
+                transform,
+            ),
             x_min,
             x_max,
-            cache_entry.fingerprint.pixel_columns,
+            fingerprint.pixel_columns,
         );
+        cache_entry.fingerprint = fingerprint;
     }
 }
 
@@ -4067,25 +4003,8 @@ fn draw_cached_lap_series<'a>(
     color: egui::Color32,
     width: f32,
 ) {
-    let Some(cache_entry) = render_cache.get(cache_key) else {
-        return;
-    };
-    if cache_entry.plot_points.is_empty() {
-        return;
-    }
-
-    for segment in cache_entry
-        .plot_points
-        .split(|point| !point.x.is_finite() || !point.y.is_finite())
-    {
-        if segment.is_empty() {
-            continue;
-        }
-        plot_ui.line(
-            Line::new("", PlotPoints::Borrowed(segment))
-                .color(color)
-                .width(width),
-        );
+    if let Some(cache_entry) = render_cache.get(cache_key) {
+        draw_gapped_line(plot_ui, &cache_entry.plot_points, color, width);
     }
 }
 
@@ -4203,7 +4122,7 @@ fn find_distance_channel(shared: &SharedState) -> (Option<DistanceAxisCache>, bo
         {
             return (
                 Some(DistanceAxisCache {
-                    data: data.iter().map(|v| v * scale).collect(),
+                    data: scaled_samples(data, scale),
                     freq: mc.freq,
                 }),
                 false,
@@ -4225,7 +4144,7 @@ fn find_distance_channel(shared: &SharedState) -> (Option<DistanceAxisCache>, bo
                 if is_monotonic_non_decreasing(&decoded.data) {
                     return (
                         Some(DistanceAxisCache {
-                            data: decoded.data.iter().map(|v| v * scale).collect(),
+                            data: scaled_samples(&decoded.data, scale),
                             freq: ch.freq,
                         }),
                         false,
@@ -4239,6 +4158,15 @@ fn find_distance_channel(shared: &SharedState) -> (Option<DistanceAxisCache>, bo
     }
 
     (None, waiting_on_sources)
+}
+
+/// Share the buffer when no unit conversion is needed.
+fn scaled_samples(data: &Arc<[f64]>, scale: f64) -> Arc<[f64]> {
+    if scale == 1.0 {
+        Arc::clone(data)
+    } else {
+        data.iter().map(|v| v * scale).collect()
+    }
 }
 
 fn find_distance_channel_in_ld(ld: &LdFile) -> Option<OwnedDistanceAxisCache> {
@@ -4287,9 +4215,7 @@ fn find_speed_channel(shared: &SharedState) -> (SpeedChannelLookup, bool) {
     let Some(ld) = shared.ld_file.as_ref() else {
         return (None, waiting_on_sources);
     };
-    let ready = |name: &str| {
-        let ch = ld.find_channel_by_name(name)?;
-        i3rs_core::distance::speed_unit_to_mps(&ch.unit)?;
+    let ready = |ch: &i3rs_core::ChannelMeta| {
         if let Some(decoded) = shared.decoded_physical_channel_if_ready(ch.index) {
             Some((Arc::clone(&decoded.data), ch.freq, ch.unit.clone()))
         } else {
@@ -4297,48 +4223,30 @@ fn find_speed_channel(shared: &SharedState) -> (SpeedChannelLookup, bool) {
             None
         }
     };
-    // Wait for a higher-priority source instead of caching whichever decode
-    // happens to finish first; primary and external sessions must agree.
-    let usable = |name| {
-        ld.find_channel_by_name(name).is_some_and(|c| {
-            c.freq > 0 && i3rs_core::distance::speed_unit_to_mps(&c.unit).is_some()
-        })
-    };
-    if usable("Corr Speed") {
-        let data = ready("Corr Speed");
-        let waiting = data.is_none();
-        return (data, waiting);
-    }
-    if usable("Wheel Speed Front Left") && usable("Wheel Speed Front Right") {
-        let a = ready("Wheel Speed Front Left");
-        let b = ready("Wheel Speed Front Right");
-        if let (Some(a), Some(b)) = (a, b)
-            && let Some((d, f)) =
-                i3rs_core::distance::fastest_speed((&a.0, a.1, &a.2), (&b.0, b.1, &b.2))
-        {
-            return (Some((Arc::from(d), f, "m/s".into())), false);
-        }
-        return (None, true);
-    }
-    for name in i3rs_core::distance::SPEED_FALLBACKS {
-        if let Some(ch) = ld.find_channel_by_name(name)
-            && ch.freq > 0
-            && i3rs_core::distance::speed_unit_to_mps(&ch.unit).is_some()
-        {
-            let data = ready(name);
+    // Wait for the selected source instead of caching whichever decode
+    // happens to finish first.
+    match corrected_speed_source(ld) {
+        Some(SpeedSource::Single(ch)) => {
+            let data = ready(ch);
             let waiting = data.is_none();
-            return (data, waiting);
+            (data, waiting)
         }
+        Some(SpeedSource::FrontWheels(a, b)) => {
+            if let (Some(a), Some(b)) = (ready(a), ready(b))
+                && let Some((d, f)) =
+                    i3rs_core::distance::fastest_speed((&a.0, a.1, &a.2), (&b.0, b.1, &b.2))
+            {
+                return (Some((Arc::from(d), f, "m/s".into())), false);
+            }
+            (None, true)
+        }
+        None => (None, waiting_on_sources),
     }
-
-    (None, waiting_on_sources)
 }
 
 fn find_speed_channel_in_ld(ld: &LdFile) -> Option<(Vec<f64>, u16, String)> {
     i3rs_core::distance::corrected_speed_from_ld(ld).map(|(data, freq)| (data, freq, "m/s".into()))
 }
-
-use i3rs_core::distance::integrate_speed_series;
 
 fn normalized_name(name: &str) -> String {
     i3rs_core::normalize_channel_name(name)
@@ -4377,16 +4285,6 @@ fn time_from_monotonic_axis(data: &[f64], freq: u16, axis_value: f64) -> Option<
     }
 }
 
-fn distance_unit_to_meters(unit: &str) -> Option<f64> {
-    match unit.trim().to_ascii_lowercase().as_str() {
-        "m" | "meter" | "meters" | "metre" | "metres" => Some(1.),
-        "km" => Some(1000.),
-        "mi" | "mile" | "miles" => Some(1609.344),
-        "ft" | "feet" => Some(0.3048),
-        _ => None,
-    }
-}
-
 fn is_monotonic_non_decreasing(data: &[f64]) -> bool {
     const EPSILON: f64 = 1e-6;
 
@@ -4413,13 +4311,27 @@ impl NormalizedNameExt for str {
 mod tests {
     use super::{
         ActiveGraphXAxis, GraphAxisFingerprint, GraphPanel, GraphRenderFingerprint,
-        LapRenderFingerprint, MIN_TILE_HEIGHT, OverlaySource, PlotXRange, SampleRange,
-        display_transform_fingerprint, integrate_speed_series, is_monotonic_non_decreasing,
-        native_plot_points_for_range, overlay_axis_offset, time_from_monotonic_axis,
+        LapRenderFingerprint, MIN_TILE_HEIGHT, OverlaySource, PlotTransform, PlotXRange,
+        SampleRange, display_transform_fingerprint, integrate_speed_series,
+        is_monotonic_non_decreasing, overlay_axis_offset, time_from_monotonic_axis,
+        visible_plot_points,
     };
     use crate::state::{ChannelId, PlottedChannel, YAxis};
     use i3rs_core::Lap;
     use std::sync::Arc;
+
+    fn native_plot_points_for_range(
+        data: &[f64],
+        freq: u16,
+        samples: SampleRange,
+        axis: &ActiveGraphXAxis,
+        x_range: PlotXRange,
+        y_scale: f64,
+        y_offset: f64,
+    ) -> Vec<egui_plot::PlotPoint> {
+        let transform = PlotTransform::y_only(y_scale, y_offset);
+        visible_plot_points(data, freq, samples, axis, x_range, transform).collect()
+    }
 
     /// Adding a graph has to shrink the existing tiles to make room rather than
     /// appending a tile and overflowing the panel; removing one has to give the
@@ -4446,7 +4358,7 @@ mod tests {
             if let Some(ch) = ld.find_channel_by_name(name) {
                 let data = ld.read_channel_data(ch).unwrap();
                 let stats = crate::state::compute_channel_stats(&data);
-                shared.store_decoded_physical_channel(ch.index, data, stats, ch.freq);
+                shared.store_decoded_physical_channel(ch.index, data, stats);
             }
         }
         let (primary, _) = super::derive_distance_axis_cache(&shared);
@@ -4833,18 +4745,23 @@ mod tests {
                     .map(|(data, freq)| {
                         let end = ((duration * *freq as f64).ceil() as usize).min(data.len());
                         if native {
-                            native_plot_points_for_range(
+                            let axis = ActiveGraphXAxis::Time;
+                            let points = visible_plot_points(
                                 data,
                                 *freq,
                                 SampleRange { start: 0, end },
-                                &ActiveGraphXAxis::Time,
+                                &axis,
                                 PlotXRange {
                                     min: 0.0,
                                     max: duration,
                                 },
-                                1.0,
-                                0.0,
-                            )
+                                PlotTransform::y_only(1.0, 0.0),
+                            );
+                            if mode == "adaptive" {
+                                super::display_trace_points(points, 0.0, duration, 1200)
+                            } else {
+                                points.collect()
+                            }
                         } else {
                             i3rs_core::downsample_minmax(&data[..end], *freq, 0, 1200)
                                 .into_iter()
@@ -4853,16 +4770,6 @@ mod tests {
                         }
                     })
                     .collect::<Vec<_>>();
-                let series: Vec<_> = series
-                    .into_iter()
-                    .map(|points| {
-                        if mode == "adaptive" {
-                            super::display_trace_points(points, 0.0, duration, 1200)
-                        } else {
-                            points
-                        }
-                    })
-                    .collect();
                 let prep_ms = prep.elapsed().as_secs_f64() * 1000.;
                 let ctx = egui::Context::default();
                 let mut times = Vec::new();

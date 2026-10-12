@@ -146,6 +146,36 @@ pub struct GraphDisplayTransformConfig {
     pub scale_manual: Option<(f64, f64)>,
 }
 
+impl Default for GraphDisplayTransformConfig {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            offset: 0.0,
+            unit: None,
+            scale_manual: None,
+        }
+    }
+}
+
+impl GraphDisplayTransformConfig {
+    fn of(pc: &crate::state::PlottedChannel) -> Self {
+        Self {
+            scale: pc.display_scale,
+            offset: pc.display_offset,
+            unit: pc.display_unit.clone(),
+            scale_manual: (pc.scale_mode == crate::state::ScaleMode::Manual)
+                .then_some((pc.manual_min, pc.manual_max)),
+        }
+    }
+
+    fn apply_to(&self, pc: &mut crate::state::PlottedChannel) {
+        pc.display_scale = self.scale;
+        pc.display_offset = self.offset;
+        pc.display_unit = self.unit.clone();
+        apply_saved_scale_limits(pc, self.scale_manual);
+    }
+}
+
 fn apply_saved_scale_limits(
     channel: &mut crate::state::PlottedChannel,
     scale_manual: Option<(f64, f64)>,
@@ -189,13 +219,7 @@ fn save_analysis_channel(
         name,
         is_math,
         color: [pc.color.r(), pc.color.g(), pc.color.b()],
-        transform: GraphDisplayTransformConfig {
-            scale: pc.display_scale,
-            offset: pc.display_offset,
-            unit: pc.display_unit.clone(),
-            scale_manual: (pc.scale_mode == crate::state::ScaleMode::Manual)
-                .then_some((pc.manual_min, pc.manual_max)),
-        },
+        transform: GraphDisplayTransformConfig::of(pc),
     })
 }
 
@@ -210,10 +234,7 @@ fn load_analysis_channel(
         eframe::egui::Color32::from_rgb(c.color[0], c.color[1], c.color[2]),
         0,
     )?;
-    pc.display_scale = c.transform.scale;
-    pc.display_offset = c.transform.offset;
-    pc.display_unit = c.transform.unit.clone();
-    apply_saved_scale_limits(&mut pc, c.transform.scale_manual);
+    c.transform.apply_to(&mut pc);
     Some(pc)
 }
 
@@ -448,17 +469,7 @@ pub fn save_workspace(
                         let display_transforms: Vec<GraphDisplayTransformConfig> = g
                             .plotted_channels
                             .iter()
-                            .map(|pc| GraphDisplayTransformConfig {
-                                scale: pc.display_scale,
-                                offset: pc.display_offset,
-                                unit: pc.display_unit.clone(),
-                                scale_manual: match pc.scale_mode {
-                                    crate::state::ScaleMode::Manual => {
-                                        Some((pc.manual_min, pc.manual_max))
-                                    }
-                                    crate::state::ScaleMode::Auto => None,
-                                },
-                            })
+                            .map(GraphDisplayTransformConfig::of)
                             .collect();
                         let overlays: Vec<GraphOverlayConfig> = g
                             .lap_overlays
@@ -733,22 +744,30 @@ pub fn save_workspace(
 // Conversion: WorkspaceFile → App state
 // ---------------------------------------------------------------------------
 
-pub fn load_workspace(
-    workspace: &WorkspaceFile,
-    shared: &mut SharedState,
-) -> Vec<(String, DockState<PanelTab>)> {
+/// Restore section identity before asynchronous math/layout restoration can wait.
+pub(crate) fn restore_track_sections(workspace: &WorkspaceFile, shared: &mut SharedState) {
     shared.track_definition_error = None;
     shared.pending_track_definition = workspace.track_definition.clone();
+    // Missing paths cannot establish recording identity (e.g. browser uploads).
+    let same_recording = workspace
+        .last_file_path
+        .as_deref()
+        .is_some_and(|saved| Some(saved) == shared.ld_path.as_ref().and_then(|p| p.to_str()));
     // Legacy index-only sections are valid only for the original recording.
-    shared.sectors = if workspace.track_definition.is_none()
-        && workspace.last_file_path.as_deref() == shared.ld_path.as_ref().and_then(|p| p.to_str())
-    {
+    shared.sectors = if workspace.track_definition.is_none() && same_recording {
         workspace.sectors.clone()
     } else {
         Vec::new()
     };
     shared.reference_lap = workspace.reference_lap.filter(|i| *i < shared.laps.len());
     shared.apply_pending_track_definition();
+}
+
+pub fn load_workspace(
+    workspace: &WorkspaceFile,
+    shared: &mut SharedState,
+) -> Vec<(String, DockState<PanelTab>)> {
+    restore_track_sections(workspace, shared);
     workspace
         .worksheets
         .iter()
@@ -782,13 +801,9 @@ pub fn load_workspace(
                                 .map(|c| eframe::egui::Color32::from_rgb(c[0], c[1], c[2]))
                                 .unwrap_or(CHANNEL_COLORS[i % CHANNEL_COLORS.len()]);
                             let tile_group = gc.tile_groups.get(i).copied().unwrap_or(i);
-                            let display_transform = gc.display_transforms.get(i);
-                            let display_scale =
-                                display_transform.map(|cfg| cfg.scale).unwrap_or(1.0);
-                            let display_offset =
-                                display_transform.map(|cfg| cfg.offset).unwrap_or(0.0);
-                            let display_unit = display_transform.and_then(|cfg| cfg.unit.clone());
-                            let scale_manual = display_transform.and_then(|cfg| cfg.scale_manual);
+                            let identity = GraphDisplayTransformConfig::default();
+                            let display_transform =
+                                gc.display_transforms.get(i).unwrap_or(&identity);
 
                             if is_math {
                                 // Find math channel by name
@@ -803,9 +818,9 @@ pub fn load_workspace(
                                         data: data.clone(),
                                         tile_group,
                                         y_axis: crate::state::YAxis::Left,
-                                        display_scale,
-                                        display_offset,
-                                        display_unit: display_unit.clone(),
+                                        display_scale: 1.0,
+                                        display_offset: 0.0,
+                                        display_unit: None,
                                         scale_mode: crate::state::ScaleMode::Auto,
                                         manual_min: stats.min,
                                         manual_max: stats.max,
@@ -813,7 +828,7 @@ pub fn load_workspace(
                                         cached_max: stats.max,
                                         cached_avg: stats.avg,
                                     };
-                                    apply_saved_scale_limits(&mut plotted, scale_manual);
+                                    display_transform.apply_to(&mut plotted);
                                     graph.plotted_channels.push(plotted);
                                 }
                             } else if let Some(ld) = &shared.ld_file
@@ -827,10 +842,7 @@ pub fn load_workspace(
                                 plotted.color = color;
                                 plotted.tile_group = tile_group;
                                 plotted.y_axis = crate::state::YAxis::Left;
-                                plotted.display_scale = display_scale;
-                                plotted.display_offset = display_offset;
-                                plotted.display_unit = display_unit.clone();
-                                apply_saved_scale_limits(&mut plotted, scale_manual);
+                                display_transform.apply_to(&mut plotted);
                                 graph.plotted_channels.push(plotted);
                             }
                         }
@@ -1002,11 +1014,8 @@ pub fn load_workspace(
                         let mut mixture_map = MixtureMapPanel::new(mc.id, &mc.title);
                         mixture_map.bins = mc.bins.clamp(5, 100);
                         mixture_map.scatter_mode = mc.scatter_mode;
-                        mixture_map.sensor_delay = if mc.sensor_delay.is_finite() {
-                            mc.sensor_delay.clamp(0., 5.)
-                        } else {
-                            0.
-                        };
+                        mixture_map.sensor_delay =
+                            crate::panels::mixture_map::normalized_sensor_delay(mc.sensor_delay);
                         mixture_map.minimum_y = mc.minimum_y.filter(|v| v.is_finite());
                         mixture_map.color_bands = mc.color_bands.valid();
                         if let Some(channel_name) = &mc.x_channel_name {
@@ -1191,6 +1200,23 @@ mod tests {
             serde_json::from_str(r#"{"worksheets":[],"active_worksheet":0,"last_file_path":null}"#)
                 .unwrap();
         assert!(legacy.track_definition.is_none());
+    }
+
+    #[test]
+    fn legacy_section_indices_require_a_known_matching_recording() {
+        let mut shared = crate::state::SharedState::new();
+        let mut workspace: super::WorkspaceFile = serde_json::from_str(
+            r#"{"worksheets":[],"active_worksheet":0,"last_file_path":null,"sectors":[{"name":"Old","start_index":1,"end_index":2}]}"#,
+        ).unwrap();
+        super::restore_track_sections(&workspace, &mut shared);
+        assert!(shared.sectors.is_empty());
+        workspace.last_file_path = Some("original.ld".into());
+        shared.ld_path = Some("original.ld".into());
+        super::restore_track_sections(&workspace, &mut shared);
+        assert_eq!(shared.sectors.len(), 1);
+        shared.ld_path = Some("different.ld".into());
+        super::restore_track_sections(&workspace, &mut shared);
+        assert!(shared.sectors.is_empty());
     }
 
     #[test]

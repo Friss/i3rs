@@ -45,6 +45,13 @@ Selectors:
 - `--lap NAME|N`: one lap
 - `--laps all` or `--laps A,B`: multiple lap segments
 
+Native extraction, lap statistics, histograms, and lap-scoped math statistics
+use the half-open interval `[START, END)`: a sample at the start is included;
+a sample at the end belongs to the next interval. A boundary between samples
+rounds up, matching the GUI. This corrects the earlier behavior that included
+one sample before an off-grid start. Counts and statistics for those selections
+may therefore change. Requested resampling still evaluates the requested times.
+
 Axes:
 
 - `time`: absolute session time

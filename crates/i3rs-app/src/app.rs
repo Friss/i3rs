@@ -272,6 +272,7 @@ impl App {
         if self.shared.are_math_channels_settled() {
             self.apply_workspace_snapshot(workspace);
         } else {
+            crate::workspace::restore_track_sections(&workspace, &mut self.shared);
             self.pending_workspace_restore = Some(workspace);
         }
     }
@@ -523,7 +524,6 @@ impl App {
                                 decoded.channel_idx,
                                 decoded.data,
                                 decoded.stats,
-                                decoded.freq,
                             );
                             if !self.shared.math_channels.is_empty() {
                                 math_editor::reevaluate_math_channels_waiting_on_inputs(
@@ -918,8 +918,6 @@ impl App {
                     }
                     math_editor::evaluate_all_math_channels(&mut self.shared);
                     self.shared.invalidate_derived_caches();
-                    self.shared.sectors = project.workspace.sectors.clone();
-                    self.shared.reference_lap = project.workspace.reference_lap;
 
                     let workspace = project.workspace;
                     self.sync_project_sessions_from_workspace(&workspace);
@@ -1479,9 +1477,6 @@ impl App {
                         math_editor::evaluate_all_math_channels(&mut self.shared);
                         self.shared.invalidate_derived_caches();
 
-                        self.shared.sectors = workspace.sectors.clone();
-                        self.shared.reference_lap = workspace.reference_lap;
-
                         self.sync_project_sessions_from_workspace(&workspace);
                         self.pending_workspace_restore = None;
                         self.restore_workspace_when_ready(workspace);
@@ -1691,17 +1686,8 @@ impl App {
                     .clicked()
                 {
                     if !self.shared.playback_active {
-                        let (start, end) = self
-                            .shared
-                            .zoom_range
-                            .unwrap_or((0.0, self.shared.data_duration.unwrap_or(0.0)));
-                        if self
-                            .shared
-                            .cursor_time
-                            .is_none_or(|t| t < start || t >= end)
-                        {
-                            self.shared.cursor_time = Some(start);
-                        }
+                        let range = self.shared.analysis_range();
+                        self.shared.clamp_cursor_to(range);
                     }
                     self.shared.playback_active = !self.shared.playback_active;
                 }
@@ -2361,6 +2347,13 @@ mod tests {
     #[test]
     fn workspace_restore_waits_for_math_channels_to_finish() {
         let mut shared = SharedState::new();
+        shared.ld_path = Some("previous.ld".into());
+        shared.sectors = vec![i3rs_core::Sector {
+            name: "Previous recording".into(),
+            start_index: 50,
+            end_index: 100,
+            distance: None,
+        }];
         let mut math_channel =
             shared.create_math_channel_def("Derived".into(), "1".into(), String::new(), 2);
         math_channel.data = Some(Arc::from(vec![1.0]));
@@ -2399,8 +2392,13 @@ mod tests {
         app.shared.math_channels[0].error = Some("Waiting for source channels...".into());
         app.shared.math_channels[0].evaluation_state = MathEvaluationState::WaitingForInputs;
 
+        app.shared.ld_path = Some("current.ld".into());
         app.restore_workspace_when_ready(workspace);
 
+        assert!(
+            app.shared.sectors.is_empty(),
+            "Old recording indices must not remain active while math loads"
+        );
         assert!(app.pending_workspace_restore.is_some());
         let pending_graph = app.worksheets[0]
             .dock_state
