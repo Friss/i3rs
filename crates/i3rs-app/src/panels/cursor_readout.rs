@@ -101,35 +101,18 @@ pub fn value_at_time(data: &[f64], freq: u16, time: f64, discrete: bool) -> f64 
 
 /// Linearly interpolate a channel value at a given time.
 pub fn interpolate_at_time(data: &[f64], freq: u16, time: f64) -> f64 {
-    if data.is_empty() || freq == 0 {
-        return 0.0;
-    }
-
-    let sample_f = time * freq as f64;
-    let idx = sample_f as usize;
-
-    if idx >= data.len() {
-        return *data.last().unwrap_or(&0.0);
-    }
-
-    let next_idx = idx + 1;
-    if next_idx >= data.len() {
-        return data[idx];
-    }
-
-    let frac = sample_f - idx as f64;
-    data[idx] * (1.0 - frac) + data[next_idx] * frac
+    i3rs_core::analysis::sample_at_time(data, freq, time).unwrap_or(f64::NAN)
 }
 
 /// Read the most recent sample at or before the given time.
 pub fn sample_hold_at_time(data: &[f64], freq: u16, time: f64) -> f64 {
-    if data.is_empty() || freq == 0 {
-        return 0.0;
+    if data.is_empty() || freq == 0 || !time.is_finite() || time < 0.0 {
+        return f64::NAN;
     }
 
     let idx = (time * freq as f64).floor() as usize;
     if idx >= data.len() {
-        return *data.last().unwrap_or(&0.0);
+        return f64::NAN;
     }
 
     data[idx]

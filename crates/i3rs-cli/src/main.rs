@@ -481,6 +481,7 @@ fn channel_json(channel: &ChannelMeta) -> Value {
         "sample_count": channel.n_data,
         "data_type": channel.data_type.name(),
         "decimal_places": channel.dec_places,
+        "display_decimal_places": channel.display_decimals,
         "duration_secs": channel.duration_secs(),
         "enum_labels": enum_labels,
     })

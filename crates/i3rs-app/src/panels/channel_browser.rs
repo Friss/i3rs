@@ -159,5 +159,16 @@ fn show_lap_selector(ui: &mut egui::Ui, shared: &mut SharedState) {
             }
         });
 
-    shared.selected_lap = new_selection;
+    if shared.selected_lap != new_selection {
+        shared.selected_lap = new_selection;
+        shared.zoom_from_timeline = true;
+        shared.zoom_range = new_selection
+            .and_then(|index| shared.laps.get(index))
+            .map(|lap| (lap.start_time, lap.end_time));
+        if let Some((start, end)) = shared.zoom_range
+            && shared.cursor_time.is_none_or(|t| t < start || t >= end)
+        {
+            shared.cursor_time = Some(start);
+        }
+    }
 }

@@ -104,7 +104,7 @@ impl TimelinePanel {
         if let Some(pos) = response.hover_pos() {
             let hover_time =
                 (((pos.x - rect.left()) / rect.width()) as f64 * duration).clamp(0.0, duration);
-            shared.cursor_time = Some(hover_time);
+            shared.set_hover_cursor(hover_time);
 
             let target = self.hit_test(pos, zoom_rect);
             match target {

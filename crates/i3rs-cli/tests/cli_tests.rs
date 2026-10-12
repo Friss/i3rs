@@ -31,11 +31,16 @@ fn run_cli_in_dir(args: &[&str], cwd: &PathBuf) -> std::process::Output {
 }
 
 fn temp_skill_dir() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time is before unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("i3rs-skill-test-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "i3rs-skill-test-{}-{nanos}-{unique}",
+        std::process::id()
+    ))
 }
 
 fn assert_agent_skill_files_exist(dir: &Path) {

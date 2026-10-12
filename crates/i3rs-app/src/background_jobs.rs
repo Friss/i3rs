@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::state::{ChannelStats, DownsampleSeriesKey, compute_channel_stats};
-use i3rs_core::{
-    ChannelData, DownsampledPoint, Lap, LdFile, LdxFile, TrackData, detect_laps,
-    evaluate_expression_with_aliases, find_ldx_for_ld,
-};
+use crate::state::{ChannelStats, compute_channel_stats};
 #[cfg(not(target_arch = "wasm32"))]
-use i3rs_core::{downsample_minmax, extract_gps_track};
+use i3rs_core::extract_gps_track;
+use i3rs_core::{
+    ChannelData, Lap, LdFile, LdxFile, TrackData, detect_laps, evaluate_expression_with_aliases,
+    find_ldx_for_ld,
+};
 
 pub struct LoadedSession {
     pub file_name: String,
@@ -52,16 +52,6 @@ pub enum JobRequest {
         session_id: u64,
         ld: Arc<LdFile>,
     },
-    BuildDownsampledSeries {
-        request_id: u64,
-        session_id: u64,
-        key: DownsampleSeriesKey,
-        data: Arc<[f64]>,
-        freq: u16,
-        start_sample: usize,
-        end_sample: usize,
-        target_width: usize,
-    },
 }
 
 pub struct DecodedPhysicalChannel {
@@ -96,11 +86,6 @@ pub enum JobResult {
         math_id: u64,
         expression: String,
         result: Result<EvaluatedMathChannel, String>,
-    },
-    BuildDownsampledSeries {
-        session_id: u64,
-        key: DownsampleSeriesKey,
-        points: Vec<DownsampledPoint>,
     },
 }
 
@@ -204,27 +189,6 @@ fn perform_evaluate_math_channel(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn perform_build_downsampled_series(
-    data: Arc<[f64]>,
-    freq: u16,
-    start_sample: usize,
-    end_sample: usize,
-    target_width: usize,
-) -> Vec<DownsampledPoint> {
-    let visible_end = end_sample.min(data.len());
-    let visible_start = start_sample.min(visible_end);
-    if visible_start >= visible_end {
-        return Vec::new();
-    }
-    downsample_minmax(
-        &data[visible_start..visible_end],
-        freq,
-        visible_start,
-        target_width,
-    )
-}
-
 #[cfg(target_arch = "wasm32")]
 const WASM_COOPERATIVE_CHUNK: usize = 4_096;
 
@@ -312,75 +276,6 @@ async fn perform_build_track_data_cooperative(ld: Arc<LdFile>) -> Option<TrackDa
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn perform_build_downsampled_series_cooperative(
-    data: Arc<[f64]>,
-    freq: u16,
-    start_sample: usize,
-    end_sample: usize,
-    target_width: usize,
-) -> Vec<DownsampledPoint> {
-    let visible_end = end_sample.min(data.len());
-    let visible_start = start_sample.min(visible_end);
-    if visible_start >= visible_end || target_width == 0 || freq == 0 {
-        return Vec::new();
-    }
-
-    let samples = &data[visible_start..visible_end];
-    let freq_f = freq as f64;
-    if samples.len() <= target_width.saturating_mul(2) {
-        let mut points = Vec::with_capacity(samples.len());
-        for start in (0..samples.len()).step_by(WASM_COOPERATIVE_CHUNK) {
-            let end = (start + WASM_COOPERATIVE_CHUNK).min(samples.len());
-            for (offset, &value) in samples[start..end].iter().enumerate() {
-                let idx = start + offset;
-                points.push(DownsampledPoint {
-                    time: (visible_start + idx) as f64 / freq_f,
-                    min: value,
-                    max: value,
-                });
-            }
-            yield_to_browser().await;
-        }
-        return points;
-    }
-
-    let mut result = Vec::with_capacity(target_width);
-    let bucket_size_f = samples.len() as f64 / target_width as f64;
-    for bucket in 0..target_width {
-        let start = (bucket as f64 * bucket_size_f) as usize;
-        let end = (((bucket + 1) as f64) * bucket_size_f) as usize;
-        let end = end.min(samples.len());
-        if start >= end {
-            continue;
-        }
-
-        let mut min_v = samples[start];
-        let mut max_v = samples[start];
-        for &value in &samples[start + 1..end] {
-            if value < min_v {
-                min_v = value;
-            }
-            if value > max_v {
-                max_v = value;
-            }
-        }
-
-        let mid_sample = visible_start + (start + end) / 2;
-        result.push(DownsampledPoint {
-            time: mid_sample as f64 / freq_f,
-            min: min_v,
-            max: max_v,
-        });
-
-        if bucket % 256 == 255 {
-            yield_to_browser().await;
-        }
-    }
-
-    result
-}
-
-#[cfg(target_arch = "wasm32")]
 async fn run_wasm_job(request: JobRequest) -> JobResult {
     match request {
         JobRequest::LoadSession { request_id, source } => {
@@ -430,27 +325,6 @@ async fn run_wasm_job(request: JobRequest) -> JobResult {
                 result,
             }
         }
-        JobRequest::BuildDownsampledSeries {
-            request_id: _,
-            session_id,
-            key,
-            data,
-            freq,
-            start_sample,
-            end_sample,
-            target_width,
-        } => JobResult::BuildDownsampledSeries {
-            session_id,
-            key,
-            points: perform_build_downsampled_series_cooperative(
-                data,
-                freq,
-                start_sample,
-                end_sample,
-                target_width,
-            )
-            .await,
-        },
     }
 }
 
@@ -504,26 +378,6 @@ impl BackgroundJobs {
                         math_id,
                         expression: expression.clone(),
                         result: perform_evaluate_math_channel(expression, channel_data, aliases),
-                    },
-                    JobRequest::BuildDownsampledSeries {
-                        request_id: _,
-                        session_id,
-                        key,
-                        data,
-                        freq,
-                        start_sample,
-                        end_sample,
-                        target_width,
-                    } => JobResult::BuildDownsampledSeries {
-                        session_id,
-                        key,
-                        points: perform_build_downsampled_series(
-                            data,
-                            freq,
-                            start_sample,
-                            end_sample,
-                            target_width,
-                        ),
                     },
                 };
 

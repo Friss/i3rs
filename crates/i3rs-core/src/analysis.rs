@@ -191,14 +191,14 @@ pub fn sample_at_time(data: &[f64], freq: u16, time: f64) -> Option<f64> {
     let idx = time * freq as f64;
     let lo = idx.floor() as usize;
     if lo >= data.len() {
-        return (idx <= data.len() as f64).then_some(*data.last().unwrap());
+        return None;
     }
     let hi = lo + 1;
-    if hi >= data.len() {
-        return Some(data[lo]);
+    if hi >= data.len() || idx == lo as f64 {
+        return Some(data[lo]).filter(|v| v.is_finite());
     }
     let frac = idx - lo as f64;
-    Some(data[lo] * (1.0 - frac) + data[hi] * frac)
+    Some(data[lo] * (1.0 - frac) + data[hi] * frac).filter(|v| v.is_finite())
 }
 
 /// Resample a channel at explicit absolute session times.
@@ -393,6 +393,18 @@ mod tests {
     fn sample_at_time_interpolates() {
         let data = [0.0, 10.0, 20.0];
         assert_eq!(sample_at_time(&data, 10, 0.05), Some(5.0));
+    }
+
+    #[test]
+    fn interpolation_keeps_exact_valid_samples_and_does_not_bridge_outages() {
+        let data = [1.0, f64::NAN, 3.0, 4.0];
+        assert_eq!(sample_at_time(&data, 1, 0.0), Some(1.0));
+        assert_eq!(sample_at_time(&data, 1, 0.5), None);
+        assert_eq!(sample_at_time(&data, 1, 1.0), None);
+        assert_eq!(sample_at_time(&data, 1, 1.5), None);
+        assert_eq!(sample_at_time(&data, 1, 2.0), Some(3.0));
+        assert_eq!(sample_at_time(&data, 1, 2.5), Some(3.5));
+        assert_eq!(sample_at_time(&data, 1, 4.0), None);
     }
 
     #[test]

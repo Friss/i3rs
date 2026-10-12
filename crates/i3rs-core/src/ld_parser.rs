@@ -194,13 +194,31 @@ pub struct ChannelMeta {
     pub mul: i16,
     pub scale: i16,
     pub dec_places: i16,
+    /// Decimal digits for display, independent of the sample scaling exponent.
+    pub display_decimals: u8,
     data_ptr: u32,
+    legacy_name: String,
+    /// Half-open ranges of samples marked invalid by the logger.
+    invalid_ranges: Vec<std::ops::Range<usize>>,
     /// Enum/state value labels parsed from the file (value → label).
     /// Empty for non-enum channels. Wrapped in Arc for cheap cloning.
     pub enum_labels: Arc<HashMap<i64, String>>,
 }
 
 impl ChannelMeta {
+    fn mask_invalid(&self, values: &mut [f64], start: usize) {
+        let end = start + values.len();
+        let first = self
+            .invalid_ranges
+            .partition_point(|range| range.end <= start);
+        for range in &self.invalid_ranges[first..] {
+            if range.start >= end {
+                break;
+            }
+            values[range.start.max(start) - start..range.end.min(end) - start].fill(f64::NAN);
+        }
+    }
+
     /// Duration of this channel's data in seconds.
     pub fn duration_secs(&self) -> f64 {
         if self.freq > 0 {
@@ -290,6 +308,13 @@ impl LdFile {
                 .entry(normalize_channel_name(&channel.name))
                 .or_insert(channel.index);
         }
+        // Keep saved workspaces using the old truncated spelling readable.
+        // Canonical names above always take precedence over legacy aliases.
+        for channel in &channels {
+            normalized_name_index
+                .entry(normalize_channel_name(&channel.legacy_name))
+                .or_insert(channel.index);
+        }
 
         Ok(LdFile {
             backing,
@@ -306,10 +331,20 @@ impl LdFile {
         self.data().len()
     }
 
-    /// Estimated session duration in seconds (from the longest channel).
+    /// Session endpoint on the finest recorded sample grid.
+    /// Slow channels include a final partial sample period; extending each of
+    /// those to a full period would add up to a second of padding.
     pub fn duration_secs(&self) -> f64 {
-        self.channels
+        let channels = self
+            .channels
             .iter()
+            .filter(|ch| ch.freq > 0 && ch.n_data > 0);
+        let max_freq = channels.clone().map(|ch| ch.freq).max().unwrap_or(0);
+        if max_freq == 0 {
+            return 0.0;
+        }
+        channels
+            .filter(|ch| ch.freq == max_freq)
             .map(|ch| ch.duration_secs())
             .fold(0.0_f64, f64::max)
     }
@@ -345,6 +380,7 @@ impl LdFile {
 
         let mut vals = self.read_raw_samples(offset, actual_count, channel.data_type);
         apply_scaling(&mut vals, channel);
+        channel.mask_invalid(&mut vals, 0);
         Some(vals)
     }
 
@@ -380,6 +416,7 @@ impl LdFile {
 
         let mut vals = self.read_raw_samples(offset, actual, channel.data_type);
         apply_scaling(&mut vals, channel);
+        channel.mask_invalid(&mut vals, start);
         Some(vals)
     }
 
@@ -390,7 +427,7 @@ impl LdFile {
         channel: &'a ChannelMeta,
         value: f64,
     ) -> Option<&'a str> {
-        if channel.enum_labels.is_empty() {
+        if !value.is_finite() || channel.enum_labels.is_empty() {
             return None;
         }
         let v = value.round() as i64;
@@ -500,8 +537,103 @@ fn parse_event(data: &[u8], event_ptr: u32) -> Event {
     e
 }
 
-/// Extended channel record size (120 base + 92 extended metadata).
-const CHAN_RECORD_SIZE: usize = 212;
+/// M1 records have a 124-byte base and pointer-linked optional blocks. They are
+/// not fixed-size: validity transitions can precede the extended attributes.
+fn channel_attributes(data: &[u8], off: usize) -> (Option<String>, Option<u16>) {
+    let mut name = None;
+    let mut enum_id = None;
+    let Some(base) = data.get(off..).filter(|b| b.len() >= 124) else {
+        return (name, enum_id);
+    };
+    let ext = read_u32(base, 120) as usize;
+    let Some(extension) = data.get(ext..).filter(|b| ext != 0 && b.len() >= 6) else {
+        return (name, enum_id);
+    };
+    let ptr = read_u32(extension, 2) as usize;
+    let Some(attrs) = data.get(ptr..).filter(|b| ptr != 0 && b.len() >= 8) else {
+        return (name, enum_id);
+    };
+    if read_u32(attrs, 0) != 1 {
+        return (name, enum_id);
+    }
+    let count = read_u32(attrs, 4) as usize;
+    let mut pos = 8;
+    // Each attribute has an eight-byte header and a length-delimited payload.
+    if count > (attrs.len() - 8) / 8 {
+        return (name, enum_id);
+    }
+    for _ in 0..count {
+        let Some(header) = attrs.get(pos..).and_then(|rest| rest.get(..8)) else {
+            break;
+        };
+        let kind = read_u32(header, 0);
+        let len = read_u16(header, 6) as usize;
+        pos += 8;
+        let Some(payload) = attrs.get(pos..).and_then(|rest| rest.get(..len)) else {
+            break;
+        };
+        match kind {
+            4 if payload.last() == Some(&0) => {
+                let full_name = decode_string(payload);
+                if !full_name.is_empty() {
+                    name = Some(full_name);
+                }
+            }
+            5 if len == 2 => enum_id = Some(read_u16(payload, 0)),
+            _ => {}
+        }
+        pos += len;
+    }
+    (name, enum_id)
+}
+
+fn channel_invalid_ranges(
+    data: &[u8],
+    off: usize,
+    freq: u16,
+    sample_count: u32,
+) -> Vec<std::ops::Range<usize>> {
+    let ptr = read_u32(data, off + 116) as usize;
+    let Some(block) = data.get(ptr..).filter(|b| ptr != 0 && b.len() >= 12) else {
+        return Vec::new();
+    };
+    if read_u16(block, 0) != 0 || read_u16(block, 2) != freq {
+        return Vec::new();
+    }
+    let count = read_u32(block, 4) as usize;
+    let records_ptr = read_u32(block, 8) as usize;
+    let Some(records) = data.get(records_ptr..).filter(|_| records_ptr != 0) else {
+        return Vec::new();
+    };
+    if count > records.len() / 6 {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut invalid_start = None;
+    let mut previous = 0;
+    for record in records[..count * 6].chunks_exact(6) {
+        let flag = read_u16(record, 0);
+        let index = read_u32(record, 2);
+        // Reject the whole malformed block, never partially mask channel data.
+        if flag > 1 || index < previous || index > sample_count {
+            return Vec::new();
+        }
+        if flag == 0 {
+            invalid_start.get_or_insert(index as usize);
+        } else if let Some(start) = invalid_start.take()
+            && start < index as usize
+        {
+            ranges.push(start..index as usize);
+        }
+        previous = index;
+    }
+    if let Some(start) = invalid_start
+        && start < sample_count as usize
+    {
+        ranges.push(start..sample_count as usize);
+    }
+    ranges
+}
 
 fn parse_channel_metadata(
     data: &[u8],
@@ -514,7 +646,10 @@ fn parse_channel_metadata(
     while meta_ptr != 0 && !visited.contains(&meta_ptr) {
         visited.insert(meta_ptr);
         let off = meta_ptr as usize;
-        if off + CHAN_META_SIZE > data.len() {
+        if data
+            .get(off..)
+            .is_none_or(|rest| rest.len() < CHAN_META_SIZE)
+        {
             break;
         }
 
@@ -537,18 +672,21 @@ fn parse_channel_metadata(
         let mut short_name = decode_string(raw_short);
         let unit_str = decode_string(raw_unit);
 
-        // Name overflow heuristic for M1 ECU channel names > 32 chars
-        let name_overflowed = !raw_name.contains(&0u8);
-        if name_overflowed && !short_name.is_empty() {
-            let last_char = raw_name[31];
-            let first_short = short_name.as_bytes()[0];
-            if last_char.is_ascii_alphanumeric()
-                && first_short.is_ascii_alphanumeric()
-                && short_name.len() <= 2
-            {
-                name.push_str(&short_name);
-                short_name = String::new();
-            }
+        // Compatibility alias only: never display this old overflow heuristic.
+        let mut legacy_name = name.clone();
+        if !raw_name.contains(&0)
+            && !short_name.is_empty()
+            && short_name.len() <= 2
+            && raw_name[31].is_ascii_alphanumeric()
+            && short_name.as_bytes()[0].is_ascii_alphanumeric()
+        {
+            legacy_name.push_str(&short_name);
+        }
+        let legacy_name = legacy_name.replace('.', " ");
+
+        let (full_name, enum_id) = channel_attributes(data, off);
+        if let Some(full_name) = full_name {
+            name = full_name;
         }
 
         // Replace dots with spaces for display (e.g. "Engine.Speed" → "Engine Speed")
@@ -573,19 +711,17 @@ fn parse_channel_metadata(
 
         let data_type = DataType::from_codes(dtype_a, dtype_code);
 
-        // Extract enum reference from extended metadata:
-        //   +208: u16 enum_type (0x0002 = uses enum table)
-        //   +210: u16 enum_id   (indexes into parsed enum tables)
-        let mut enum_labels =
-            if off + CHAN_RECORD_SIZE <= data.len() && read_u16(data, off + 208) == 0x0002 {
-                let enum_id = read_u16(data, off + 210);
-                enum_tables
-                    .get(&enum_id)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(HashMap::new()))
-            } else {
-                Arc::new(HashMap::new())
-            };
+        let mut enum_labels = enum_id
+            .and_then(|id| enum_tables.get(&id).cloned())
+            .unwrap_or_default();
+        let invalid_ranges = channel_invalid_ranges(data, off, rec_freq, n_data);
+        // Byte +100 is the display precision, +101 is its format (integer/float).
+        // Older producers leave both zero: retain scaling precision as fallback.
+        let display_decimals = if matches!(data[off + 101], 1 | 3) {
+            data[off + 100].min(9)
+        } else {
+            dec_places.clamp(0, 9) as u8
+        };
         if enum_labels.is_empty()
             && let Some(fallback_labels) = state_channel_labels(&name)
         {
@@ -604,7 +740,10 @@ fn parse_channel_metadata(
             mul,
             scale,
             dec_places,
+            display_decimals,
+            invalid_ranges,
             data_ptr,
+            legacy_name,
             enum_labels,
         });
 
@@ -727,6 +866,125 @@ fn scan_enum_entries(
 mod tests {
     use super::*;
 
+    fn put_u16(bytes: &mut [u8], at: usize, value: u16) {
+        bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn extended_fixture() -> Vec<u8> {
+        let mut bytes = vec![0; 4096];
+        bytes[0] = MAGIC_BYTE;
+        put_u32(&mut bytes, 8, 1800);
+        put_u32(&mut bytes, 12, 4000);
+        let off = 1800;
+        put_u32(&mut bytes, off + 8, 4000);
+        put_u32(&mut bytes, off + 12, 8);
+        put_u16(&mut bytes, off + 18, 7);
+        put_u16(&mut bytes, off + 20, 4);
+        put_u16(&mut bytes, off + 22, 2);
+        put_u16(&mut bytes, off + 26, 1);
+        put_u16(&mut bytes, off + 28, 1);
+        bytes[off + 32..off + 64].copy_from_slice(b"A channel name filling 32 bytes!");
+        bytes[off + 64] = b'G';
+        bytes[off + 100] = 3;
+        bytes[off + 101] = 3;
+        put_u32(&mut bytes, off + 116, 2000);
+        put_u16(&mut bytes, 2002, 2);
+        put_u32(&mut bytes, 2004, 4);
+        put_u32(&mut bytes, 2008, 2044);
+        for (i, (flag, index)) in [(0, 0), (1, 2), (0, 4), (1, 6)].iter().enumerate() {
+            put_u16(&mut bytes, 2044 + i * 6, *flag);
+            put_u32(&mut bytes, 2046 + i * 6, *index);
+        }
+        // Attributes follow a validity block, so no fixed +208 enum offset.
+        put_u32(&mut bytes, off + 120, 2200);
+        put_u32(&mut bytes, 2202, 2270);
+        put_u32(&mut bytes, 2270, 1);
+        put_u32(&mut bytes, 2274, 2);
+        put_u32(&mut bytes, 2278, 5);
+        put_u16(&mut bytes, 2284, 2);
+        put_u16(&mut bytes, 2286, 137);
+        let name = b"A channel name filling 32 bytes! with its full suffix\0";
+        put_u32(&mut bytes, 2288, 4);
+        put_u16(&mut bytes, 2294, name.len() as u16);
+        bytes[2296..2296 + name.len()].copy_from_slice(name);
+        for i in 0..8 {
+            bytes[4000 + i * 4..4004 + i * 4].copy_from_slice(&(i as f32 + 0.125).to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn validity_masks_full_and_partial_reads_without_changing_valid_measurements() {
+        let ld = LdFile::from_bytes(extended_fixture()).unwrap();
+        let ch = &ld.channels[0];
+        let full = ld.read_channel_data(ch).unwrap();
+        for (i, value) in full.iter().enumerate() {
+            if [0, 1, 4, 5].contains(&i) {
+                assert!(value.is_nan());
+            } else {
+                assert_eq!(*value, i as f64 + 0.125);
+            }
+        }
+        let partial = ld.read_channel_range(ch, 3, 7).unwrap();
+        assert_eq!(partial[0], 3.125);
+        assert!(partial[1].is_nan() && partial[2].is_nan());
+        assert_eq!(partial[3], 6.125);
+    }
+
+    #[test]
+    fn linked_attributes_preserve_names_units_precision_and_enum_references() {
+        let bytes = extended_fixture();
+        let (name, enum_id) = channel_attributes(&bytes, 1800);
+        assert_eq!(enum_id, Some(137));
+        let ld = LdFile::from_bytes(bytes).unwrap();
+        let ch = &ld.channels[0];
+        assert_eq!(ch.name, name.unwrap());
+        assert!(ch.name.ends_with("with its full suffix"));
+        assert_eq!(ch.unit, "G");
+        assert_eq!(ch.display_decimals, 3);
+        assert_eq!(ch.dec_places, 0);
+    }
+
+    #[test]
+    fn invalid_optional_pointers_counts_and_nonmonotonic_ranges_are_ignored() {
+        for (position, value) in [
+            (1916, u32::MAX),
+            (2004, u32::MAX),
+            (2008, u32::MAX),
+            (2064, 1),
+        ] {
+            let mut bytes = extended_fixture();
+            put_u32(&mut bytes, position, value);
+            let ld = LdFile::from_bytes(bytes).unwrap();
+            assert!(
+                ld.read_channel_data(&ld.channels[0])
+                    .unwrap()
+                    .iter()
+                    .all(|v| v.is_finite())
+            );
+        }
+        let mut bytes = extended_fixture();
+        put_u32(&mut bytes, 1920, u32::MAX);
+        let ld = LdFile::from_bytes(bytes).unwrap();
+        assert_eq!(ld.channels[0].name, "A channel name filling 32 bytes!");
+        assert_eq!(ld.channels[0].unit, "G");
+    }
+
+    #[test]
+    fn session_endpoint_uses_finest_grid_instead_of_slow_channel_padding() {
+        let mut ld = LdFile::from_bytes(extended_fixture()).unwrap();
+        ld.channels[0].freq = 100;
+        ld.channels[0].n_data = 401;
+        let mut slow = ld.channels[0].clone();
+        slow.freq = 1;
+        slow.n_data = 5;
+        ld.channels.push(slow);
+        assert_eq!(ld.duration_secs(), 4.01);
+    }
+
     #[test]
     fn enum_scan_bounds_stay_out_of_header_and_sample_data() {
         assert_eq!(enum_scan_bounds(4_000, 5_000), (HEAD_SIZE, 4_000));
@@ -767,6 +1025,9 @@ mod tests {
             scale,
             dec_places,
             data_ptr: 0,
+            legacy_name: String::new(),
+            display_decimals: 0,
+            invalid_ranges: Vec::new(),
             enum_labels: Arc::new(HashMap::new()),
         }
     }

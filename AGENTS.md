@@ -13,7 +13,7 @@ cargo run --release -p i3rs-app -- test_data/VIR_LAP.ld   # Run GUI with test fi
 cargo run --release -p i3rs-cli -- test_data/VIR_LAP.ld   # Run CLI inspector
 ```
 
-Rust 2024 edition — requires rustc 1.85+.
+Rust 2024 edition — requires rustc 1.95+ for the GUI dependencies.
 
 ## Workspace Structure
 

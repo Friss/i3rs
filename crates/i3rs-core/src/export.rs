@@ -84,14 +84,12 @@ pub fn export_csv(
 
         for plan in &channel_plans {
             let src_idx = plan.source_indices[row];
-            let val = if src_idx < plan.data.len() {
-                plan.data[src_idx]
-            } else if !plan.data.is_empty() {
-                plan.data[plan.data.len() - 1]
+            if let Some(val) = plan.data.get(src_idx).filter(|v| v.is_finite()) {
+                write!(writer, ",{:.prec$}", val, prec = plan.dec_places)
+                    .map_err(|e| e.to_string())?;
             } else {
-                0.0
-            };
-            write!(writer, ",{:.prec$}", val, prec = plan.dec_places).map_err(|e| e.to_string())?;
+                write!(writer, ",").map_err(|e| e.to_string())?;
+            }
         }
         writeln!(writer).map_err(|e| e.to_string())?;
     }
@@ -164,5 +162,23 @@ mod tests {
         let path = PathBuf::from("/tmp/test_empty.csv");
         let result = export_csv(&path, &[], None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn missing_samples_export_as_empty_cells() {
+        let path = std::env::temp_dir().join("i3rs_missing_samples.csv");
+        let channel = ExportChannel {
+            name: "Lambda",
+            data: &[0.895, f64::NAN, 1.020],
+            freq: 1,
+            dec_places: 3,
+        };
+        export_csv(&path, &[channel], Some((0.0, 4.0))).unwrap();
+        let csv = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            csv,
+            "Time (s),Lambda\n0.000000,0.895\n1.000000,\n2.000000,1.020\n3.000000,\n"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

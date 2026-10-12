@@ -6,7 +6,7 @@ use eframe::egui;
 use crate::state::{ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
-    build_plotted_channel_info, create_plotted_channel, interp_at_time, refresh_plotted_channel,
+    build_plotted_channel_info, create_plotted_channel, refresh_plotted_channel,
     resolve_channel_meta, resolve_plotted_channel_display_meta,
 };
 
@@ -132,10 +132,18 @@ impl GaugePanel {
                 for (i, gc) in self.gauges.iter().enumerate() {
                     let (name, unit, freq, dec_places, enum_labels) =
                         resolve_plotted_channel_display_meta(&gc.channel, shared);
+                    let discrete = !enum_labels.is_empty() || i3rs_core::is_state_channel(&name);
                     let raw_value = shared
                         .cursor_time
-                        .and_then(|t| interp_at_time(&gc.channel.data, freq, t));
-                    let discrete = !enum_labels.is_empty();
+                        .map(|t| {
+                            super::cursor_readout::value_at_time(
+                                &gc.channel.data,
+                                freq,
+                                t,
+                                discrete,
+                            )
+                        })
+                        .filter(|value| value.is_finite());
                     let value = raw_value.map(|v| {
                         if discrete {
                             v
@@ -356,7 +364,7 @@ fn draw_analog_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawC
         .map(|v| format!("{:.prec$} {}", v, unit, prec = dec))
         .unwrap_or_else(|| "---".into());
     painter.text(
-        egui::pos2(rect.center().x, center.y + radius * 0.5),
+        egui::pos2(rect.center().x, rect.max.y - 14.0),
         egui::Align2::CENTER_CENTER,
         value_text,
         egui::FontId::monospace(16.0),
@@ -443,14 +451,14 @@ fn draw_bar_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawCont
 
     // Min/Max
     painter.text(
-        egui::pos2(bar_rect.min.x, bar_rect.max.y + 8.0),
+        egui::pos2(bar_rect.min.x, bar_rect.min.y - 12.0),
         egui::Align2::LEFT_TOP,
         format!("{:.0}", min),
         egui::FontId::proportional(9.0),
         egui::Color32::GRAY,
     );
     painter.text(
-        egui::pos2(bar_rect.max.x, bar_rect.max.y + 8.0),
+        egui::pos2(bar_rect.max.x, bar_rect.min.y - 12.0),
         egui::Align2::RIGHT_TOP,
         format!("{:.0}", max),
         egui::FontId::proportional(9.0),

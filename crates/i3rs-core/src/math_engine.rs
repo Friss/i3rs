@@ -153,8 +153,10 @@ fn resample(data: &[f64], src_freq: u16, target_freq: u16, target_len: usize) ->
         let hi = lo + 1;
         let frac = src_idx - lo as f64;
 
-        let val = if hi >= data.len() {
-            data[data.len() - 1]
+        let val = if lo >= data.len() {
+            f64::NAN
+        } else if hi >= data.len() || frac == 0.0 {
+            data[lo]
         } else {
             data[lo] * (1.0 - frac) + data[hi] * frac
         };

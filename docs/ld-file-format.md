@@ -102,8 +102,9 @@ Located at `vehicle_ptr`:
 ## Channel Metadata (Linked List)
 
 Channel metadata entries form a **doubly-linked list**. The first entry is at the absolute
-offset `chan_meta_ptr` from the file header. Each entry is **212 bytes** (120 base + 92
-extended metadata).
+offset `chan_meta_ptr` from the file header. M1 records have a **124-byte base** and
+optional pointer-linked blocks. Record sizes vary; follow the pointers rather than
+assuming a 212-byte stride.
 
 | Offset | Size | Type     | Field       | Description |
 |--------|------|----------|-------------|-------------|
@@ -122,30 +123,40 @@ extended metadata).
 | 0x20   | 32   | char[32] | name        | Channel name (e.g. `"Engine.Speed"`), null-padded |
 | 0x40   | 8    | char[8]  | short_name  | Short name — often holds the unit on M1 ECUs (see below) |
 | 0x48   | 12   | char[12] | unit        | Unit string (e.g. `"rpm"`, `"kPa"`), null-padded |
-| 0x54   | 40   | —        | (padding)   | Zeroed padding to 120 bytes |
-| 0x78   | 92   | —        | extended    | Extended metadata (see below) |
+| 0x54   | 16   | —        | display limits | Observed integer and float display limits |
+| 0x64   | 1    | uint8    | display decimals | Separate from scaling `dec_places` |
+| 0x65   | 1    | uint8    | display format | Observed: 1 = integer, 3 = float |
+| 0x66   | 14   | —        | reserved | |
+| 0x74   | 4    | uint32   | validity pointer | Optional validity transition block |
+| 0x78   | 4    | uint32   | extension pointer | Optional extended attributes block |
 
-Total channel record size: **212 bytes** (120 base + 92 extended).
+### Validity transitions
 
-### Extended Channel Metadata
+At the pointer stored at `+0x74`, M1 logs contain a block with `u16 type` (0),
+`u16 frequency` (matching the channel), `u32 count`, and `u32 records_ptr`.
+Each pointed-to record is six bytes: `u16 valid` (0 or 1) and `u32 sample_index`.
+A transition applies starting at that sample index. Invalid intervals are half-open;
+a final invalid transition without a following valid transition runs to the end.
+A transition at `n_data` is permitted as an end marker.
 
-Beyond the base 120-byte record, each channel entry has 92 bytes of extended metadata.
-Most of this region is unknown/zeroed, but it contains a reference to the channel's
-enum table (if any).
+Decode invalid samples as NaN, including range reads, and retain their positions.
+Do not compact the time series or replace invalid samples with zero or held values.
+Validate pointer bounds, frequency, flags, counts, and monotonic sample indices
+before applying the block. No validity pointer means there is no additional mask.
 
-| Offset | Size | Type   | Field      | Description |
-|--------|------|--------|------------|-------------|
-| 0xD0   | 2    | uint16 | enum_type  | `0x0002` if channel uses an enum table, `0x0000` otherwise |
-| 0xD2   | 2    | uint16 | enum_id    | ID of the enum table (indexes into the enum tables section) |
+### Extended channel attributes
 
-(Offsets are relative to the start of the channel metadata entry, i.e. `meta_ptr + 0xD0`.)
+The block pointed to by `+0x78` contains an attribute-list pointer at its own `+2`.
+The attribute list starts with `u32 version` (1) and `u32 count`. Each entry has
+`u32 kind`, `u16 reserved`, `u16 payload_length`, then that many payload bytes:
 
-When `enum_type == 0x0002`, the channel's sample values are integer codes that map to
-human-readable labels via the enum table identified by `enum_id`. See the
-**Enum/State Tables** section below.
+- Kind 4: null-terminated full channel name.
+- Kind 5: two-byte enum table ID.
 
-**Status:** The exact layout of the remaining ~88 bytes of extended metadata is not
-fully decoded. Only the enum reference at offset 0xD0–0xD3 has been verified.
+More than one attribute may be present. Both the extension and list pointers are
+absolute file offsets. Validity blocks may appear before the attributes, so the
+old `meta + 0xD0 / 0xD2` enum shortcut is only coincidentally correct in records
+without validity transitions. It must not be used as a general format rule.
 
 ### Terminator Entry
 
@@ -161,16 +172,15 @@ from other MoTeC loggers:
    The 12-byte `unit` field is frequently empty. When parsing, check `unit` first;
    if empty, fall back to `short_name`.
 
-2. **Channel names longer than 32 characters are truncated.** When the 32-byte `name`
-   field has no null terminator (completely filled), the name was cut off. In this case
-   the `short_name` field may contain either:
-   - The **continuation of the name** (e.g. name ends with `"Duty C"`, short_name is `"%"`,
-     giving full name `"Duty C%"`)
-   - The **unit** for a name that happens to be exactly 32 characters
+2. **The base name is truncated to 32 bytes.** Recover the full name from kind 4
+   in the extended attributes when present. The short-name field is independent:
+   never append a one- or two-character unit to the channel name. For example,
+   `CP.Lotus.ESP.Lateral Acceleratio` plus unit `G` is not a name ending in `G`.
 
-   **Heuristic used:** If the name field has no null byte AND the short_name is 1–2
-   characters AND the last character of the name is alphanumeric, treat short_name as
-   a name continuation. Otherwise treat it as the unit.
+3. **Display precision is independent of numeric scaling.** Float lambda channels
+   have scaling exponent zero but display precision three. Use `+0x64` when the
+   display format is recognized; older producers without it can fall back to a
+   bounded scaling precision.
 
 ---
 
@@ -331,12 +341,10 @@ Since there is no direct pointer to the enum tables section:
 
 ### Linking Channels to Enum Tables
 
-Each channel's extended metadata at offset `+0xD0` contains:
-- uint16 at `+0xD0`: enum type — `0x0002` means this channel references an enum table
-- uint16 at `+0xD2`: enum ID — matches the `enum_id` field in the table header
-
-When displaying values for a channel with `enum_type == 0x0002`, look up the channel's
-sample value in the enum table identified by `enum_id` to get the text label.
+Read kind 5 from the channel's pointer-linked extended attributes. Its two-byte
+payload is the enum ID, matching the `enum_id` in the table header. Look up finite
+sample values in that table; missing samples must never be cast to integer zero
+and displayed as a valid state.
 
 ### Observed Enum Tables
 
@@ -360,8 +368,7 @@ Oil Temperature/Pressure, Fuel Pressure, Exhaust Lambda/Temperature, etc.).
 Multiple channels can reference the same enum table (e.g., Traction State and
 Launch State both use table 138).
 
-**Status:** The enum table parsing and channel-to-table linking via extended metadata
-offset `+0xD0`/`+0xD2` has been verified against all state channels in the test data.
+**Status:** Enum references are read through the extended attribute list described above.
 The exact meaning of the 4 unknown bytes in each entry marker (`03 00 xx xx xx xx`)
 and the `06 00` sub-group separators is not fully understood.
 
@@ -369,11 +376,36 @@ and the `06 00` sub-group separators is not fully understood.
 
 ## Session Duration
 
-There is no explicit duration field. Estimate it from the channel with the most samples:
+No explicit session endpoint is currently decoded. Estimate the endpoint from
+channels at the highest recorded frequency, taking the longest of those channels:
 
 ```
-duration = max(ch.n_data / ch.rec_freq  for all channels where rec_freq > 0)
+max_freq = max(ch.rec_freq for nonempty channels)
+duration = max(ch.n_data / ch.rec_freq for channels with ch.rec_freq == max_freq)
 ```
+
+Lower-rate channels include a final partial sample period. Taking their maximum
+`count / frequency` incorrectly rounds the session up: the May 8 S1 log ends at
+3918.210 s in i2 and its 100 Hz channels, but its 1 Hz channels contain 3919 samples.
+All lap-detection paths use the same session endpoint. This remains an estimate
+for formats that independently stop recording different channels.
+
+## Recorded beacon events
+
+`Beacon (Internal)` is a tagged int16 event stream, not a physical measurement.
+An event consists of three consecutive words with high-bit tags `11`, `10`, `01`.
+The low 14 bits of the third word contain milliseconds within the second (0–999).
+The first word is stored in the sample bucket immediately after the crossing.
+For its index `i` and stream frequency `f`, the crossing is in `[(i-1)/f, i/f]`;
+combine that interval with the milliseconds to recover local session time. Allow
+half a millisecond for timestamp quantization. Validate tags, timestamp range,
+and strict ordering. This also handles cropped logs with a retained ECU counter
+origin, and closely spaced events in the 68 Hz stream used by the May 8 file.
+
+Use recorded beacons before the `Lap Time Running` or `Lap Number` fallbacks.
+A timer reset can mean an ECU restart and is not necessarily a beacon crossing.
+Verification against i2: all 19 May 8 crossings match to the millisecond, including
+814.515 and 814.574; the cropped VIR fixture retains its 128.392 s timed lap.
 
 ---
 

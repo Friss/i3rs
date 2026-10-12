@@ -5,14 +5,24 @@ use std::sync::Arc;
 use eframe::egui;
 use egui_plot::{Line, MarkerShape, Plot, PlotPoint, PlotPoints, Points};
 use i3rs_core::{
-    Sector, SectorTime, TrackData, compute_color_map, compute_sector_times, find_nearest_sample,
+    Sector, SectorTime, TrackData, compute_color_map, compute_sector_times,
+    find_nearest_sample_in_range,
 };
 
+use super::utils::{
+    create_plotted_channel, resolve_plotted_channel_display_meta, sample_range,
+    transform_channel_value,
+};
 use crate::state::{CHANNEL_COLORS, SharedState};
 
 pub struct TrackMapPanel {
     pub id: u64,
     pub title: String,
+    pub section_times_only: bool,
+    pub show_annotations: bool,
+    section_count: usize,
+    trend_sector: usize,
+    status: Option<String>,
     track_data: Option<Arc<TrackData>>,
     /// Channel index for rainbow coloring (None = solid color).
     pub color_channel_idx: Option<usize>,
@@ -42,8 +52,8 @@ pub struct TrackMapPanel {
 }
 
 struct CachedSectorReport {
-    sector_count: usize,
-    lap_count: usize,
+    sectors: Vec<Sector>,
+    laps: Vec<(u64, u64)>,
     times: Vec<Vec<SectorTime>>,
 }
 
@@ -53,11 +63,12 @@ struct TrackLineFingerprint {
     track_len: usize,
     colors_ptr: usize,
     colors_len: usize,
+    sample_range: (usize, usize),
 }
 
 struct CachedTrackLine {
     fingerprint: TrackLineFingerprint,
-    solid_points: Vec<PlotPoint>,
+    solid_segments: Vec<Vec<PlotPoint>>,
     colored_segments: Vec<CachedColoredTrackSegment>,
 }
 
@@ -82,7 +93,7 @@ struct CachedTrackMarker {
 struct SectorMarkersFingerprint {
     track_ptr: usize,
     track_len: usize,
-    start_indices: Vec<usize>,
+    sectors: Vec<Sector>,
 }
 
 struct CachedSectorMarkers {
@@ -101,6 +112,11 @@ impl TrackMapPanel {
         Self {
             id,
             title: title.into(),
+            section_times_only: false,
+            show_annotations: true,
+            section_count: 4,
+            trend_sector: 0,
+            status: None,
             track_data: None,
             color_channel_idx: None,
             cached_colors: None,
@@ -143,6 +159,12 @@ impl TrackMapPanel {
         }
 
         self.ensure_track_data(shared);
+        if let Some(error) = &shared.track_definition_error {
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                format!("Could not restore sections: {error}"),
+            );
+        }
 
         let Some(track) = &self.track_data else {
             ui.centered_and_justified(|ui| {
@@ -170,24 +192,50 @@ impl TrackMapPanel {
         self.show_toolbar(ui, shared);
         ui.separator();
 
+        if self.section_times_only {
+            self.show_sector_report(ui, shared);
+            return;
+        }
         self.ensure_color_map(shared);
 
         let track = Arc::clone(self.track_data.as_ref().unwrap());
         let cursor_time = shared.cursor_time;
         let sectors = &shared.sectors;
+        let time_range = shared
+            .zoom_range
+            .unwrap_or((0.0, shared.data_duration.unwrap_or(f64::INFINITY)));
+        let sample_range = (
+            track.time.partition_point(|t| *t < time_range.0),
+            track.time.partition_point(|t| *t < time_range.1),
+        );
 
         let mut hover_idx: Option<usize> = None;
         let mut clicked_idx: Option<usize> = None;
         let editing = self.editing_sectors;
 
-        let plot = Plot::new(format!("trackmap_{}", self.id))
+        let annotations = if self.show_annotations {
+            section_annotations(&track, shared)
+        } else {
+            Vec::new()
+        };
+        let range_changed = self
+            .track_line_cache
+            .as_ref()
+            .is_none_or(|c| c.fingerprint.sample_range != sample_range);
+        let mut plot = Plot::new(format!("trackmap_{}", self.id))
             .data_aspect(1.0)
             .allow_drag(true)
             .allow_zoom(true)
             .allow_scroll(false)
             .show_axes(false)
-            .show_grid(false);
+            .show_grid(false)
+            .height(
+                (ui.available_height() - if sectors.is_empty() { 0.0 } else { 230.0 }).max(180.0),
+            );
 
+        if range_changed {
+            plot = plot.reset();
+        }
         let colors = self.cached_colors.clone();
         let response = plot.show(ui, |plot_ui| {
             Self::draw_track_line(
@@ -195,36 +243,104 @@ impl TrackMapPanel {
                 &mut self.track_line_cache,
                 &track,
                 colors.as_deref(),
+                sample_range,
             );
 
             Self::draw_sector_markers(plot_ui, &mut self.sector_marker_cache, &track, sectors);
 
-            if let Some(t) = cursor_time {
+            if let Some(t) = cursor_time.filter(|t| *t >= time_range.0 && *t < time_range.1) {
                 Self::draw_cursor_marker(plot_ui, &mut self.cursor_marker_cache, &track, t);
             }
 
             if let Some(coord) = plot_ui.pointer_coordinate() {
                 let _hover_perf = crate::perf_metrics::scope("track hover lookup");
-                let idx = find_nearest_sample(&track, coord.x, coord.y);
-                hover_idx = Some(idx);
+                let idx = find_nearest_sample_in_range(&track, coord.x, coord.y, time_range);
+                hover_idx = idx;
 
                 if plot_ui.response().clicked() {
                     // Reuse the already-computed index instead of calling find_nearest_sample again
-                    clicked_idx = Some(idx);
+                    clicked_idx = idx;
                 }
             }
         });
 
+        // Place labels in two screen-space columns so dense named sections
+        // remain readable without changing the track's auto-fit bounds.
+        let frame = *response.transform.frame();
+        let painter = ui.painter().with_clip_rect(frame);
+        for right in [false, true] {
+            let mut labels: Vec<_> = annotations
+                .iter()
+                .filter_map(|(point, label)| {
+                    let pos = response.transform.position_from_point(point);
+                    (frame.contains(pos) && (pos.x >= frame.center().x) == right)
+                        .then_some((pos, label))
+                })
+                .collect();
+            labels.sort_by(|a, b| a.0.y.total_cmp(&b.0.y));
+            let gap = 16.0_f32.min((frame.height() - 20.).max(0.) / labels.len().max(1) as f32);
+            let mut ys: Vec<f32> = Vec::new();
+            for (pos, _) in &labels {
+                ys.push(pos.y.max(ys.last().map_or(frame.top() + 10., |y| y + gap)));
+            }
+            if let Some(last) = ys.last_mut() {
+                *last = last.min(frame.bottom() - 10.);
+            }
+            for i in (0..ys.len().saturating_sub(1)).rev() {
+                ys[i] = ys[i].min(ys[i + 1] - gap);
+            }
+            for ((point, label), y) in labels.iter().zip(ys) {
+                let anchor = egui::pos2(
+                    if right {
+                        frame.right() - 8.
+                    } else {
+                        frame.left() + 8.
+                    },
+                    y,
+                );
+                let text = label
+                    .replace("\nCorr Speed ", " · ")
+                    .replace("\nGear ", " · G");
+                let galley = painter.layout_no_wrap(
+                    text,
+                    egui::FontId::proportional(9.),
+                    egui::Color32::LIGHT_GRAY,
+                );
+                let text_pos = egui::pos2(
+                    if right {
+                        anchor.x - galley.size().x
+                    } else {
+                        anchor.x
+                    },
+                    y - galley.size().y / 2.,
+                );
+                let edge = egui::pos2(
+                    if right {
+                        text_pos.x - 4.
+                    } else {
+                        text_pos.x + galley.size().x + 4.
+                    },
+                    y,
+                );
+                painter.line_segment(
+                    [*point, edge],
+                    egui::Stroke::new(0.5, egui::Color32::from_gray(65)),
+                );
+                painter.galley(text_pos, galley, egui::Color32::LIGHT_GRAY);
+            }
+        }
+
         if response.response.hovered()
             && let Some(idx) = hover_idx
         {
-            shared.cursor_time = Some(track.time[idx]);
+            shared.set_hover_cursor(track.time[idx]);
         }
 
         if editing && let Some(idx) = clicked_idx {
             if let Some(start) = self.pending_sector_start.take() {
                 let sector_num = shared.sectors.len() + 1;
                 shared.sectors.push(Sector {
+                    distance: None,
                     name: format!("S{}", sector_num),
                     start_index: start,
                     end_index: idx,
@@ -318,12 +434,14 @@ impl TrackMapPanel {
         cache: &'a mut Option<CachedTrackLine>,
         track: &TrackData,
         colors: Option<&[[u8; 4]]>,
+        sample_range: (usize, usize),
     ) {
         let fingerprint = TrackLineFingerprint {
             track_ptr: track as *const TrackData as usize,
             track_len: track.x.len(),
             colors_ptr: colors.map_or(0, |colors| colors.as_ptr() as usize),
             colors_len: colors.map_or(0, |colors| colors.len()),
+            sample_range,
         };
 
         let cached =
@@ -333,13 +451,10 @@ impl TrackMapPanel {
         }
 
         if cached.colored_segments.is_empty() {
-            if !cached.solid_points.is_empty() {
-                let line = Line::new(
-                    "Track",
-                    PlotPoints::Borrowed(cached.solid_points.as_slice()),
-                )
-                .width(2.5_f32)
-                .color(egui::Color32::from_rgb(50, 255, 200));
+            for segment in &cached.solid_segments {
+                let line = Line::new("Track", PlotPoints::Borrowed(segment.as_slice()))
+                    .width(2.5_f32)
+                    .color(egui::Color32::from_rgb(50, 255, 200));
                 plot_ui.line(line);
             }
         } else {
@@ -361,7 +476,10 @@ impl TrackMapPanel {
         let sample_idx = (time * track.freq as f64).round() as usize;
         let sample_idx = sample_idx.min(track.x.len().saturating_sub(1));
 
-        if sample_idx >= track.x.len() {
+        if sample_idx >= track.x.len()
+            || !track.x[sample_idx].is_finite()
+            || !track.y[sample_idx].is_finite()
+        {
             return;
         }
 
@@ -393,7 +511,7 @@ impl TrackMapPanel {
         let fingerprint = SectorMarkersFingerprint {
             track_ptr: track as *const TrackData as usize,
             track_len: track.x.len(),
-            start_indices: sectors.iter().map(|sector| sector.start_index).collect(),
+            sectors: sectors.to_vec(),
         };
         let cached = cache
             .get_or_insert_with(|| CachedSectorMarkers::build(track, sectors, fingerprint.clone()));
@@ -412,7 +530,7 @@ impl TrackMapPanel {
     }
 
     fn show_toolbar(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Color by:");
             let current_name = if self.color_channel_idx.is_some() {
                 &self.color_channel_name
@@ -531,6 +649,71 @@ impl TrackMapPanel {
                 }
             });
         });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.show_annotations, "Section labels and speed / gear");
+            ui.add(egui::DragValue::new(&mut self.section_count).range(2..=20).prefix("Sections "));
+            if ui.button("Split selected lap").on_hover_text("Create generic sections of equal distance; rename them below").clicked()
+                && let Some(track) = &self.track_data {
+                let lap = shared.selected_lap.and_then(|i| shared.laps.get(i));
+                if let Some(lap) = lap {
+                    shared.sectors = i3rs_core::split_lap_into_sectors(track,lap,self.section_count);
+                    self.status = Some(if shared.sectors.is_empty() { "Not enough valid GPS movement in this lap" } else { "Sections created; rename them below or edit their boundaries on the map" }.into());
+                } else { self.status = Some("Select a complete lap before splitting sections".into()); }
+            }
+            if ui.button("VIR Full sections").on_hover_text("Apply the 33 named distance sections from the VIR Full model to the selected complete lap").clicked() {
+                let result = self.track_data.as_ref().ok_or("GPS track is unavailable".to_string()).and_then(|track| {
+                    let lap = shared.selected_lap.and_then(|i|shared.laps.get(i)).ok_or("Select a complete VIR lap first".to_string())?;
+                    i3rs_core::track::sectors_from_distance_definition(track,lap,&i3rs_core::track::vir_full_definition())
+                });
+                match result { Ok(sectors) => {shared.sectors=sectors; self.status=Some("VIR Full: 33 distance sections; laps within 5% stretch to 5337.5 m".into());}, Err(e)=>self.status=Some(e) }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if ui.button("Import sections…").clicked()
+                    && let Some(path) = rfd::FileDialog::new().add_filter("Track sections", &["json"]).pick_file() {
+                    let result = std::fs::read_to_string(path).map_err(|e| e.to_string())
+                        .and_then(|json| serde_json::from_str::<i3rs_core::TrackDefinition>(&json).map_err(|e| e.to_string()))
+                        .and_then(|definition| {
+                            let track = self.track_data.as_ref().ok_or("GPS track is unavailable")?;
+                            i3rs_core::import_track_definition(track, &definition)
+                        });
+                    match result {
+                        Ok(sectors) => { shared.sectors = sectors; self.status = Some("Sections imported".into()); }
+                        Err(error) => self.status = Some(error),
+                    }
+                }
+                if ui.add_enabled(!shared.sectors.is_empty(),egui::Button::new("Export sections…")).clicked()
+                    && let Some(track) = &self.track_data
+                    && let Some(definition) = i3rs_core::export_track_definition(track,&shared.sectors,shared.file_name.clone())
+                    && let Some(path) = rfd::FileDialog::new().add_filter("Track sections", &["json"]).set_file_name("track-sections.json").save_file() {
+                    self.status = Some(match serde_json::to_string_pretty(&definition).map_err(|e| e.to_string())
+                        .and_then(|json| std::fs::write(path,json).map_err(|e|e.to_string())) {
+                        Ok(()) => "Sections exported".into(), Err(error) => error,
+                    });
+                }
+            }
+        });
+        if let Some(status) = &self.status {
+            ui.label(status);
+        }
+        if !shared.sectors.is_empty() {
+            ui.collapsing("Section names", |ui| {
+                ui.label("Distance-defined sections retain their model boundaries when renamed.");
+                let mut remove = None;
+                for (i, sector) in shared.sectors.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{}.", i + 1));
+                        ui.text_edit_singleline(&mut sector.name);
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    shared.sectors.remove(i);
+                }
+            });
+        }
     }
 
     fn invalidate_color_cache(&mut self) {
@@ -588,44 +771,53 @@ impl TrackMapPanel {
         );
     }
 
-    fn show_sector_report(&mut self, ui: &mut egui::Ui, shared: &SharedState) {
+    fn show_sector_report(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
         if shared.sectors.is_empty() || shared.laps.is_empty() {
+            ui.label("Select a lap, then split it into sections or import named sections. Boundaries can also be picked on Track Report.");
             return;
         }
-
         let Some(track) = &self.track_data else {
             return;
         };
-
-        // Cache sector times — only recompute when sectors or laps change
-        let needs_rebuild = self.cached_sector_times.as_ref().is_none_or(|c| {
-            c.sector_count != shared.sectors.len() || c.lap_count != shared.laps.len()
-        });
-
-        if needs_rebuild {
-            let times = compute_sector_times(&shared.sectors, &shared.laps, track);
+        let laps: Vec<_> = shared
+            .laps
+            .iter()
+            .map(|l| (l.start_time.to_bits(), l.end_time.to_bits()))
+            .collect();
+        if self
+            .cached_sector_times
+            .as_ref()
+            .is_none_or(|c| c.sectors != shared.sectors || c.laps != laps)
+        {
             self.cached_sector_times = Some(CachedSectorReport {
-                sector_count: shared.sectors.len(),
-                lap_count: shared.laps.len(),
-                times,
+                sectors: shared.sectors.clone(),
+                laps,
+                times: compute_sector_times(&shared.sectors, &shared.laps, track),
             });
         }
-
-        let sector_times = &self.cached_sector_times.as_ref().unwrap().times;
-        if sector_times.is_empty() {
-            return;
-        }
-
-        ui.strong("Sector Times");
-
-        let ref_lap_times: Option<&Vec<_>> = shared.reference_lap.and_then(|i| sector_times.get(i));
-
-        egui::ScrollArea::vertical()
-            .max_height(200.0)
+        let times = &self.cached_sector_times.as_ref().unwrap().times;
+        let best: Vec<f64> = (0..shared.sectors.len())
+            .map(|s| {
+                times
+                    .iter()
+                    .filter_map(|row| row.get(s))
+                    .map(|t| t.time_secs)
+                    .filter(|t| t.is_finite() && *t > 0.0)
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .collect();
+        ui.strong("Section Times");
+        let max_height = if self.section_times_only {
+            ui.available_height() * 0.6
+        } else {
+            190.0
+        };
+        egui::ScrollArea::both()
+            .id_salt(("sections", self.id))
+            .max_height(max_height)
             .show(ui, |ui| {
-                egui::Grid::new(format!("sector_report_{}", self.id))
+                egui::Grid::new(("section_matrix", self.id))
                     .striped(true)
-                    .min_col_width(60.0)
                     .show(ui, |ui| {
                         ui.strong("Lap");
                         for sector in &shared.sectors {
@@ -633,53 +825,95 @@ impl TrackMapPanel {
                         }
                         ui.strong("Total");
                         ui.end_row();
-
-                        for (lap_idx, lap_sectors) in sector_times.iter().enumerate() {
-                            let lap = &shared.laps[lap_idx];
-                            ui.label(&lap.name);
-
-                            let mut total = 0.0;
-                            for (s_idx, st) in lap_sectors.iter().enumerate() {
-                                total += st.time_secs;
-
-                                if let Some(ref_times) = ref_lap_times
-                                    && Some(lap_idx) != shared.reference_lap
-                                    && let Some(ref_st) = ref_times.get(s_idx)
+                        for (li, row) in times.iter().enumerate() {
+                            let lap = &shared.laps[li];
+                            if ui
+                                .selectable_label(shared.selected_lap == Some(li), &lap.name)
+                                .clicked()
+                            {
+                                shared.selected_lap = Some(li);
+                                shared.zoom_range = Some((lap.start_time, lap.end_time));
+                                if shared
+                                    .cursor_time
+                                    .is_none_or(|t| t < lap.start_time || t >= lap.end_time)
                                 {
-                                    let delta = st.time_secs - ref_st.time_secs;
-                                    ui.colored_label(
-                                        delta_color(delta),
-                                        format!(
-                                            "{} ({:+.3})",
-                                            i3rs_core::format_duration(st.time_secs),
-                                            delta
-                                        ),
-                                    );
+                                    shared.cursor_time = Some(lap.start_time);
+                                }
+                                shared.zoom_from_timeline = true;
+                            }
+                            for (si, st) in row.iter().enumerate() {
+                                if !st.time_secs.is_finite() {
+                                    ui.weak("—");
                                     continue;
                                 }
-                                ui.label(i3rs_core::format_duration(st.time_secs));
-                            }
-
-                            if let Some(ref_times) = ref_lap_times
-                                && Some(lap_idx) != shared.reference_lap
-                            {
-                                let ref_total: f64 = ref_times.iter().map(|st| st.time_secs).sum();
-                                let delta = total - ref_total;
+                                let delta = shared
+                                    .reference_lap
+                                    .and_then(|i| times.get(i))
+                                    .and_then(|r| r.get(si))
+                                    .map(|r| st.time_secs - r.time_secs)
+                                    .filter(|d| d.is_finite());
+                                let mut label = format!("{:.3}", st.time_secs);
+                                if let Some(d) = delta {
+                                    label.push_str(&format!(" ({d:+.3})"));
+                                }
+                                let is_best = (st.time_secs - best[si]).abs() < 1e-7;
+                                let color = if is_best {
+                                    egui::Color32::LIGHT_GREEN
+                                } else {
+                                    delta.map_or(ui.visuals().text_color(), delta_color)
+                                };
                                 ui.colored_label(
-                                    delta_color(delta),
-                                    format!(
-                                        "{} ({:+.3})",
-                                        i3rs_core::format_duration(total),
-                                        delta
-                                    ),
+                                    color,
+                                    if is_best {
+                                        format!("★ {label}")
+                                    } else {
+                                        label
+                                    },
                                 );
-                            } else {
-                                ui.label(i3rs_core::format_duration(total));
                             }
+                            let sum: f64 = row.iter().map(|s| s.time_secs).sum();
+                            ui.label(if sum.is_finite() {
+                                format!("{sum:.3}")
+                            } else {
+                                "—".into()
+                            });
                             ui.end_row();
                         }
                     });
             });
+        if self.section_times_only {
+            self.trend_sector = self.trend_sector.min(shared.sectors.len() - 1);
+            egui::ComboBox::from_id_salt(("section_trend", self.id))
+                .selected_text(&shared.sectors[self.trend_sector].name)
+                .show_ui(ui, |ui| {
+                    for (i, s) in shared.sectors.iter().enumerate() {
+                        ui.selectable_value(&mut self.trend_sector, i, &s.name);
+                    }
+                });
+            let mut runs = Vec::new();
+            let mut run = Vec::new();
+            for (i, row) in times.iter().enumerate() {
+                let t = row[self.trend_sector].time_secs;
+                if t.is_finite() {
+                    run.push([i as f64, t]);
+                } else if !run.is_empty() {
+                    runs.push(std::mem::take(&mut run));
+                }
+            }
+            if !run.is_empty() {
+                runs.push(run);
+            }
+            Plot::new(("section_trend_plot", self.id))
+                .height(ui.available_height().max(100.0))
+                .x_axis_label("Lap index (0 = Out Lap)")
+                .y_axis_label("Section time (s)")
+                .show(ui, |p| {
+                    for run in runs {
+                        p.line(Line::new("Section time", run.clone()));
+                        p.points(Points::new("", run).radius(3.0));
+                    }
+                });
+        }
     }
 }
 
@@ -689,38 +923,43 @@ impl CachedTrackLine {
         colors: Option<&[[u8; 4]]>,
         fingerprint: TrackLineFingerprint,
     ) -> Self {
-        if let Some(colors) = colors {
-            let colored_segments = colors
-                .iter()
-                .enumerate()
-                .take(track.x.len().saturating_sub(1))
-                .map(|(idx, color)| CachedColoredTrackSegment {
-                    color: egui::Color32::from_rgb(color[0], color[1], color[2]),
-                    points: [
-                        PlotPoint::new(track.x[idx], track.y[idx]),
-                        PlotPoint::new(track.x[idx + 1], track.y[idx + 1]),
-                    ],
-                })
-                .collect();
-
-            Self {
-                fingerprint,
-                solid_points: Vec::new(),
-                colored_segments,
+        let (start, end) = fingerprint.sample_range;
+        let mut solid_segments = Vec::new();
+        let mut run = Vec::new();
+        let mut colored_segments = Vec::new();
+        for idx in start..end.min(track.x.len()) {
+            let valid = track.x[idx].is_finite() && track.y[idx].is_finite();
+            if !valid {
+                if !run.is_empty() {
+                    solid_segments.push(std::mem::take(&mut run));
+                }
+                continue;
             }
-        } else {
-            let solid_points = track
-                .x
-                .iter()
-                .zip(track.y.iter())
-                .map(|(&x, &y)| PlotPoint::new(x, y))
-                .collect();
-
-            Self {
-                fingerprint,
-                solid_points,
-                colored_segments: Vec::new(),
+            if let Some(colors) = colors {
+                if idx + 1 < end.min(track.x.len())
+                    && track.x[idx + 1].is_finite()
+                    && track.y[idx + 1].is_finite()
+                    && let Some(color) = colors.get(idx)
+                {
+                    colored_segments.push(CachedColoredTrackSegment {
+                        color: egui::Color32::from_rgb(color[0], color[1], color[2]),
+                        points: [
+                            PlotPoint::new(track.x[idx], track.y[idx]),
+                            PlotPoint::new(track.x[idx + 1], track.y[idx + 1]),
+                        ],
+                    });
+                }
+            } else {
+                run.push(PlotPoint::new(track.x[idx], track.y[idx]));
             }
+        }
+        if !run.is_empty() {
+            solid_segments.push(run);
+        }
+        Self {
+            fingerprint,
+            solid_segments,
+            colored_segments,
         }
     }
 }
@@ -739,7 +978,11 @@ impl CachedSectorMarkers {
         let markers = sectors
             .iter()
             .enumerate()
-            .filter(|(_, sector)| sector.start_index < track.x.len())
+            .filter(|(_, sector)| {
+                sector.start_index < track.x.len()
+                    && track.x[sector.start_index].is_finite()
+                    && track.y[sector.start_index].is_finite()
+            })
             .map(|(idx, sector)| CachedSectorMarker {
                 name: format!("{} start", sector.name),
                 color: CHANNEL_COLORS[idx % CHANNEL_COLORS.len()],
@@ -755,6 +998,75 @@ impl CachedSectorMarkers {
             markers,
         }
     }
+}
+
+fn section_annotations(track: &TrackData, shared: &SharedState) -> Vec<(PlotPoint, String)> {
+    let Some(lap) = shared.selected_lap.and_then(|i| shared.laps.get(i)) else {
+        return Vec::new();
+    };
+    let Some(ld) = &shared.ld_file else {
+        return Vec::new();
+    };
+    let gear = ld.find_channel_by_name("Gear").and_then(|c| {
+        create_plotted_channel(crate::state::ChannelId::Physical(c.index), shared, 0)
+    });
+    shared
+        .sectors
+        .iter()
+        .filter_map(|s| {
+            let (start, end) = i3rs_core::sector_interval(s, lap, track)?;
+            let mut label = s.name.clone();
+            if let Some((speed, freq)) = &track.corrected_speed {
+                let ranges = if end > start {
+                    vec![(start, end)]
+                } else {
+                    vec![(start, lap.end_time), (lap.start_time, end)]
+                };
+                let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+                for range in ranges {
+                    for i in sample_range(speed.len(), *freq, range) {
+                        let value = speed[i] / 0.44704;
+                        if value.is_finite() {
+                            min = min.min(value);
+                            max = max.max(value);
+                        }
+                    }
+                }
+                if min.is_finite() {
+                    label.push_str(&format!("\nCorr Speed {min:.1}–{max:.1} mph"));
+                }
+            }
+            for (kind, channel) in [("Gear", gear.as_ref())] {
+                let Some(ch) = channel else {
+                    continue;
+                };
+                let meta = resolve_plotted_channel_display_meta(ch, shared);
+                let ranges = if end > start {
+                    vec![(start, end)]
+                } else {
+                    vec![(start, lap.end_time), (lap.start_time, end)]
+                };
+                let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+                for range in ranges {
+                    for i in sample_range(ch.data.len(), meta.2, range) {
+                        let value = transform_channel_value(ch, ch.data[i]);
+                        if value.is_finite() {
+                            min = min.min(value);
+                            max = max.max(value);
+                        }
+                    }
+                }
+                if min.is_finite() {
+                    let dec = if kind == "Gear" { 0 } else { 1 };
+                    label.push_str(&format!("\n{kind} {min:.dec$}–{max:.dec$} {}", meta.1));
+                }
+            }
+            Some((
+                PlotPoint::new(*track.x.get(s.start_index)?, *track.y.get(s.start_index)?),
+                label,
+            ))
+        })
+        .collect()
 }
 
 fn delta_color(delta: f64) -> egui::Color32 {
@@ -784,8 +1096,9 @@ mod tests {
                 track_len: 2,
                 colors_ptr: 3,
                 colors_len: 4,
+                sample_range: (0, 2),
             },
-            solid_points: vec![PlotPoint::new(0.0, 0.0)],
+            solid_segments: vec![vec![PlotPoint::new(0.0, 0.0)]],
             colored_segments: Vec::new(),
         });
         panel.cursor_marker_cache = Some(CachedTrackMarker {
@@ -800,7 +1113,7 @@ mod tests {
             fingerprint: SectorMarkersFingerprint {
                 track_ptr: 1,
                 track_len: 2,
-                start_indices: vec![0],
+                sectors: vec![],
             },
             markers: Vec::new(),
         });
@@ -821,8 +1134,9 @@ mod tests {
                 track_len: 2,
                 colors_ptr: 3,
                 colors_len: 4,
+                sample_range: (0, 2),
             },
-            solid_points: vec![PlotPoint::new(0.0, 0.0)],
+            solid_segments: vec![vec![PlotPoint::new(0.0, 0.0)]],
             colored_segments: Vec::new(),
         });
         panel.cursor_marker_cache = Some(CachedTrackMarker {

@@ -4,6 +4,7 @@
 //! The panel bins the data into a 2D grid and colors each cell by the
 //! average value channel reading in that bin.
 
+use super::distribution::ColorBands;
 use eframe::egui;
 
 use crate::state::{ChannelId, PlottedChannel, SharedState};
@@ -22,6 +23,9 @@ struct HeatmapFingerprint {
     value_data_ptr: usize,
     zoom_key: Option<(u64, u64)>,
     bins: usize,
+    delay: u64,
+    minimum_y: Option<u64>,
+    frequencies: [u16; 3],
     x_transform: DisplayTransformFingerprint,
     y_transform: DisplayTransformFingerprint,
     value_transform: DisplayTransformFingerprint,
@@ -43,7 +47,12 @@ pub struct MixtureMapPanel {
     pub value_channel: Option<PlottedChannel>,
     /// Number of bins along each axis.
     pub bins: usize,
-    cache: Option<HeatmapCache>,
+    pub scatter_mode: bool,
+    /// Positive delay aligns Y(t + delay) with X(t) and load(t).
+    pub sensor_delay: f64,
+    pub minimum_y: Option<f64>,
+    pub color_bands: ColorBands,
+    cache: Option<Box<HeatmapCache>>,
 }
 
 impl MixtureMapPanel {
@@ -55,6 +64,10 @@ impl MixtureMapPanel {
             y_channel: None,
             value_channel: None,
             bins: 20,
+            scatter_mode: false,
+            sensor_delay: 0.0,
+            minimum_y: None,
+            color_bands: ColorBands::default(),
             cache: None,
         }
     }
@@ -109,7 +122,7 @@ impl MixtureMapPanel {
         }
 
         // Toolbar
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("X:");
             let mut clear_x = false;
             if let Some(channel) = self.x_channel.as_mut() {
@@ -210,6 +223,24 @@ impl MixtureMapPanel {
         let (v_name, v_unit, v_freq, v_dec_places, _) =
             resolve_plotted_channel_display_meta(v_ch, shared);
 
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Y sensor delay (s):");
+            ui.add(
+                egui::DragValue::new(&mut self.sensor_delay)
+                    .range(0.0..=5.0)
+                    .speed(0.01),
+            );
+            let mut filter = self.minimum_y.is_some();
+            ui.checkbox(&mut filter, "Exclude Y below");
+            if filter {
+                ui.add(egui::DragValue::new(self.minimum_y.get_or_insert(0.5)).speed(0.01));
+            } else {
+                self.minimum_y = None;
+            }
+            if y_name.to_ascii_lowercase().contains("lambda") {
+                ui.weak("Gear-change filtering is not applied");
+            }
+        });
         let target_freq = x_freq.min(y_freq).min(v_freq);
         if target_freq == 0 {
             ui.label("Channel frequency is 0");
@@ -227,6 +258,9 @@ impl MixtureMapPanel {
             value_data_ptr: v_ch.data.as_ptr() as usize,
             zoom_key,
             bins: self.bins,
+            delay: self.sensor_delay.to_bits(),
+            minimum_y: self.minimum_y.map(f64::to_bits),
+            frequencies: [x_freq, y_freq, v_freq],
             x_transform: display_transform_fingerprint(x_ch),
             y_transform: display_transform_fingerprint(y_ch),
             value_transform: display_transform_fingerprint(v_ch),
@@ -256,22 +290,39 @@ impl MixtureMapPanel {
                 y_ch.display_offset,
                 v_ch.display_scale,
                 v_ch.display_offset,
+                self.sensor_delay,
+                self.minimum_y,
             );
-            self.cache = Some(HeatmapCache {
+            self.cache = Some(Box::new(HeatmapCache {
                 fingerprint,
                 heatmap,
-            });
+            }));
         }
         let heatmap = &self.cache.as_ref().unwrap().heatmap;
 
         let x_axis = axis_config(&x_name, &x_unit, x_dec_places);
         let y_axis = axis_config(&y_name, &y_unit, y_dec_places);
 
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.scatter_mode, true, "Samples");
+            ui.selectable_value(&mut self.scatter_mode, false, "Heatmap");
+            ui.label(format!(
+                "{} samples · range follows lap / zoom",
+                heatmap.triples.len()
+            ));
+            if self.scatter_mode {
+                self.color_bands.controls(ui);
+            }
+        });
+        let mut band_counts = vec![0_usize; self.color_bands.len()];
+        for &(_, _, v, _) in &heatmap.triples {
+            band_counts[self.color_bands.index(v)] += 1;
+        }
         let available = ui.available_rect_before_wrap();
         let margin = 50.0;
         let plot_rect = egui::Rect::from_min_max(
-            egui::pos2(available.min.x + margin, available.min.y + 10.0),
-            egui::pos2(available.max.x - 20.0, available.max.y - margin),
+            egui::pos2(available.min.x + margin, available.min.y + 24.0),
+            egui::pos2(available.max.x - 145.0, available.max.y - margin),
         );
 
         if plot_rect.width() < 10.0 || plot_rect.height() < 10.0 {
@@ -287,32 +338,50 @@ impl MixtureMapPanel {
         let cell_h = plot_rect.height() / self.bins as f32;
         let legend_steps = legend_step_count(&v_unit, heatmap.value_range);
 
-        for yi in 0..self.bins {
-            for xi in 0..self.bins {
-                let cell = &heatmap.cells[yi * self.bins + xi];
-                if cell.count == 0 {
+        if self.scatter_mode {
+            for &(x, y, value, _) in &heatmap.triples {
+                if y < heatmap.y_min || y > heatmap.y_max {
                     continue;
                 }
-                let avg_val = cell.sum / cell.count as f64;
-                let frac = if heatmap.value_range > 0.0 {
-                    ((avg_val - heatmap.value_min) / heatmap.value_range).clamp(0.0, 1.0) as f32
-                } else {
-                    0.5
-                };
-
-                let color = heat_color(step_fraction(frac, legend_steps))
-                    .gamma_multiply(occupancy_alpha(cell.count, heatmap.max_count));
-                let cell_rect = egui::Rect::from_min_size(
-                    egui::pos2(
-                        plot_rect.min.x + xi as f32 * cell_w,
-                        plot_rect.max.y - (yi + 1) as f32 * cell_h,
-                    ),
-                    egui::vec2(cell_w, cell_h),
+                let px = plot_rect.left()
+                    + normalized_fraction(x, heatmap.x_min, heatmap.x_max) as f32
+                        * plot_rect.width();
+                let py = plot_rect.bottom()
+                    - normalized_fraction(y, heatmap.y_min, heatmap.y_max) as f32
+                        * plot_rect.height();
+                painter.circle_filled(
+                    egui::pos2(px, py),
+                    1.75,
+                    self.color_bands.color(self.color_bands.index(value)),
                 );
-                painter.rect_filled(cell_rect, 0.0, color);
+            }
+        } else {
+            for yi in 0..self.bins {
+                for xi in 0..self.bins {
+                    let cell = &heatmap.cells[yi * self.bins + xi];
+                    if cell.count == 0 {
+                        continue;
+                    }
+                    let avg_val = cell.sum / cell.count as f64;
+                    let frac = if heatmap.value_range > 0.0 {
+                        ((avg_val - heatmap.value_min) / heatmap.value_range).clamp(0.0, 1.0) as f32
+                    } else {
+                        0.5
+                    };
+
+                    let color = heat_color(step_fraction(frac, legend_steps))
+                        .gamma_multiply(occupancy_alpha(cell.count, heatmap.max_count));
+                    let cell_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            plot_rect.min.x + xi as f32 * cell_w,
+                            plot_rect.max.y - (yi + 1) as f32 * cell_h,
+                        ),
+                        egui::vec2(cell_w, cell_h),
+                    );
+                    painter.rect_filled(cell_rect, 0.0, color);
+                }
             }
         }
-
         painter.rect_stroke(
             plot_rect,
             0.0,
@@ -364,62 +433,104 @@ impl MixtureMapPanel {
         } else {
             format!("{} ({})", y_name, y_unit)
         };
-        let y_label_pos = egui::pos2(available.min.x + 8.0, plot_rect.center().y);
-        let char_height = 13.0;
-        let total_h = y_label.len() as f32 * char_height;
-        let start_y = y_label_pos.y - total_h / 2.0;
-        for (i, c) in y_label.chars().enumerate() {
-            painter.text(
-                egui::pos2(y_label_pos.x, start_y + i as f32 * char_height),
-                egui::Align2::CENTER_TOP,
-                c.to_string(),
-                egui::FontId::proportional(11.0),
-                egui::Color32::LIGHT_GRAY,
-            );
-        }
+        painter.text(
+            egui::pos2(plot_rect.left(), plot_rect.top() - 6.0),
+            egui::Align2::LEFT_BOTTOM,
+            y_label,
+            egui::FontId::proportional(11.0),
+            egui::Color32::LIGHT_GRAY,
+        );
 
         let legend_x = plot_rect.max.x + 5.0;
         let legend_h = plot_rect.height().min(165.0);
         let legend_top = plot_rect.center().y - legend_h / 2.0;
         let legend_w = 12.0;
-        for i in 0..legend_steps {
-            let frac = 1.0 - i as f32 / (legend_steps.saturating_sub(1).max(1)) as f32;
-            let color = heat_color(frac);
-            let y = legend_top + i as f32 * legend_h / legend_steps as f32;
-            let r = egui::Rect::from_min_size(
-                egui::pos2(legend_x, y),
-                egui::vec2(legend_w, legend_h / legend_steps as f32 + 1.0),
-            );
-            painter.rect_filled(r, 0.0, color);
-            let value = heatmap.value_min + heatmap.value_range * frac as f64;
+        if self.scatter_mode {
             painter.text(
-                egui::pos2(legend_x + legend_w + 4.0, y + 1.0),
-                egui::Align2::LEFT_TOP,
-                format_axis_value(value, v_dec_places),
-                egui::FontId::proportional(9.0),
-                egui::Color32::GRAY,
+                egui::pos2(legend_x, legend_top - 20.0),
+                egui::Align2::LEFT_BOTTOM,
+                legend_title(&v_name, &v_unit),
+                egui::FontId::proportional(11.0),
+                egui::Color32::LIGHT_GRAY,
+            );
+            for (i, count) in band_counts.iter().enumerate() {
+                let y = legend_top + i as f32 * 17.0;
+                painter.rect_filled(
+                    egui::Rect::from_min_size(egui::pos2(legend_x, y), egui::vec2(10.0, 10.0)),
+                    0.0,
+                    self.color_bands.color(i),
+                );
+                painter.text(
+                    egui::pos2(legend_x + 14.0, y),
+                    egui::Align2::LEFT_TOP,
+                    format!("{} ({})", self.color_bands.label(i), count),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::LIGHT_GRAY,
+                );
+            }
+        } else {
+            for i in 0..legend_steps {
+                let frac = 1.0 - i as f32 / (legend_steps.saturating_sub(1).max(1)) as f32;
+                let color = heat_color(frac);
+                let y = legend_top + i as f32 * legend_h / legend_steps as f32;
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(legend_x, y),
+                    egui::vec2(legend_w, legend_h / legend_steps as f32 + 1.0),
+                );
+                painter.rect_filled(r, 0.0, color);
+                let value = heatmap.value_min + heatmap.value_range * frac as f64;
+                painter.text(
+                    egui::pos2(legend_x + legend_w + 4.0, y + 1.0),
+                    egui::Align2::LEFT_TOP,
+                    format_axis_value(value, v_dec_places),
+                    egui::FontId::proportional(9.0),
+                    egui::Color32::GRAY,
+                );
+            }
+            painter.text(
+                egui::pos2(legend_x + legend_w / 2.0, legend_top - 4.0),
+                egui::Align2::CENTER_BOTTOM,
+                legend_title(&v_name, &v_unit),
+                egui::FontId::proportional(10.0),
+                egui::Color32::LIGHT_GRAY,
             );
         }
-        painter.text(
-            egui::pos2(legend_x + legend_w / 2.0, legend_top - 4.0),
-            egui::Align2::CENTER_BOTTOM,
-            legend_title(&v_name, &v_unit),
-            egui::FontId::proportional(10.0),
-            egui::Color32::LIGHT_GRAY,
-        );
-
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
             && plot_rect.contains(pos)
         {
-            let xi = (((pos.x - plot_rect.left()) / plot_rect.width()) * self.bins as f32)
-                .floor()
-                .clamp(0.0, self.bins.saturating_sub(1) as f32) as usize;
-            let yi = (((plot_rect.bottom() - pos.y) / plot_rect.height()) * self.bins as f32)
-                .floor()
-                .clamp(0.0, self.bins.saturating_sub(1) as f32) as usize;
-            if let Some(time) = heatmap.cells[yi * self.bins + xi].representative_time {
-                shared.cursor_time = Some(time);
+            if self.scatter_mode {
+                let nearest = heatmap
+                    .triples
+                    .iter()
+                    .filter_map(|&(x, y, _, time)| {
+                        let px = plot_rect.left()
+                            + normalized_fraction(x, heatmap.x_min, heatmap.x_max) as f32
+                                * plot_rect.width();
+                        let py = plot_rect.bottom()
+                            - normalized_fraction(y, heatmap.y_min, heatmap.y_max) as f32
+                                * plot_rect.height();
+                        let d = (pos - egui::pos2(px, py)).length_sq();
+                        (d < 100.0).then_some((d, time))
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0));
+                if let Some((_, time)) = nearest {
+                    shared.playback_active = false;
+                    shared.cursor_time = Some(time);
+                }
+            } else {
+                let xi = (((pos.x - plot_rect.left()) / plot_rect.width()) * self.bins as f32)
+                    .floor()
+                    .clamp(0.0, self.bins.saturating_sub(1) as f32)
+                    as usize;
+                let yi = (((plot_rect.bottom() - pos.y) / plot_rect.height()) * self.bins as f32)
+                    .floor()
+                    .clamp(0.0, self.bins.saturating_sub(1) as f32)
+                    as usize;
+                if let Some(time) = heatmap.cells[yi * self.bins + xi].representative_time {
+                    shared.playback_active = false;
+                    shared.cursor_time = Some(time);
+                }
             }
         }
 
@@ -453,6 +564,7 @@ struct HeatmapCell {
 
 struct Heatmap {
     cells: Vec<HeatmapCell>,
+    triples: Vec<(f64, f64, f64, f64)>,
     x_min: f64,
     x_max: f64,
     y_min: f64,
@@ -487,6 +599,8 @@ fn compute_heatmap(
     y_offset: f64,
     v_scale: f64,
     v_offset: f64,
+    sensor_delay: f64,
+    minimum_y: Option<f64>,
 ) -> Heatmap {
     let mut cells: Vec<HeatmapCell> = (0..bins * bins)
         .map(|_| HeatmapCell {
@@ -497,8 +611,22 @@ fn compute_heatmap(
         })
         .collect();
 
-    let start = (t0 * target_freq as f64).floor() as usize;
-    let end = (t1 * target_freq as f64).ceil() as usize;
+    let sensor_delay = if sensor_delay.is_finite() {
+        sensor_delay.clamp(0., 5.)
+    } else {
+        0.
+    };
+    let start = (t0.max(0.) * target_freq as f64).ceil() as usize;
+    let duration = (x_data.len() as f64 / x_freq.max(1) as f64)
+        .min(v_data.len() as f64 / v_freq.max(1) as f64)
+        .min(y_data.len() as f64 / y_freq.max(1) as f64 - sensor_delay);
+    let end =
+        if [x_freq, y_freq, v_freq, target_freq].contains(&0) || !t0.is_finite() || !t1.is_finite()
+        {
+            0
+        } else {
+            ((t1 - sensor_delay).min(duration).max(0.) * target_freq as f64).ceil() as usize
+        };
 
     let mut triples = Vec::new();
     let mut x_min = f64::MAX;
@@ -508,13 +636,14 @@ fn compute_heatmap(
     let mut v_min = f64::MAX;
     let mut v_max = f64::MIN;
 
-    let step = ((end - start) / 100_000).max(1);
+    // Count every valid sample; display aggregation must not alter statistics.
+    let step = 1;
     let mut i = start;
     while i < end {
         let t = i as f64 / target_freq as f64;
         if let (Some(x), Some(y), Some(v)) = (
             interp_at_time(x_data, x_freq, t),
-            interp_at_time(y_data, y_freq, t),
+            interp_at_time(y_data, y_freq, t + sensor_delay),
             interp_at_time(v_data, v_freq, t),
         ) && x.is_finite()
             && y.is_finite()
@@ -523,8 +652,10 @@ fn compute_heatmap(
             let x = x * x_scale + x_offset;
             let y = y * y_scale + y_offset;
             let v = v * v_scale + v_offset;
-            if let Some((fixed_y_min, fixed_y_max)) = y_fixed_range
-                && (y < fixed_y_min || y > fixed_y_max)
+            if !x.is_finite()
+                || !y.is_finite()
+                || !v.is_finite()
+                || minimum_y.is_some_and(|min| y < min)
             {
                 i += step;
                 continue;
@@ -556,6 +687,7 @@ fn compute_heatmap(
         let (fixed_y_min, fixed_y_max) = y_fixed_range.unwrap_or((0.0, 1.0));
         return Heatmap {
             cells,
+            triples,
             x_min: 0.0,
             x_max: 1.0,
             y_min: fixed_y_min,
@@ -577,6 +709,9 @@ fn compute_heatmap(
     let mut max_count = 0;
 
     for (x, y, v, t) in &triples {
+        if *y < y_min || *y > y_max {
+            continue;
+        }
         let xi = (((x - x_min) / x_range * bins as f64) as usize).min(bins - 1);
         let yi = (((y - y_min) / y_range * bins as f64).clamp(0.0, bins as f64 - 1.0)) as usize;
         let cell = &mut cells[yi * bins + xi];
@@ -594,6 +729,7 @@ fn compute_heatmap(
 
     Heatmap {
         cells,
+        triples,
         x_min,
         x_max,
         y_min,
@@ -690,4 +826,90 @@ fn heat_color(frac: f32) -> egui::Color32 {
         (1.0, 1.0 - t, 0.0)
     };
     egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[ignore = "requires local i2 comparison recording"]
+    fn i2_outlap_mixture_sample_count() {
+        let ld = i3rs_core::LdFile::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../S1_#28299_20260508_174455_02.ld"
+        ))
+        .unwrap();
+        let load = |name| {
+            let ch = ld.find_channel_by_name(name).unwrap();
+            (ld.read_channel_data(ch).unwrap(), ch.freq)
+        };
+        let (rpm, rf) = load("Engine Speed");
+        let (throttle, tf) = load("Throttle Position");
+        for (name, expected, low) in [
+            ("Exhaust Lambda Bank 1", 6821, 6794),
+            ("Exhaust Lambda Bank 2", 6833, 6806),
+        ] {
+            let (lambda, lf) = load(name);
+            let map = super::compute_heatmap(
+                &rpm,
+                rf,
+                &lambda,
+                lf,
+                &throttle,
+                tf,
+                20,
+                0.,
+                351.680,
+                32,
+                Some((0.7, 1.2)),
+                1.,
+                0.,
+                1.,
+                0.,
+                1.,
+                0.,
+                0.15,
+                Some(0.5),
+            );
+            assert_eq!(map.triples.len(), expected);
+            let bands = super::ColorBands::default();
+            let mut counts = vec![0; bands.len()];
+            for &(_, _, v, _) in &map.triples {
+                counts[bands.index(v)] += 1;
+            }
+            assert_eq!(&counts[1..12], &[low, 3, 3, 2, 1, 1, 0, 1, 4, 6, 6]);
+        }
+    }
+    #[test]
+    fn display_bounds_do_not_filter_statistics_and_delay_stays_inside_range() {
+        let map = super::compute_heatmap(
+            &[1000.; 4],
+            1,
+            &[1., 2., 3., 4.],
+            1,
+            &[0., 10., 20., 30.],
+            1,
+            1,
+            0.,
+            4.,
+            2,
+            Some((0.7, 1.2)),
+            1.,
+            0.,
+            1.,
+            0.,
+            1.,
+            0.,
+            1.,
+            None,
+        );
+        assert_eq!(
+            map.triples,
+            [
+                (1000., 2., 0., 0.),
+                (1000., 3., 10., 1.),
+                (1000., 4., 20., 2.)
+            ]
+        );
+        assert!(map.cells.iter().all(|c| c.count == 0));
+    }
 }

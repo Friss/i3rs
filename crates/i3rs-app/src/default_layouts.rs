@@ -14,7 +14,9 @@ use crate::panels::gauge::GaugeStyle;
 use crate::panels::graph::GraphPanel;
 use crate::panels::histogram::HistogramPanel;
 use crate::panels::mixture_map::MixtureMapPanel;
+use crate::panels::report::ReportPanel;
 use crate::panels::scatter::ScatterPanel;
+use crate::panels::track_map::TrackMapPanel;
 use crate::panels::utils::create_plotted_channel;
 use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState, YAxis};
 
@@ -483,6 +485,9 @@ fn build_mixture_map_panel(
     let value_idx = find_first_channel(ld, value_names)?;
     let mut panel = MixtureMapPanel::new(next_panel_id(shared), title);
     panel.bins = bins;
+    panel.scatter_mode = true;
+    panel.sensor_delay = 0.15;
+    panel.minimum_y = Some(0.5);
     panel.x_channel = make_plotted_channel(shared, x_idx, CHANNEL_COLORS[0], 0);
     panel.y_channel = make_plotted_channel(shared, y_idx, CHANNEL_COLORS[1], 1);
     panel.value_channel = make_plotted_channel(shared, value_idx, CHANNEL_COLORS[2], 2);
@@ -600,8 +605,17 @@ fn build_oil_pressure_worksheet(
     });
 
     match (scatter, graph) {
-        (Some(panel), _) => Some((
-            "Oil Pressure".to_string(),
+        (Some(panel), Some(graph)) => {
+            let mut dock = DockState::new(vec![PanelTab::Scatter(panel)]);
+            dock.main_surface_mut().split_below(
+                NodeIndex::root(),
+                0.78,
+                vec![PanelTab::Graph(graph)],
+            );
+            Some(("Oil Pressure".into(), dock))
+        }
+        (Some(panel), None) => Some((
+            "Oil Pressure".into(),
             DockState::new(vec![PanelTab::Scatter(panel)]),
         )),
         (None, Some(panel)) => Some((
@@ -616,7 +630,7 @@ fn build_rpm_histo_worksheet(
     ld: &LdFile,
     shared: &mut SharedState,
 ) -> Option<(String, DockState<PanelTab>)> {
-    let histogram = build_histogram_panel(
+    let mut histogram = build_histogram_panel(
         ld,
         shared,
         "Engine Speed",
@@ -626,6 +640,11 @@ fn build_rpm_histo_worksheet(
         Some((0.0, 0.0)),
         10.0,
     );
+    if let Some(panel) = &mut histogram {
+        panel.percentage = true;
+        panel.color_channel = find_first_channel(ld, &["Throttle Position", "Throttle Pedal"])
+            .and_then(|idx| make_plotted_channel(shared, idx, CHANNEL_COLORS[2], 0));
+    }
     let graph = build_graph_panel(
         ld,
         shared,
@@ -686,6 +705,51 @@ pub fn create_default_worksheets(
     }
     if let Some(sheet) = build_rpm_histo_worksheet(ld, shared) {
         worksheets.push(sheet);
+    }
+    let has_gps = ld
+        .channels
+        .iter()
+        .any(|c| normalize_channel_name(&c.name).contains("gps latitude"))
+        && ld
+            .channels
+            .iter()
+            .any(|c| normalize_channel_name(&c.name).contains("gps longitude"));
+    if has_gps {
+        let mut map = TrackMapPanel::new(next_panel_id(shared), "Track Report");
+        map.home_worksheet = worksheets.len();
+        worksheets.push((
+            "Track Report".into(),
+            DockState::new(vec![PanelTab::TrackMap(map)]),
+        ));
+    }
+    let mut report = ReportPanel::new(next_panel_id(shared), "Channel Report");
+    for name in [
+        "Engine Speed",
+        "Vehicle Speed",
+        "Throttle Position",
+        "Engine Oil Pressure",
+        "Fuel Pressure",
+        "Coolant Temperature",
+        "Engine Oil Temperature",
+        "Exhaust Lambda Bank 1",
+        "Exhaust Lambda Bank 2",
+    ] {
+        if let Some(idx) = find_channel(ld, name) {
+            report.add_channel(ChannelId::Physical(idx), shared);
+        }
+    }
+    worksheets.push((
+        "Channel Report".into(),
+        DockState::new(vec![PanelTab::Report(report)]),
+    ));
+    if has_gps {
+        let mut sections = TrackMapPanel::new(next_panel_id(shared), "Section Times");
+        sections.section_times_only = true;
+        sections.home_worksheet = worksheets.len();
+        worksheets.push((
+            "Section Times".into(),
+            DockState::new(vec![PanelTab::TrackMap(sections)]),
+        ));
     }
     if let Some(sheet) = build_graph_worksheet(ld, shared, &SPARE_WORKSHEET) {
         worksheets.push(sheet);

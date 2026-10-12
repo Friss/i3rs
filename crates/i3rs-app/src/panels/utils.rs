@@ -42,7 +42,7 @@ pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> Chan
                     ch.name.clone(),
                     ch.unit.clone(),
                     ch.freq,
-                    ch.dec_places,
+                    ch.display_decimals as i16,
                     Arc::clone(&ch.enum_labels),
                 )
             } else {
@@ -155,37 +155,61 @@ pub fn display_transform_fingerprint(channel: &PlottedChannel) -> DisplayTransfo
 
 /// Interpolate a channel value at a given time using linear interpolation.
 pub fn interp_at_time(data: &[f64], freq: u16, time: f64) -> Option<f64> {
-    if freq == 0 || data.is_empty() {
-        return None;
-    }
-    let sample_f = time * freq as f64;
-    let idx = sample_f as usize;
-    if idx >= data.len() {
-        return None;
-    }
-    if idx + 1 < data.len() {
-        let frac = sample_f - idx as f64;
-        Some(data[idx] * (1.0 - frac) + data[idx + 1] * frac)
-    } else {
-        Some(data[idx])
-    }
+    i3rs_core::analysis::sample_at_time(data, freq, time)
 }
 
-/// Extract visible data slice based on zoom range, filtering out non-finite values.
-pub fn get_visible_slice(data: &[f64], freq: u16, shared: &SharedState) -> Vec<f64> {
-    if let Some((t0, t1)) = shared.zoom_range {
-        let start = (t0 * freq as f64).floor() as usize;
-        let end = (t1 * freq as f64).ceil() as usize;
-        let start = start.min(data.len());
-        let end = end.min(data.len());
-        data[start..end]
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect()
-    } else {
-        data.iter().copied().filter(|v| v.is_finite()).collect()
-    }
+/// Shared searchable picker for analysis channel roles, including math channels.
+pub fn channel_picker(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    selected: &mut Option<ChannelId>,
+    filter: &mut String,
+    shared: &SharedState,
+) -> bool {
+    let previous = *selected;
+    let name = selected
+        .map(|id| resolve_channel_meta(id, shared).0)
+        .unwrap_or_else(|| "None".into());
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(name)
+        .width(170.0)
+        .show_ui(ui, |ui| {
+            ui.text_edit_singleline(filter);
+            let query = filter.to_lowercase();
+            ui.selectable_value(selected, None, "None");
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    if let Some(ld) = &shared.ld_file {
+                        for ch in &ld.channels {
+                            if ch.name.to_lowercase().contains(&query) {
+                                ui.selectable_value(
+                                    selected,
+                                    Some(ChannelId::Physical(ch.index)),
+                                    &ch.name,
+                                );
+                            }
+                        }
+                    }
+                    for (idx, ch) in shared.math_channels.iter().enumerate() {
+                        if ch.name.to_lowercase().contains(&query) {
+                            ui.selectable_value(
+                                selected,
+                                Some(ChannelId::Math(idx)),
+                                format!("{} (math)", ch.name),
+                            );
+                        }
+                    }
+                });
+        });
+    *selected != previous
+}
+
+/// Sample positions in [start, end). Never include a position before a beacon.
+pub fn sample_range(len: usize, freq: u16, range: (f64, f64)) -> std::ops::Range<usize> {
+    let start = (range.0 * freq as f64).ceil().max(0.0) as usize;
+    let end = (range.1 * freq as f64).ceil().max(0.0) as usize;
+    start.min(len)..end.min(len).max(start.min(len))
 }
 
 /// Load raw channel data from a ChannelId, returning the immutable shared sample buffer.

@@ -1,15 +1,12 @@
 //! Shared application state accessible by all panels.
 
 use eframe::egui;
-use i3rs_core::{
-    DownsampledPoint, Lap, LdFile, LdxFile, Sector, TrackData, downsample_minmax,
-    format_state_value, is_state_channel,
-};
+use i3rs_core::{Lap, LdFile, LdxFile, Sector, TrackData, format_state_value, is_state_channel};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Identifies a channel: either a physical channel from the .ld file or a math channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -83,6 +80,9 @@ impl PlottedChannelInfo {
 
     /// Format a value using file-parsed enum labels, falling back to hardcoded labels.
     pub fn format_value(&self, value: f64) -> Option<String> {
+        if !value.is_finite() {
+            return Some("---".into());
+        }
         if !self.enum_labels.is_empty() {
             let v = value.round() as i64;
             if let Some(label) = self.enum_labels.get(&v) {
@@ -156,87 +156,6 @@ pub struct DecodedChannel {
     pub stats: ChannelStats,
     #[allow(dead_code)]
     pub freq: u16,
-    lod_levels: RwLock<Vec<LodLevel>>,
-}
-
-#[derive(Clone)]
-pub struct LodLevel {
-    pub points: Arc<[DownsampledPoint]>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DownsampleSeriesKey {
-    pub data_ptr: usize,
-    pub data_len: usize,
-    pub freq: u16,
-    pub start_sample: usize,
-    pub end_sample: usize,
-    pub target_width: usize,
-}
-
-#[derive(Clone)]
-pub struct DownsampleSeriesRequest {
-    pub key: DownsampleSeriesKey,
-    pub data: Arc<[f64]>,
-    pub freq: u16,
-    pub start_sample: usize,
-    pub end_sample: usize,
-    pub target_width: usize,
-}
-
-impl DecodedChannel {
-    pub fn best_lod_level_for_view(
-        &self,
-        visible_sample_count: usize,
-        target_width: usize,
-    ) -> Option<LodLevel> {
-        if visible_sample_count == 0 || target_width == 0 || self.data.is_empty() {
-            return None;
-        }
-
-        self.ensure_lod_levels();
-
-        let desired_visible_points = target_width.saturating_mul(2) as f64;
-        let visible_fraction = visible_sample_count as f64 / self.data.len().max(1) as f64;
-
-        let levels = self.lod_levels.read().ok()?;
-        levels
-            .iter()
-            .filter_map(|level| {
-                let estimated_visible_points = level.points.len() as f64 * visible_fraction;
-                (estimated_visible_points >= desired_visible_points)
-                    .then_some((estimated_visible_points, level.clone()))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, level)| level)
-    }
-
-    fn ensure_lod_levels(&self) {
-        if let Ok(levels) = self.lod_levels.read()
-            && !levels.is_empty()
-        {
-            return;
-        }
-
-        if let Ok(mut levels) = self.lod_levels.write() {
-            if !levels.is_empty() {
-                return;
-            }
-
-            for &target_buckets in &[2_048usize, 8_192, 32_768, 131_072] {
-                if self.data.len() > target_buckets.saturating_mul(2) {
-                    levels.push(LodLevel {
-                        points: Arc::from(downsample_minmax(
-                            &self.data,
-                            self.freq,
-                            0,
-                            target_buckets,
-                        )),
-                    });
-                }
-            }
-        }
-    }
 }
 
 /// Compute min, max, avg, stddev for a slice of finite f64 values.
@@ -354,6 +273,7 @@ pub struct CachedChannelStats {
     pub name: String,
     pub color: egui::Color32,
     pub dec_places: i16,
+    pub unit: String,
     /// Full session stats.
     pub session: ChannelStats,
     /// Per-lap stats.
@@ -364,22 +284,30 @@ pub struct CachedChannelStats {
 pub struct ReportCache {
     /// Fingerprint: (channel_name, data_ptr, data_len, unit, scale_bits, offset_bits).
     fingerprint: Vec<(String, usize, usize, String, u64, u64)>,
-    lap_count: usize,
+    laps: Vec<(String, u64, u64)>,
     pub stats: Vec<CachedChannelStats>,
+    frequencies: Vec<u16>,
+}
+
+fn lap_fingerprint(laps: &[Lap]) -> Vec<(String, u64, u64)> {
+    laps.iter()
+        .map(|l| (l.name.clone(), l.start_time.to_bits(), l.end_time.to_bits()))
+        .collect()
 }
 
 impl ReportCache {
     pub fn new() -> Self {
         Self {
             fingerprint: Vec::new(),
-            lap_count: 0,
+            laps: Vec::new(),
             stats: Vec::new(),
+            frequencies: Vec::new(),
         }
     }
 
     /// Returns true if the cache is still valid for the current display state.
-    pub fn is_valid(&self, registry: &[PlottedChannelInfo], lap_count: usize) -> bool {
-        if self.lap_count != lap_count || self.fingerprint.len() != registry.len() {
+    pub fn is_valid(&self, registry: &[PlottedChannelInfo], laps: &[Lap]) -> bool {
+        if self.laps != lap_fingerprint(laps) || self.fingerprint.len() != registry.len() {
             return false;
         }
         for (i, info) in registry.iter().enumerate() {
@@ -392,6 +320,9 @@ impl ReportCache {
                 || unit != &info.unit
                 || scale_bits != info.display_scale.to_bits()
                 || offset_bits != info.display_offset.to_bits()
+                || self.stats[i].dec_places != info.dec_places
+                || self.stats[i].color != info.color
+                || self.frequencies[i] != info.freq
             {
                 return false;
             }
@@ -414,7 +345,8 @@ impl ReportCache {
                 )
             })
             .collect();
-        self.lap_count = laps.len();
+        self.laps = lap_fingerprint(laps);
+        self.frequencies = registry.iter().map(|info| info.freq).collect();
         self.stats.clear();
 
         for info in registry {
@@ -430,7 +362,7 @@ impl ReportCache {
             let mut per_lap = Vec::with_capacity(laps.len());
 
             for lap in laps {
-                let start_sample = (lap.start_time * freq as f64).floor() as usize;
+                let start_sample = (lap.start_time * freq as f64).ceil() as usize;
                 let end_sample = (lap.end_time * freq as f64).ceil() as usize;
                 let start = start_sample.min(info.data.len());
                 let end = end_sample.min(info.data.len());
@@ -451,6 +383,7 @@ impl ReportCache {
                 name: info.name.clone(),
                 color: info.color,
                 dec_places: info.dec_places,
+                unit: info.unit.clone(),
                 session,
                 per_lap,
             });
@@ -473,6 +406,8 @@ pub struct SharedState {
 
     // Cross-panel synchronization
     pub cursor_time: Option<f64>,
+    pub playback_active: bool,
+    pub playback_speed: f64,
     pub zoom_range: Option<(f64, f64)>,
     pub data_duration: Option<f64>,
     /// Set to true when the timeline (or other external control) changes the zoom.
@@ -499,11 +434,10 @@ pub struct SharedState {
     pub channel_preferences: HashMap<String, ChannelPreference>,
     pub channel_preferences_dirty: bool,
 
-    // Report cache
-    pub report_cache: ReportCache,
-
     // Track map: sectors and reference lap
     pub sectors: Vec<Sector>,
+    pub pending_track_definition: Option<i3rs_core::TrackDefinition>,
+    pub track_definition_error: Option<String>,
     pub reference_lap: Option<usize>,
 
     // Next panel ID counter
@@ -517,9 +451,6 @@ pub struct SharedState {
     requested_channel_decodes: RefCell<Vec<usize>>,
     pending_math_evaluations: RefCell<HashSet<u64>>,
     requested_math_evaluations: RefCell<Vec<u64>>,
-    downsampled_series_cache: RefCell<HashMap<DownsampleSeriesKey, Arc<[DownsampledPoint]>>>,
-    pending_downsampled_series: RefCell<HashSet<DownsampleSeriesKey>>,
-    requested_downsampled_series: RefCell<Vec<DownsampleSeriesRequest>>,
     track_data_cache: RefCell<Option<Arc<TrackData>>>,
     pending_track_data_build: RefCell<bool>,
     requested_track_data_build: RefCell<bool>,
@@ -538,6 +469,8 @@ impl SharedState {
             selected_lap: None,
             show_lap_markers: true,
             cursor_time: None,
+            playback_active: false,
+            playback_speed: 1.0,
             zoom_range: None,
             data_duration: None,
             zoom_from_timeline: false,
@@ -550,8 +483,9 @@ impl SharedState {
             channel_aliases: HashMap::new(),
             channel_preferences: HashMap::new(),
             channel_preferences_dirty: false,
-            report_cache: ReportCache::new(),
             sectors: Vec::new(),
+            pending_track_definition: None,
+            track_definition_error: None,
             reference_lap: None,
             next_panel_id: 1,
             next_math_channel_id: 1,
@@ -561,9 +495,6 @@ impl SharedState {
             requested_channel_decodes: RefCell::new(Vec::new()),
             pending_math_evaluations: RefCell::new(HashSet::new()),
             requested_math_evaluations: RefCell::new(Vec::new()),
-            downsampled_series_cache: RefCell::new(HashMap::new()),
-            pending_downsampled_series: RefCell::new(HashSet::new()),
-            requested_downsampled_series: RefCell::new(Vec::new()),
             track_data_cache: RefCell::new(None),
             pending_track_data_build: RefCell::new(false),
             requested_track_data_build: RefCell::new(false),
@@ -573,9 +504,6 @@ impl SharedState {
 
     pub fn invalidate_derived_caches(&mut self) {
         self.distance_axis_cache = None;
-        self.downsampled_series_cache.borrow_mut().clear();
-        self.pending_downsampled_series.borrow_mut().clear();
-        self.requested_downsampled_series.borrow_mut().clear();
     }
 
     pub fn invalidate_session_caches(&mut self) {
@@ -589,38 +517,6 @@ impl SharedState {
         *self.pending_track_data_build.borrow_mut() = false;
         *self.requested_track_data_build.borrow_mut() = false;
         *self.resolved_track_data_build.borrow_mut() = false;
-    }
-
-    pub fn downsampled_series_if_ready(
-        &self,
-        key: &DownsampleSeriesKey,
-    ) -> Option<Arc<[DownsampledPoint]>> {
-        self.downsampled_series_cache
-            .borrow()
-            .get(key)
-            .map(Arc::clone)
-    }
-
-    pub fn request_downsampled_series(&self, request: DownsampleSeriesRequest) {
-        if self
-            .downsampled_series_cache
-            .borrow()
-            .contains_key(&request.key)
-        {
-            return;
-        }
-
-        let mut pending = self.pending_downsampled_series.borrow_mut();
-        if !pending.insert(request.key.clone()) {
-            return;
-        }
-
-        self.requested_downsampled_series.borrow_mut().push(request);
-    }
-
-    pub fn take_requested_downsampled_series(&self) -> Vec<DownsampleSeriesRequest> {
-        let mut requested = self.requested_downsampled_series.borrow_mut();
-        std::mem::take(&mut *requested)
     }
 
     pub fn request_math_channel_evaluation_by_id(&self, math_id: u64) {
@@ -675,21 +571,6 @@ impl SharedState {
         self.math_channels.iter().position(|mc| mc.id == math_id)
     }
 
-    pub fn store_downsampled_series(
-        &self,
-        key: DownsampleSeriesKey,
-        points: Vec<DownsampledPoint>,
-    ) {
-        self.pending_downsampled_series.borrow_mut().remove(&key);
-        self.downsampled_series_cache
-            .borrow_mut()
-            .insert(key, Arc::from(points));
-    }
-
-    pub fn cancel_downsampled_series(&self, key: &DownsampleSeriesKey) {
-        self.pending_downsampled_series.borrow_mut().remove(key);
-    }
-
     pub fn track_data_if_ready(&self) -> Option<Arc<TrackData>> {
         self.track_data_cache.borrow().as_ref().map(Arc::clone)
     }
@@ -717,10 +598,59 @@ impl SharedState {
         *self.pending_track_data_build.borrow()
     }
 
-    pub fn store_track_data(&self, track_data: Option<TrackData>) {
+    pub fn store_track_data(&mut self, track_data: Option<TrackData>) {
         *self.pending_track_data_build.borrow_mut() = false;
         *self.resolved_track_data_build.borrow_mut() = true;
         *self.track_data_cache.borrow_mut() = track_data.map(Arc::new);
+        self.apply_pending_track_definition();
+    }
+
+    pub fn apply_pending_track_definition(&mut self) {
+        if let Some(track) = self.track_data_if_ready()
+            && let Some(definition) = self.pending_track_definition.take()
+        {
+            match i3rs_core::import_track_definition(&track, &definition) {
+                Ok(sectors) => {
+                    self.sectors = sectors;
+                    self.track_definition_error = None;
+                }
+                Err(error) => {
+                    self.sectors.clear();
+                    self.track_definition_error = Some(error);
+                }
+            }
+        }
+    }
+
+    /// Hovering a stationary pointer must not override the playback clock.
+    pub fn set_hover_cursor(&mut self, time: f64) {
+        if !self.playback_active {
+            self.cursor_time = Some(time);
+        }
+    }
+
+    pub fn advance_playback(&mut self, elapsed: f64) {
+        if !self.playback_active {
+            return;
+        }
+        let (start, end) = self
+            .zoom_range
+            .unwrap_or((0.0, self.data_duration.unwrap_or(0.0)));
+        if !start.is_finite() || !end.is_finite() || end <= start {
+            self.playback_active = false;
+            return;
+        }
+        let time = self
+            .cursor_time
+            .filter(|t| t.is_finite())
+            .unwrap_or(start)
+            .clamp(start, end);
+        let next =
+            (time + elapsed.clamp(0.0, 0.25) * self.playback_speed.clamp(0.1, 16.0)).min(end);
+        self.cursor_time = Some(next);
+        if next >= end {
+            self.playback_active = false;
+        }
     }
 
     pub fn cancel_track_data_build(&self) {
@@ -777,7 +707,6 @@ impl SharedState {
                 data: Arc::from(data),
                 stats,
                 freq,
-                lod_levels: RwLock::new(Vec::new()),
             }),
         );
     }
@@ -792,6 +721,24 @@ impl SharedState {
 #[cfg(test)]
 mod tests {
     use super::SharedState;
+
+    #[test]
+    fn playback_respects_range_speed_and_hover_and_stops_at_end() {
+        let mut shared = SharedState::new();
+        shared.zoom_range = Some((10.0, 11.0));
+        shared.playback_active = true;
+        shared.playback_speed = 2.0;
+        shared.advance_playback(0.2);
+        assert_eq!(shared.cursor_time, Some(10.4));
+        shared.set_hover_cursor(99.0);
+        assert_eq!(shared.cursor_time, Some(10.4));
+        shared.advance_playback(0.2);
+        shared.advance_playback(0.2);
+        assert_eq!(shared.cursor_time, Some(11.0));
+        assert!(!shared.playback_active);
+        shared.set_hover_cursor(10.5);
+        assert_eq!(shared.cursor_time, Some(10.5));
+    }
 
     #[test]
     fn canceled_channel_decode_can_be_requested_again() {

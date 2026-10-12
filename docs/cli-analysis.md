@@ -22,7 +22,9 @@ i3rs laps session.ld --source auto --format json
 sample-rate counts, and `.ldx` sidecar metadata when present.
 
 `channels` reports channel index, name, unit, sample rate, sample count, data
-type, decimal places, duration, and enum labels.
+type, scaling decimal places, display decimal places, duration, and enum labels.
+Invalid logger samples are preserved at their original timestamps and emitted as
+JSON `null` (or empty CSV cells); statistics exclude them from finite-value counts.
 
 `laps` reports lap number, display name, start time, end time, and duration.
 `--source auto` uses the same `.ld` lap detection as the app and includes `.ldx`

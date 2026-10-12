@@ -2,11 +2,18 @@
 
 use eframe::egui;
 
-use crate::state::SharedState;
+use super::utils::{
+    build_plotted_channel_info, channel_picker, create_plotted_channel, refresh_plotted_channel,
+    resolve_plotted_channel_display_meta, show_plotted_channel_display_menu,
+};
+use crate::state::{ChannelId, PlottedChannel, ReportCache, SharedState};
 
 pub struct ReportPanel {
     pub id: u64,
     pub title: String,
+    pub channels: Vec<PlottedChannel>,
+    cache: ReportCache,
+    filter: String,
 }
 
 impl ReportPanel {
@@ -14,26 +21,106 @@ impl ReportPanel {
         Self {
             id,
             title: title.into(),
+            channels: Vec::new(),
+            cache: ReportCache::new(),
+            filter: String::new(),
         }
     }
 
-    pub fn ui(&self, ui: &mut egui::Ui, shared: &mut SharedState) {
-        if shared.display_channel_registry.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.label("Plot some channels to see statistics");
-            });
+    pub fn add_channel(&mut self, id: ChannelId, shared: &SharedState) {
+        if !self.channels.iter().any(|c| c.channel_id == id)
+            && let Some(pc) = create_plotted_channel(id, shared, self.channels.len())
+        {
+            self.channels.push(pc);
+        }
+    }
+
+    pub fn clear_channels(&mut self) {
+        self.channels.clear();
+        self.cache = ReportCache::new();
+    }
+
+    pub fn copy_visible_channels(&mut self, shared: &SharedState) {
+        for info in &shared.display_channel_registry {
+            let id = shared
+                .ld_file
+                .as_ref()
+                .and_then(|ld| ld.find_channel_by_name(&info.name))
+                .map(|ch| ChannelId::Physical(ch.index))
+                .or_else(|| {
+                    shared
+                        .math_channels
+                        .iter()
+                        .position(|ch| ch.name == info.name)
+                        .map(ChannelId::Math)
+                });
+            if let Some(id) = id {
+                self.add_channel(id, shared);
+            }
+        }
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
+        if let Some(id) = shared.pending_toggle_channel.take() {
+            if self.channels.iter().any(|c| c.channel_id == id) {
+                self.channels.retain(|c| c.channel_id != id);
+            } else {
+                self.add_channel(id, shared);
+            }
+        }
+        if shared.dragging_channel.is_some()
+            && ui.input(|i| i.pointer.any_released())
+            && ui.ui_contains_pointer()
+            && let Some(id) = shared.dragging_channel.take()
+        {
+            self.add_channel(id, shared);
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Add channel:");
+            let mut selected = None;
+            channel_picker(
+                ui,
+                ("report_add", self.id),
+                &mut selected,
+                &mut self.filter,
+                shared,
+            );
+            if let Some(id) = selected {
+                self.add_channel(id, shared);
+            }
+            let mut remove = None;
+            for (idx, pc) in self.channels.iter_mut().enumerate() {
+                refresh_plotted_channel(pc, shared);
+                let name = resolve_plotted_channel_display_meta(pc, shared).0;
+                let (button, clear) =
+                    super::utils::segmented_channel_button(ui, &name, None, "Remove from report");
+                button.context_menu(|ui| {
+                    if show_plotted_channel_display_menu(ui, pc, shared) {
+                        remove = Some(idx);
+                    }
+                });
+                if clear {
+                    remove = Some(idx);
+                }
+            }
+            if let Some(idx) = remove {
+                self.channels.remove(idx);
+            }
+        });
+        ui.separator();
+        if self.channels.is_empty() {
+            ui.label("Add or drop channels to build this report");
             return;
         }
-
-        // Rebuild cache if channels or laps changed
-        if !shared
-            .report_cache
-            .is_valid(&shared.display_channel_registry, shared.laps.len())
-        {
-            shared
-                .report_cache
-                .rebuild(&shared.display_channel_registry, &shared.laps);
+        let registry: Vec<_> = self
+            .channels
+            .iter()
+            .map(|pc| build_plotted_channel_info(pc, shared))
+            .collect();
+        if !self.cache.is_valid(&registry, &shared.laps) {
+            self.cache.rebuild(&registry, &shared.laps);
         }
+        shared.plotted_channel_registry.extend(registry);
 
         egui::ScrollArea::both()
             .auto_shrink([false, false])
@@ -52,16 +139,19 @@ impl ReportPanel {
                         ui.strong("StdDev");
                         ui.end_row();
 
-                        for cached in &shared.report_cache.stats {
+                        for cached in &self.cache.stats {
                             let dec = cached.dec_places.max(0) as usize;
                             let session = cached.session;
 
-                            ui.colored_label(cached.color, &cached.name);
+                            ui.colored_label(
+                                cached.color,
+                                format!("{} [{}]", cached.name, cached.unit),
+                            );
                             ui.label("All");
-                            ui.monospace(format!("{:.prec$}", session.min, prec = dec));
-                            ui.monospace(format!("{:.prec$}", session.max, prec = dec));
-                            ui.monospace(format!("{:.prec$}", session.avg, prec = dec));
-                            ui.monospace(format!("{:.prec$}", session.stddev, prec = dec));
+                            ui.monospace(format_stat(session.min, dec));
+                            ui.monospace(format_stat(session.max, dec));
+                            ui.monospace(format_stat(session.avg, dec));
+                            ui.monospace(format_stat(session.stddev, dec));
                             ui.end_row();
 
                             // Per-lap stats
@@ -78,14 +168,22 @@ impl ReportPanel {
                                 } else {
                                     ui.label(label);
                                 }
-                                ui.monospace(format!("{:.prec$}", lap_stats.min, prec = dec));
-                                ui.monospace(format!("{:.prec$}", lap_stats.max, prec = dec));
-                                ui.monospace(format!("{:.prec$}", lap_stats.avg, prec = dec));
-                                ui.monospace(format!("{:.prec$}", lap_stats.stddev, prec = dec));
+                                ui.monospace(format_stat(lap_stats.min, dec));
+                                ui.monospace(format_stat(lap_stats.max, dec));
+                                ui.monospace(format_stat(lap_stats.avg, dec));
+                                ui.monospace(format_stat(lap_stats.stddev, dec));
                                 ui.end_row();
                             }
                         }
                     });
             });
+    }
+}
+
+fn format_stat(value: f64, decimals: usize) -> String {
+    if value.is_finite() {
+        format!("{value:.decimals$}")
+    } else {
+        "—".into()
     }
 }
