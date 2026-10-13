@@ -12,6 +12,9 @@ use std::collections::HashMap;
 /// For recognized channels with an unmapped numeric value, returns
 /// the raw integer as a string (e.g. "34").
 pub fn format_state_value(channel_name: &str, value: f64) -> Option<String> {
+    if !value.is_finite() {
+        return None;
+    }
     let v = value.round() as i64;
     let name = channel_name.trim();
 

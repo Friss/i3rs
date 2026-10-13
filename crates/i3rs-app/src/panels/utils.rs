@@ -16,6 +16,29 @@ static EMPTY_ENUM_LABELS: LazyLock<Arc<HashMap<i64, String>>> =
     LazyLock::new(|| Arc::new(HashMap::new()));
 static EMPTY_SAMPLES: LazyLock<Arc<[f64]>> = LazyLock::new(|| Arc::from(Vec::<f64>::new()));
 
+/// Discrete (enum/state) channels show labels and are never interpolated.
+pub fn uses_discrete_values(name: &str, enum_labels: &HashMap<i64, String>) -> bool {
+    !enum_labels.is_empty() || i3rs_core::is_state_channel(name)
+}
+
+/// Format a value using file-parsed enum labels, falling back to hardcoded labels.
+pub fn format_enum_value(
+    name: &str,
+    enum_labels: &HashMap<i64, String>,
+    value: f64,
+) -> Option<String> {
+    if !value.is_finite() {
+        return Some("---".into());
+    }
+    if !enum_labels.is_empty() {
+        let v = value.round() as i64;
+        if let Some(label) = enum_labels.get(&v) {
+            return Some(label.clone());
+        }
+    }
+    i3rs_core::format_state_value(name, value)
+}
+
 #[derive(Clone, Copy)]
 pub struct DisplayUnitPreset {
     pub label: &'static str,
@@ -42,7 +65,7 @@ pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> Chan
                     ch.name.clone(),
                     ch.unit.clone(),
                     ch.freq,
-                    ch.dec_places,
+                    ch.display_decimals as i16,
                     Arc::clone(&ch.enum_labels),
                 )
             } else {
@@ -155,37 +178,60 @@ pub fn display_transform_fingerprint(channel: &PlottedChannel) -> DisplayTransfo
 
 /// Interpolate a channel value at a given time using linear interpolation.
 pub fn interp_at_time(data: &[f64], freq: u16, time: f64) -> Option<f64> {
-    if freq == 0 || data.is_empty() {
-        return None;
-    }
-    let sample_f = time * freq as f64;
-    let idx = sample_f as usize;
-    if idx >= data.len() {
-        return None;
-    }
-    if idx + 1 < data.len() {
-        let frac = sample_f - idx as f64;
-        Some(data[idx] * (1.0 - frac) + data[idx + 1] * frac)
-    } else {
-        Some(data[idx])
-    }
+    i3rs_core::analysis::sample_at_time(data, freq, time)
 }
 
-/// Extract visible data slice based on zoom range, filtering out non-finite values.
-pub fn get_visible_slice(data: &[f64], freq: u16, shared: &SharedState) -> Vec<f64> {
-    if let Some((t0, t1)) = shared.zoom_range {
-        let start = (t0 * freq as f64).floor() as usize;
-        let end = (t1 * freq as f64).ceil() as usize;
-        let start = start.min(data.len());
-        let end = end.min(data.len());
-        data[start..end]
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect()
-    } else {
-        data.iter().copied().filter(|v| v.is_finite()).collect()
-    }
+/// Shared searchable picker for analysis channel roles, including math channels.
+pub fn channel_picker(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    selected: &mut Option<ChannelId>,
+    filter: &mut String,
+    shared: &SharedState,
+) -> bool {
+    let previous = *selected;
+    let name = selected
+        .map(|id| resolve_channel_meta(id, shared).0)
+        .unwrap_or_else(|| "None".into());
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(name)
+        .width(170.0)
+        .show_ui(ui, |ui| {
+            ui.text_edit_singleline(filter);
+            let query = filter.to_lowercase();
+            ui.selectable_value(selected, None, "None");
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    if let Some(ld) = &shared.ld_file {
+                        for ch in &ld.channels {
+                            if ch.name.to_lowercase().contains(&query) {
+                                ui.selectable_value(
+                                    selected,
+                                    Some(ChannelId::Physical(ch.index)),
+                                    &ch.name,
+                                );
+                            }
+                        }
+                    }
+                    for (idx, ch) in shared.math_channels.iter().enumerate() {
+                        if ch.name.to_lowercase().contains(&query) {
+                            ui.selectable_value(
+                                selected,
+                                Some(ChannelId::Math(idx)),
+                                format!("{} (math)", ch.name),
+                            );
+                        }
+                    }
+                });
+        });
+    *selected != previous
+}
+
+/// Sample positions in [start, end). Never include a position before a beacon.
+pub fn sample_range(len: usize, freq: u16, range: (f64, f64)) -> std::ops::Range<usize> {
+    let window = i3rs_core::analysis::sample_window_for_time(freq, len, range.0, range.1);
+    window.start_sample..window.end_sample
 }
 
 /// Load raw channel data from a ChannelId, returning the immutable shared sample buffer.
@@ -298,6 +344,7 @@ pub fn build_plotted_channel_info(
     let (name, unit, freq, dec_places, enum_labels) =
         resolve_plotted_channel_display_meta(channel, shared);
     PlottedChannelInfo {
+        channel_id: channel.channel_id,
         name,
         unit,
         freq,

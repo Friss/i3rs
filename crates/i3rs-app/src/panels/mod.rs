@@ -2,9 +2,11 @@
 
 pub mod channel_browser;
 pub mod cursor_readout;
+pub mod distribution;
 pub mod fft;
 pub mod gauge;
 pub mod graph;
+mod graph_line;
 pub mod histogram;
 pub mod math_editor;
 pub mod mixture_map;

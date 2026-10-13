@@ -2,6 +2,7 @@
 name = "i3rs-app"
 version.workspace = true
 edition.workspace = true
+rust-version = "1.95"
 authors.workspace = true
 license.workspace = true
 homepage.workspace = true

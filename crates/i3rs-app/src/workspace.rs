@@ -34,6 +34,8 @@ pub struct WorkspaceFile {
     #[serde(default)]
     pub sectors: Vec<Sector>,
     #[serde(default)]
+    pub track_definition: Option<i3rs_core::TrackDefinition>,
+    #[serde(default)]
     pub reference_lap: Option<usize>,
 }
 
@@ -65,6 +67,8 @@ pub enum PanelConfig {
 
 #[derive(Serialize, Deserialize)]
 pub struct GraphPanelConfig {
+    #[serde(default)]
+    pub full_resolution: bool,
     pub id: u64,
     pub title: String,
     pub channel_names: Vec<String>,
@@ -142,6 +146,36 @@ pub struct GraphDisplayTransformConfig {
     pub scale_manual: Option<(f64, f64)>,
 }
 
+impl Default for GraphDisplayTransformConfig {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            offset: 0.0,
+            unit: None,
+            scale_manual: None,
+        }
+    }
+}
+
+impl GraphDisplayTransformConfig {
+    fn of(pc: &crate::state::PlottedChannel) -> Self {
+        Self {
+            scale: pc.display_scale,
+            offset: pc.display_offset,
+            unit: pc.display_unit.clone(),
+            scale_manual: (pc.scale_mode == crate::state::ScaleMode::Manual)
+                .then_some((pc.manual_min, pc.manual_max)),
+        }
+    }
+
+    fn apply_to(&self, pc: &mut crate::state::PlottedChannel) {
+        pc.display_scale = self.scale;
+        pc.display_offset = self.offset;
+        pc.display_unit = self.unit.clone();
+        apply_saved_scale_limits(pc, self.scale_manual);
+    }
+}
+
 fn apply_saved_scale_limits(
     channel: &mut crate::state::PlottedChannel,
     scale_manual: Option<(f64, f64)>,
@@ -164,6 +198,44 @@ fn apply_saved_scale_limits(
 pub struct ReportPanelConfig {
     pub id: u64,
     pub title: String,
+    #[serde(default)]
+    pub channels: Vec<AnalysisChannelConfig>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AnalysisChannelConfig {
+    pub name: String,
+    pub is_math: bool,
+    pub color: [u8; 3],
+    pub transform: GraphDisplayTransformConfig,
+}
+
+fn save_analysis_channel(
+    pc: &crate::state::PlottedChannel,
+    shared: &SharedState,
+) -> Option<AnalysisChannelConfig> {
+    let (name, is_math) = channel_name_and_kind(pc.channel_id, shared)?;
+    Some(AnalysisChannelConfig {
+        name,
+        is_math,
+        color: [pc.color.r(), pc.color.g(), pc.color.b()],
+        transform: GraphDisplayTransformConfig::of(pc),
+    })
+}
+
+fn load_analysis_channel(
+    c: &AnalysisChannelConfig,
+    shared: &SharedState,
+) -> Option<crate::state::PlottedChannel> {
+    let mut pc = resolve_saved_plotted_channel(
+        shared,
+        &c.name,
+        c.is_math,
+        eframe::egui::Color32::from_rgb(c.color[0], c.color[1], c.color[2]),
+        0,
+    )?;
+    c.transform.apply_to(&mut pc);
+    Some(pc)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -171,6 +243,14 @@ pub struct TrackMapPanelConfig {
     pub id: u64,
     pub title: String,
     pub color_channel_name: Option<String>,
+    #[serde(default)]
+    pub section_times_only: bool,
+    #[serde(default = "default_track_annotations")]
+    pub show_annotations: bool,
+}
+
+fn default_track_annotations() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]
@@ -179,6 +259,12 @@ pub struct HistogramPanelConfig {
     pub title: String,
     pub bin_count: usize,
     pub per_lap: bool,
+    #[serde(default)]
+    pub percentage: bool,
+    #[serde(default)]
+    pub color_channel: Option<AnalysisChannelConfig>,
+    #[serde(default)]
+    pub color_bands: crate::panels::distribution::ColorBands,
     #[serde(default)]
     pub lock_x_range: bool,
     #[serde(default)]
@@ -250,6 +336,14 @@ pub struct MixtureMapPanelConfig {
     pub title: String,
     pub bins: usize,
     #[serde(default)]
+    pub scatter_mode: bool,
+    #[serde(default)]
+    pub sensor_delay: f64,
+    #[serde(default)]
+    pub minimum_y: Option<f64>,
+    #[serde(default)]
+    pub color_bands: crate::panels::distribution::ColorBands,
+    #[serde(default)]
     pub x_channel_name: Option<String>,
     #[serde(default)]
     pub y_channel_name: Option<String>,
@@ -316,9 +410,7 @@ fn resolve_saved_plotted_channel(
         let channel_idx = shared
             .ld_file
             .as_ref()?
-            .channels
-            .iter()
-            .find(|channel| channel.name == channel_name)?
+            .find_channel_by_name(channel_name)?
             .index;
         let mut plotted =
             create_plotted_channel(ChannelId::Physical(channel_idx), shared, tile_group)?;
@@ -377,17 +469,7 @@ pub fn save_workspace(
                         let display_transforms: Vec<GraphDisplayTransformConfig> = g
                             .plotted_channels
                             .iter()
-                            .map(|pc| GraphDisplayTransformConfig {
-                                scale: pc.display_scale,
-                                offset: pc.display_offset,
-                                unit: pc.display_unit.clone(),
-                                scale_manual: match pc.scale_mode {
-                                    crate::state::ScaleMode::Manual => {
-                                        Some((pc.manual_min, pc.manual_max))
-                                    }
-                                    crate::state::ScaleMode::Auto => None,
-                                },
-                            })
+                            .map(GraphDisplayTransformConfig::of)
                             .collect();
                         let overlays: Vec<GraphOverlayConfig> = g
                             .lap_overlays
@@ -428,6 +510,7 @@ pub fn save_workspace(
                             })
                             .collect();
                         PanelConfig::Graph(GraphPanelConfig {
+                            full_resolution: g.full_resolution,
                             id: g.id,
                             title: g.title.clone(),
                             channel_names,
@@ -461,6 +544,8 @@ pub fn save_workspace(
                             id: t.id,
                             title: t.title.clone(),
                             color_channel_name,
+                            section_times_only: t.section_times_only,
+                            show_annotations: t.show_annotations,
                         })
                     }
                     PanelTab::ChannelBrowser => PanelConfig::ChannelBrowser,
@@ -468,12 +553,23 @@ pub fn save_workspace(
                     PanelTab::Report(r) => PanelConfig::Report(ReportPanelConfig {
                         id: r.id,
                         title: r.title.clone(),
+                        channels: r
+                            .channels
+                            .iter()
+                            .filter_map(|pc| save_analysis_channel(pc, shared))
+                            .collect(),
                     }),
                     PanelTab::Histogram(h) => PanelConfig::Histogram(HistogramPanelConfig {
                         id: h.id,
                         title: h.title.clone(),
                         bin_count: h.bin_count,
                         per_lap: h.per_lap,
+                        percentage: h.percentage,
+                        color_channel: h
+                            .color_channel
+                            .as_ref()
+                            .and_then(|pc| save_analysis_channel(pc, shared)),
+                        color_bands: h.color_bands,
                         lock_x_range: h.lock_x_range,
                         x_min: h.x_min,
                         x_max: h.x_max,
@@ -554,6 +650,10 @@ pub fn save_workspace(
                         id: m.id,
                         title: m.title.clone(),
                         bins: m.bins,
+                        scatter_mode: m.scatter_mode,
+                        sensor_delay: m.sensor_delay,
+                        minimum_y: m.minimum_y,
+                        color_bands: m.color_bands,
                         x_channel_name: m.x_channel.as_ref().and_then(|pc| {
                             channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
                         }),
@@ -630,6 +730,12 @@ pub fn save_workspace(
         math_channels,
         channel_aliases,
         sectors,
+        track_definition: shared
+            .track_data_if_ready()
+            .and_then(|track| {
+                i3rs_core::export_track_definition(&track, &shared.sectors, "Track sections".into())
+            })
+            .or_else(|| shared.pending_track_definition.clone()),
         reference_lap: shared.reference_lap,
     }
 }
@@ -638,10 +744,30 @@ pub fn save_workspace(
 // Conversion: WorkspaceFile → App state
 // ---------------------------------------------------------------------------
 
+/// Restore section identity before asynchronous math/layout restoration can wait.
+pub(crate) fn restore_track_sections(workspace: &WorkspaceFile, shared: &mut SharedState) {
+    shared.track_definition_error = None;
+    shared.pending_track_definition = workspace.track_definition.clone();
+    // Missing paths cannot establish recording identity (e.g. browser uploads).
+    let same_recording = workspace
+        .last_file_path
+        .as_deref()
+        .is_some_and(|saved| Some(saved) == shared.ld_path.as_ref().and_then(|p| p.to_str()));
+    // Legacy index-only sections are valid only for the original recording.
+    shared.sectors = if workspace.track_definition.is_none() && same_recording {
+        workspace.sectors.clone()
+    } else {
+        Vec::new()
+    };
+    shared.reference_lap = workspace.reference_lap.filter(|i| *i < shared.laps.len());
+    shared.apply_pending_track_definition();
+}
+
 pub fn load_workspace(
     workspace: &WorkspaceFile,
     shared: &mut SharedState,
 ) -> Vec<(String, DockState<PanelTab>)> {
+    restore_track_sections(workspace, shared);
     workspace
         .worksheets
         .iter()
@@ -661,6 +787,7 @@ pub fn load_workspace(
                             "Distance" => GraphXAxis::Distance,
                             _ => GraphXAxis::Time,
                         };
+                        graph.full_resolution = gc.full_resolution;
                         graph.reference_lap = gc.reference_lap;
                         graph.embedded_gauge_height = gc.embedded_gauge_height;
                         graph.tile_heights = gc.tile_heights.clone();
@@ -674,13 +801,9 @@ pub fn load_workspace(
                                 .map(|c| eframe::egui::Color32::from_rgb(c[0], c[1], c[2]))
                                 .unwrap_or(CHANNEL_COLORS[i % CHANNEL_COLORS.len()]);
                             let tile_group = gc.tile_groups.get(i).copied().unwrap_or(i);
-                            let display_transform = gc.display_transforms.get(i);
-                            let display_scale =
-                                display_transform.map(|cfg| cfg.scale).unwrap_or(1.0);
-                            let display_offset =
-                                display_transform.map(|cfg| cfg.offset).unwrap_or(0.0);
-                            let display_unit = display_transform.and_then(|cfg| cfg.unit.clone());
-                            let scale_manual = display_transform.and_then(|cfg| cfg.scale_manual);
+                            let identity = GraphDisplayTransformConfig::default();
+                            let display_transform =
+                                gc.display_transforms.get(i).unwrap_or(&identity);
 
                             if is_math {
                                 // Find math channel by name
@@ -695,9 +818,9 @@ pub fn load_workspace(
                                         data: data.clone(),
                                         tile_group,
                                         y_axis: crate::state::YAxis::Left,
-                                        display_scale,
-                                        display_offset,
-                                        display_unit: display_unit.clone(),
+                                        display_scale: 1.0,
+                                        display_offset: 0.0,
+                                        display_unit: None,
                                         scale_mode: crate::state::ScaleMode::Auto,
                                         manual_min: stats.min,
                                         manual_max: stats.max,
@@ -705,11 +828,11 @@ pub fn load_workspace(
                                         cached_max: stats.max,
                                         cached_avg: stats.avg,
                                     };
-                                    apply_saved_scale_limits(&mut plotted, scale_manual);
+                                    display_transform.apply_to(&mut plotted);
                                     graph.plotted_channels.push(plotted);
                                 }
                             } else if let Some(ld) = &shared.ld_file
-                                && let Some(ch) = ld.channels.iter().find(|c| &c.name == name)
+                                && let Some(ch) = ld.find_channel_by_name(name)
                                 && let Some(mut plotted) = create_plotted_channel(
                                     ChannelId::Physical(ch.index),
                                     shared,
@@ -719,10 +842,7 @@ pub fn load_workspace(
                                 plotted.color = color;
                                 plotted.tile_group = tile_group;
                                 plotted.y_axis = crate::state::YAxis::Left;
-                                plotted.display_scale = display_scale;
-                                plotted.display_offset = display_offset;
-                                plotted.display_unit = display_unit.clone();
-                                apply_saved_scale_limits(&mut plotted, scale_manual);
+                                display_transform.apply_to(&mut plotted);
                                 graph.plotted_channels.push(plotted);
                             }
                         }
@@ -736,9 +856,7 @@ pub fn load_workspace(
                                     .map(ChannelId::Math)
                             } else {
                                 shared.ld_file.as_ref().and_then(|ld| {
-                                    ld.channels
-                                        .iter()
-                                        .find(|channel| channel.name == gauge.channel_name)
+                                    ld.find_channel_by_name(&gauge.channel_name)
                                         .map(|channel| ChannelId::Physical(channel.index))
                                 })
                             };
@@ -780,11 +898,13 @@ pub fn load_workspace(
                     PanelConfig::TrackMap(tc) => {
                         let mut track_map = TrackMapPanel::new(tc.id, &tc.title);
                         track_map.home_worksheet = worksheet_idx;
+                        track_map.section_times_only = tc.section_times_only;
+                        track_map.show_annotations = tc.show_annotations;
                         // Resolve color channel by name
                         if let Some(ref color_name) = tc.color_channel_name
                             && let Some(ld) = &shared.ld_file
                             && let Some(idx) =
-                                ld.channels.iter().position(|ch| &ch.name == color_name)
+                                ld.find_channel_by_name(color_name).map(|ch| ch.index)
                         {
                             track_map.color_channel_idx = Some(idx);
                         }
@@ -796,7 +916,12 @@ pub fn load_workspace(
                     PanelConfig::ChannelBrowser => PanelTab::ChannelBrowser,
                     PanelConfig::CursorReadout => PanelTab::CursorReadout,
                     PanelConfig::Report(rc) => {
-                        let report = crate::panels::report::ReportPanel::new(rc.id, &rc.title);
+                        let mut report = crate::panels::report::ReportPanel::new(rc.id, &rc.title);
+                        report.channels = rc
+                            .channels
+                            .iter()
+                            .filter_map(|c| load_analysis_channel(c, shared))
+                            .collect();
                         if rc.id >= shared.next_panel_id {
                             shared.next_panel_id = rc.id + 1;
                         }
@@ -804,7 +929,13 @@ pub fn load_workspace(
                     }
                     PanelConfig::Histogram(hc) => {
                         let mut histogram = HistogramPanel::new(hc.id, &hc.title);
-                        histogram.bin_count = hc.bin_count;
+                        histogram.bin_count = hc.bin_count.clamp(5, 500);
+                        histogram.percentage = hc.percentage;
+                        histogram.color_bands = hc.color_bands.valid();
+                        histogram.color_channel = hc
+                            .color_channel
+                            .as_ref()
+                            .and_then(|c| load_analysis_channel(c, shared));
                         histogram.per_lap = hc.per_lap;
                         histogram.lock_x_range = hc.lock_x_range;
                         histogram.x_min = hc.x_min;
@@ -881,7 +1012,12 @@ pub fn load_workspace(
                     }
                     PanelConfig::MixtureMap(mc) => {
                         let mut mixture_map = MixtureMapPanel::new(mc.id, &mc.title);
-                        mixture_map.bins = mc.bins;
+                        mixture_map.bins = mc.bins.clamp(5, 100);
+                        mixture_map.scatter_mode = mc.scatter_mode;
+                        mixture_map.sensor_delay =
+                            crate::panels::mixture_map::normalized_sensor_delay(mc.sensor_delay);
+                        mixture_map.minimum_y = mc.minimum_y.filter(|v| v.is_finite());
+                        mixture_map.color_bands = mc.color_bands.valid();
                         if let Some(channel_name) = &mc.x_channel_name {
                             mixture_map.x_channel = resolve_saved_plotted_channel(
                                 shared,
@@ -988,6 +1124,99 @@ mod tests {
             cached_max: 100.0,
             cached_avg: 50.0,
         }
+    }
+
+    #[test]
+    fn circuit_panels_roundtrip_with_independent_report_channels() {
+        use super::*;
+        let mut shared = SharedState::new();
+        let mut channel =
+            shared.create_math_channel_def("Engine test".into(), "1".into(), "rpm".into(), 1);
+        channel.freq = 2;
+        channel.data = Some(Arc::from(vec![1000.0, 2000.0, 3000.0]));
+        shared.math_channels.push(channel);
+        let mut report = crate::panels::report::ReportPanel::new(1, "Independent report");
+        report.add_channel(ChannelId::Math(0), &shared);
+        let mut histogram = HistogramPanel::new(2, "RPM");
+        histogram.percentage = true;
+        histogram.channels.push(sample_channel());
+        histogram.channels[0].channel_id = ChannelId::Math(0);
+        histogram.color_channel = create_plotted_channel(ChannelId::Math(0), &shared, 0);
+        let mut mixture = MixtureMapPanel::new(3, "Mixture");
+        mixture.scatter_mode = true;
+        mixture.sensor_delay = 0.15;
+        mixture.minimum_y = Some(0.5);
+        let mut track = TrackMapPanel::new(4, "Section Times");
+        track.section_times_only = true;
+        let mut graph = GraphPanel::new(5, "Full samples");
+        graph.full_resolution = true;
+        let dock = DockState::new(vec![
+            PanelTab::Graph(graph),
+            PanelTab::Report(report),
+            PanelTab::Histogram(histogram),
+            PanelTab::MixtureMap(mixture),
+            PanelTab::TrackMap(track),
+        ]);
+        let saved = save_workspace(&[("Circuit".into(), &dock)], 0, &shared);
+        let json = serde_json::to_string(&saved).unwrap();
+        let decoded: WorkspaceFile = serde_json::from_str(&json).unwrap();
+        let loaded = load_workspace(&decoded, &mut shared);
+        assert!(shared.display_channel_registry.is_empty());
+        let tabs: Vec<_> = loaded[0].1.iter_all_tabs().map(|(_, tab)| tab).collect();
+        let report = tabs
+            .iter()
+            .find_map(|tab| {
+                if let PanelTab::Report(r) = tab {
+                    Some(r)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(report.channels.len(), 1);
+        assert_eq!(report.channels[0].channel_id, ChannelId::Math(0));
+        assert!(tabs.iter().any(
+            |t| matches!(t, PanelTab::Histogram(h) if h.percentage && h.color_channel.is_some())
+        ));
+        assert!(
+            tabs.iter()
+                .any(|t| matches!(t, PanelTab::MixtureMap(m) if m.scatter_mode && m.sensor_delay == 0.15 && m.minimum_y == Some(0.5) && m.color_bands.centered))
+        );
+        assert!(
+            tabs.iter()
+                .any(|t| matches!(t, PanelTab::TrackMap(t) if t.section_times_only))
+        );
+        assert!(
+            tabs.iter()
+                .any(|t| matches!(t, PanelTab::Graph(g) if g.full_resolution))
+        );
+        let old_graph: GraphPanelConfig = serde_json::from_str(
+            r#"{"id":1,"title":"Graph","channel_names":[],"colors":[],"graph_mode":"Tiled"}"#,
+        )
+        .unwrap();
+        assert!(!old_graph.full_resolution);
+        // Old workspace files remain readable without any new fields.
+        let legacy: WorkspaceFile =
+            serde_json::from_str(r#"{"worksheets":[],"active_worksheet":0,"last_file_path":null}"#)
+                .unwrap();
+        assert!(legacy.track_definition.is_none());
+    }
+
+    #[test]
+    fn legacy_section_indices_require_a_known_matching_recording() {
+        let mut shared = crate::state::SharedState::new();
+        let mut workspace: super::WorkspaceFile = serde_json::from_str(
+            r#"{"worksheets":[],"active_worksheet":0,"last_file_path":null,"sectors":[{"name":"Old","start_index":1,"end_index":2}]}"#,
+        ).unwrap();
+        super::restore_track_sections(&workspace, &mut shared);
+        assert!(shared.sectors.is_empty());
+        workspace.last_file_path = Some("original.ld".into());
+        shared.ld_path = Some("original.ld".into());
+        super::restore_track_sections(&workspace, &mut shared);
+        assert_eq!(shared.sectors.len(), 1);
+        shared.ld_path = Some("different.ld".into());
+        super::restore_track_sections(&workspace, &mut shared);
+        assert!(shared.sectors.is_empty());
     }
 
     #[test]

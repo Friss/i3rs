@@ -16,6 +16,10 @@ pub struct TrackData {
     /// GPS sample frequency (Hz).
     pub freq: u16,
     spatial_index: Option<TrackSpatialIndex>,
+    origin: Option<(f64, f64, f64)>,
+    pub distance: Option<(Vec<f64>, u16)>,
+    /// Corrected speed in metres per second, shared with distance integration.
+    pub corrected_speed: Option<(Vec<f64>, u16)>,
 }
 
 impl TrackData {
@@ -27,6 +31,9 @@ impl TrackData {
             time,
             freq,
             spatial_index,
+            origin: None,
+            distance: None,
+            corrected_speed: None,
         }
     }
 }
@@ -84,6 +91,9 @@ impl TrackSpatialIndex {
         };
 
         for (sample_idx, (&xv, &yv)) in x.iter().zip(y.iter()).enumerate() {
+            if !xv.is_finite() || !yv.is_finite() {
+                continue;
+            }
             let (col, row) = index.cell_coords(xv, yv);
             cells[index.cell_index(col, row)].push(sample_idx);
         }
@@ -211,6 +221,8 @@ pub struct Sector {
     pub start_index: usize,
     /// Index into GPS data where this sector ends (exclusive).
     pub end_index: usize,
+    #[serde(default)]
+    pub distance: Option<DistanceSection>,
 }
 
 /// Timing result for one sector in one lap.
@@ -227,53 +239,406 @@ pub struct SectorTime {
 /// Searches for channels matching "GPS Latitude" and "GPS Longitude" (case-insensitive,
 /// underscore/space/dot normalized). Returns None if either channel is missing.
 pub fn extract_gps_track(ld: &LdFile) -> Option<TrackData> {
-    let lat_ch = find_gps_channel(ld, &["latitude", "lat"])?;
-    let lon_ch = find_gps_channel(ld, &["longitude", "lon", "long"])?;
-
+    let (lat_ch, lon_ch) = gps_channels(ld)?;
     let lat_data = ld.read_channel_data(lat_ch)?;
     let lon_data = ld.read_channel_data(lon_ch)?;
+    let mut track = gps_track_from_samples(&lat_data, lat_ch.freq, &lon_data, lon_ch.freq)?;
+    attach_corrected_distance(&mut track, ld);
+    Some(track)
+}
 
-    let n = lat_data.len().min(lon_data.len());
-    if n == 0 {
+/// The latitude and longitude channels, when the log has both.
+pub fn gps_channels(ld: &LdFile) -> Option<(&crate::ChannelMeta, &crate::ChannelMeta)> {
+    Some((
+        find_gps_channel(ld, &["latitude", "lat"])?,
+        find_gps_channel(ld, &["longitude", "lon", "long"])?,
+    ))
+}
+
+/// Build a normalized track from decoded GPS samples, resampling longitude to
+/// the latitude rate.
+pub fn gps_track_from_samples(
+    lat: &[f64],
+    lat_freq: u16,
+    lon: &[f64],
+    lon_freq: u16,
+) -> Option<TrackData> {
+    if lat_freq == 0 || lon_freq == 0 {
         return None;
     }
+    let lon_at_lat_rate: Vec<f64> = (0..lat.len())
+        .map(|i| {
+            crate::analysis::sample_at_time(lon, lon_freq, i as f64 / lat_freq as f64)
+                .unwrap_or(f64::NAN)
+        })
+        .collect();
+    normalize_gps_samples(lat, &lon_at_lat_rate, lat_freq)
+}
 
-    let freq = lat_ch.freq;
+/// Attach corrected speed and the distance integrated from it.
+pub fn attach_corrected_distance(track: &mut TrackData, ld: &LdFile) {
+    track.corrected_speed = crate::distance::corrected_speed_from_ld(ld);
+    track.distance = track.corrected_speed.as_ref().and_then(|(speed, freq)| {
+        crate::distance::integrate_speed_series(speed, *freq, "m/s").map(|d| (d, *freq))
+    });
+}
 
-    // Compute mean latitude for cos correction
-    let mean_lat = lat_data.iter().filter(|v| v.is_finite()).sum::<f64>()
-        / lat_data.iter().filter(|v| v.is_finite()).count().max(1) as f64;
-    let cos_lat = (mean_lat.to_radians()).cos();
-
-    // Center and scale coordinates
-    let mean_lon = lon_data.iter().filter(|v| v.is_finite()).sum::<f64>()
-        / lon_data.iter().filter(|v| v.is_finite()).count().max(1) as f64;
-
-    let mut x = Vec::with_capacity(n);
-    let mut y = Vec::with_capacity(n);
-    let mut time = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let lat = lat_data[i];
-        let lon = lon_data[i];
-        if lat.is_finite() && lon.is_finite() {
-            x.push((lon - mean_lon) * cos_lat);
-            y.push(lat - mean_lat);
-            time.push(i as f64 / freq as f64);
-        } else {
-            // Preserve index alignment — use previous point or zero
-            if let (Some(&prev_x), Some(&prev_y)) = (x.last(), y.last()) {
-                x.push(prev_x);
-                y.push(prev_y);
-            } else {
-                x.push(0.0);
-                y.push(0.0);
-            }
-            time.push(i as f64 / freq as f64);
+fn normalize_gps_samples(lat: &[f64], lon: &[f64], freq: u16) -> Option<TrackData> {
+    let valid = |a: f64, b: f64| {
+        a.is_finite() && b.is_finite() && a.abs() <= 90.0 && b.abs() <= 180.0
+            // A paired zero is the receiver's no-fix sentinel. Either coordinate
+            // may legitimately be zero on its own (equator/prime meridian).
+            && (a != 0.0 || b != 0.0)
+    };
+    let mut sum_lat = 0.0;
+    let mut sum_lon = 0.0;
+    let mut count = 0;
+    for (&a, &b) in lat.iter().zip(lon) {
+        if valid(a, b) {
+            sum_lat += a;
+            sum_lon += b;
+            count += 1;
         }
     }
+    if count == 0 || freq == 0 {
+        return None;
+    }
+    let mean_lat = sum_lat / count as f64;
+    let mean_lon = sum_lon / count as f64;
+    let cos_lat = mean_lat.to_radians().cos();
+    let mut x = Vec::new();
+    let mut y = Vec::new();
+    let mut time = Vec::new();
+    for (i, (&a, &b)) in lat.iter().zip(lon).enumerate() {
+        // Preserve timestamps and sample indices without drawing a false line
+        // through a lost fix or making a missing fix selectable on the map.
+        x.push(if valid(a, b) {
+            (b - mean_lon) * cos_lat
+        } else {
+            f64::NAN
+        });
+        y.push(if valid(a, b) { a - mean_lat } else { f64::NAN });
+        time.push(i as f64 / freq as f64);
+    }
+    let mut track = TrackData::from_normalized_parts(x, y, time, freq);
+    track.origin = Some((mean_lat, mean_lon, cos_lat));
+    Some(track)
+}
 
-    Some(TrackData::from_normalized_parts(x, y, time, freq))
+/// Distance boundaries are stored as integer millimetres for stable cache keys.
+/// Laps within 5% of the model length are stretched to that length; other laps
+/// retain their measured distance. Wrapping sections include both sides of the beacon.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DistanceSection {
+    pub start_mm: u32,
+    pub end_mm: u32,
+    pub track_length_mm: u32,
+}
+
+impl DistanceSection {
+    /// Both boundaries lie on a non-empty model and differ from each other.
+    pub fn is_valid(&self) -> bool {
+        self.track_length_mm > 0
+            && self.start_mm <= self.track_length_mm
+            && self.end_mm <= self.track_length_mm
+            && self.start_mm != self.end_mm
+    }
+}
+
+/// Laps whose measured length is within this fraction of a distance model's
+/// length are stretched to the model length.
+pub const DISTANCE_STRETCH_TOLERANCE: f64 = 0.05;
+
+/// Approximate metres per degree of latitude (normalized GPS coordinates are degrees).
+const METERS_PER_DEGREE: f64 = 111_320.0;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DistanceTrackDefinition {
+    pub version: u32,
+    pub name: String,
+    pub length_m: f64,
+    pub sections: Vec<DistanceSectionDefinition>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DistanceSectionDefinition {
+    pub name: String,
+    pub start_m: f64,
+    pub end_m: f64,
+}
+
+pub fn vir_full_definition() -> DistanceTrackDefinition {
+    serde_json::from_str(include_str!("../data/vir-full-sections.json"))
+        .expect("bundled VIR definition must be valid")
+}
+
+/// Resolve distance boundaries onto a selected lap for map markers, retaining
+/// the exact distance boundary for timing on every other lap.
+pub fn sectors_from_distance_definition(
+    track: &TrackData,
+    lap: &Lap,
+    definition: &DistanceTrackDefinition,
+) -> Result<Vec<Sector>, String> {
+    if track.time.is_empty()
+        || track.x.len() != track.time.len()
+        || track.y.len() != track.time.len()
+        || definition.version != 1
+        || !definition.length_m.is_finite()
+        || definition.length_m <= 0.0
+        || definition.length_m > 1_000_000.0
+        || definition.sections.len() > 100
+    {
+        return Err("Invalid distance track definition".into());
+    }
+    definition
+        .sections
+        .iter()
+        .map(|s| {
+            if s.name.trim().is_empty()
+                || ![s.start_m, s.end_m]
+                    .iter()
+                    .all(|d| d.is_finite() && *d >= 0.0 && *d <= definition.length_m)
+                || s.start_m == s.end_m
+            {
+                return Err("Invalid distance section boundary".into());
+            }
+            let distance = DistanceSection {
+                start_mm: (s.start_m * 1000.0).round() as u32,
+                end_mm: (s.end_m * 1000.0).round() as u32,
+                track_length_mm: (definition.length_m * 1000.0).round() as u32,
+            };
+            let (a, b) = distance_section_interval(&distance, lap, track)
+                .ok_or("Select a complete lap that visits all section boundaries")?;
+            let index = |t: f64| {
+                track
+                    .time
+                    .partition_point(|v| *v < t)
+                    .min(track.time.len().saturating_sub(1))
+            };
+            let (start_index, end_index) = (index(a), index(b));
+            if ![
+                track.x[start_index],
+                track.y[start_index],
+                track.x[end_index],
+                track.y[end_index],
+            ]
+            .iter()
+            .all(|v| v.is_finite())
+            {
+                return Err("GPS is missing at a section boundary".into());
+            }
+            Ok(Sector {
+                name: s.name.clone(),
+                start_index,
+                end_index,
+                distance: Some(distance),
+            })
+        })
+        .collect()
+}
+
+fn distance_section_interval(
+    section: &DistanceSection,
+    lap: &Lap,
+    track: &TrackData,
+) -> Option<(f64, f64)> {
+    let (data, freq) = track.distance.as_ref()?;
+    let start = crate::sample_at_time(data, *freq, lap.start_time)?;
+    let end = crate::sample_at_time(data, *freq, lap.end_time)?;
+    let length = end - start;
+    let model = section.track_length_mm as f64 / 1000.0;
+    if length <= 0.0 || !section.is_valid() {
+        return None;
+    }
+    let scale = if ((length - model) / model).abs() <= DISTANCE_STRETCH_TOLERANCE {
+        length / model
+    } else {
+        1.0
+    };
+    let crossing = |mm: u32| {
+        if mm == 0 {
+            return Some(lap.start_time);
+        }
+        let target = start + mm as f64 / 1000.0 * scale;
+        if target > end {
+            return None;
+        }
+        let i = data.partition_point(|d| *d < target);
+        if i == 0 {
+            return Some(0.0);
+        }
+        if i >= data.len() {
+            return None;
+        }
+        let width = data[i] - data[i - 1];
+        if width <= 0.0 {
+            return None;
+        }
+        Some(((i - 1) as f64 + (target - data[i - 1]) / width) / *freq as f64)
+    };
+    Some((crossing(section.start_mm)?, crossing(section.end_mm)?))
+}
+
+/// Portable section definitions use geographic positions, never sample indices
+/// from a different recording. The same file can be applied to another session.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrackDefinition {
+    pub version: u32,
+    pub name: String,
+    pub sections: Vec<GeographicSection>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GeographicSection {
+    pub name: String,
+    /// Latitude, longitude in degrees.
+    pub start: [f64; 2],
+    pub end: [f64; 2],
+    #[serde(default)]
+    pub distance: Option<DistanceSection>,
+}
+
+pub fn export_track_definition(
+    track: &TrackData,
+    sectors: &[Sector],
+    name: String,
+) -> Option<TrackDefinition> {
+    let (lat, lon, scale) = track.origin?;
+    if scale.abs() < 1e-9 {
+        return None;
+    }
+    let point = |idx: usize| -> Option<[f64; 2]> {
+        let x = *track.x.get(idx)?;
+        let y = *track.y.get(idx)?;
+        (x.is_finite() && y.is_finite()).then_some([y + lat, x / scale + lon])
+    };
+    let sections: Option<Vec<_>> = sectors
+        .iter()
+        .map(|s| {
+            Some(GeographicSection {
+                name: s.name.clone(),
+                start: point(s.start_index)?,
+                end: point(s.end_index)?,
+                distance: s.distance.clone(),
+            })
+        })
+        .collect();
+    Some(TrackDefinition {
+        version: 1,
+        name,
+        sections: sections?,
+    })
+}
+
+pub fn import_track_definition(
+    track: &TrackData,
+    definition: &TrackDefinition,
+) -> Result<Vec<Sector>, String> {
+    if definition
+        .sections
+        .iter()
+        .any(|s| s.distance.as_ref().is_some_and(|d| !d.is_valid()))
+    {
+        return Err("Invalid distance section boundary".into());
+    }
+    if definition.version != 1 {
+        return Err("Unsupported track definition version".into());
+    }
+    let (lat, lon, scale) = track.origin.ok_or("GPS origin is unavailable")?;
+    let locate = |p: [f64; 2]| -> Result<usize, String> {
+        if !p.iter().all(|v| v.is_finite()) || p[0].abs() > 90.0 || p[1].abs() > 180.0 {
+            return Err("Invalid geographic section boundary".into());
+        }
+        let (x, y) = ((p[1] - lon) * scale, p[0] - lat);
+        let idx = find_nearest_sample(track, x, y);
+        let distance = (track.x[idx] - x).hypot(track.y[idx] - y) * METERS_PER_DEGREE;
+        if !distance.is_finite() || distance > 100.0 {
+            return Err(
+                "Section boundary is more than 100 m from this recording's GPS trace".into(),
+            );
+        }
+        Ok(idx)
+    };
+    if definition.sections.len() > 100 {
+        return Err("Track definitions support up to 100 sections".into());
+    }
+    definition
+        .sections
+        .iter()
+        .map(|s| {
+            if s.name.trim().is_empty() {
+                return Err("Sections must have names".into());
+            }
+            let start_index = locate(s.start)?;
+            let end_index = locate(s.end)?;
+            if start_index == end_index {
+                return Err(format!("{} has identical boundaries", s.name));
+            }
+            Ok(Sector {
+                name: s.name.clone(),
+                start_index,
+                end_index,
+                distance: s.distance.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Seed a usable section layout from equal distances on a chosen complete lap.
+/// These are generic sections, not inferred corner names.
+pub fn split_lap_into_sectors(track: &TrackData, lap: &Lap, count: usize) -> Vec<Sector> {
+    let indices: Vec<_> = track
+        .time
+        .iter()
+        .enumerate()
+        .filter(|(i, t)| {
+            **t >= lap.start_time
+                && **t < lap.end_time
+                && track.x[*i].is_finite()
+                && track.y[*i].is_finite()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if count < 2 || indices.len() < count + 1 {
+        return Vec::new();
+    }
+    let mut distances = vec![0.0];
+    for pair in indices.windows(2) {
+        let distance = if pair[1] == pair[0] + 1 {
+            (track.x[pair[1]] - track.x[pair[0]]).hypot(track.y[pair[1]] - track.y[pair[0]])
+        } else {
+            0.0
+        };
+        distances.push(distances.last().unwrap() + distance);
+    }
+    let total = *distances.last().unwrap();
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    let mut boundaries: Vec<_> = (0..count)
+        .map(|i| {
+            let target = total * i as f64 / count as f64;
+            let after = distances
+                .partition_point(|d| *d < target)
+                .min(indices.len() - 1);
+            let before = after.saturating_sub(1);
+            indices[if (distances[before] - target).abs() <= (distances[after] - target).abs() {
+                before
+            } else {
+                after
+            }]
+        })
+        .collect();
+    boundaries.dedup();
+    if boundaries.len() != count {
+        return Vec::new();
+    }
+    (0..count)
+        .map(|i| Sector {
+            name: format!("Section {}", i + 1),
+            start_index: boundaries[i],
+            end_index: boundaries[(i + 1) % count],
+            distance: None,
+        })
+        .collect()
 }
 
 /// Find a GPS channel by looking for "gps" + one of the given suffixes in the channel name.
@@ -387,47 +752,45 @@ fn resample_to_track(track: &TrackData, data: &[f64], freq: u16) -> Vec<f64> {
         .collect()
 }
 
-/// Compute sector times for each lap.
-///
-/// Returns a Vec (one per lap) of Vec<SectorTime> (one per sector).
-/// Each sector time is computed by finding when the car is nearest to each sector
-/// boundary during each lap.
+/// Nearest valid GPS fix in the requested half-open time interval.
+/// Used for picking on a selected lap, so overlapping laps cannot steal a click.
+pub fn find_nearest_sample_in_range(
+    track: &TrackData,
+    x: f64,
+    y: f64,
+    time_range: (f64, f64),
+) -> Option<usize> {
+    let start = track.time.partition_point(|t| *t < time_range.0);
+    let end = track.time.partition_point(|t| *t < time_range.1);
+    (start..end.min(track.x.len()))
+        .filter(|&i| track.x[i].is_finite() && track.y[i].is_finite())
+        .min_by(|&a, &b| {
+            let da = (track.x[a] - x).powi(2) + (track.y[a] - y).powi(2);
+            let db = (track.x[b] - x).powi(2) + (track.y[b] - y).powi(2);
+            da.total_cmp(&db)
+        })
+}
+
+/// Compute section times from interpolated nearest approaches to the boundaries.
+/// Missing crossings yield NaN rather than a plausible-looking zero/full lap.
 pub fn compute_sector_times(
     sectors: &[Sector],
     laps: &[Lap],
     track: &TrackData,
 ) -> Vec<Vec<SectorTime>> {
-    if sectors.is_empty() || laps.is_empty() || track.x.is_empty() {
-        return Vec::new();
-    }
-
-    let freq = track.freq as f64;
-
     laps.iter()
         .map(|lap| {
-            // Sample range for this lap
-            let lap_start = (lap.start_time * freq).floor() as usize;
-            let lap_end = (lap.end_time * freq).ceil() as usize;
-            let lap_end = lap_end.min(track.x.len());
-
             sectors
                 .iter()
                 .map(|sector| {
-                    // Find when the car crosses the sector start and end boundaries during this lap.
-                    // Use nearest-approach to the sector boundary points.
-                    let start_time =
-                        find_crossing_time(track, sector.start_index, lap_start, lap_end);
-                    let end_time = find_crossing_time(track, sector.end_index, lap_start, lap_end);
-
-                    let lap_duration = lap.end_time - lap.start_time;
-                    let time_secs = if end_time > start_time {
-                        end_time - start_time
-                    } else {
-                        // Sector wraps around lap boundary
-                        lap_duration - (start_time - end_time)
-                    }
-                    .clamp(0.0, lap_duration);
-
+                    let interval = sector_interval(sector, lap, track);
+                    let time_secs = interval.map_or(f64::NAN, |(start, end)| {
+                        if end > start {
+                            end - start
+                        } else {
+                            lap.duration() - (start - end)
+                        }
+                    });
                     SectorTime {
                         sector_name: sector.name.clone(),
                         lap_name: lap.name.clone(),
@@ -439,34 +802,55 @@ pub fn compute_sector_times(
         .collect()
 }
 
-/// Find the time at which the car is nearest to a track position (given by sample index)
-/// within a lap's sample range.
-fn find_crossing_time(
-    track: &TrackData,
-    target_index: usize,
-    lap_start: usize,
-    lap_end: usize,
-) -> f64 {
-    let target_x = track.x.get(target_index).copied().unwrap_or(0.0);
-    let target_y = track.y.get(target_index).copied().unwrap_or(0.0);
+/// Crossing times within a lap; end < start denotes a section across the beacon.
+pub fn sector_interval(sector: &Sector, lap: &Lap, track: &TrackData) -> Option<(f64, f64)> {
+    if let Some(section) = &sector.distance {
+        return distance_section_interval(section, lap, track);
+    }
+    Some((
+        find_crossing_time(track, sector.start_index, lap)?,
+        find_crossing_time(track, sector.end_index, lap)?,
+    ))
+}
 
-    let mut best_dist = f64::MAX;
-    let mut best_idx = lap_start;
-
-    let search_start = lap_start.min(track.x.len());
-    let search_end = lap_end.min(track.x.len());
-
-    for i in search_start..search_end {
-        let dx = track.x[i] - target_x;
-        let dy = track.y[i] - target_y;
-        let dist = dx * dx + dy * dy;
-        if dist < best_dist {
-            best_dist = dist;
-            best_idx = i;
+fn find_crossing_time(track: &TrackData, target_index: usize, lap: &Lap) -> Option<f64> {
+    let target_x = *track.x.get(target_index)?;
+    let target_y = *track.y.get(target_index)?;
+    if !target_x.is_finite() || !target_y.is_finite() {
+        return None;
+    }
+    let start = track
+        .time
+        .partition_point(|t| *t < lap.start_time)
+        .saturating_sub(1);
+    let end = (track.time.partition_point(|t| *t <= lap.end_time) + 1).min(track.x.len());
+    let mut best: Option<(f64, f64)> = None;
+    for i in start..end.saturating_sub(1) {
+        let (x0, y0, x1, y1) = (track.x[i], track.y[i], track.x[i + 1], track.y[i + 1]);
+        let (t0, t1) = (track.time[i], track.time[i + 1]);
+        if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) || t1 <= t0 {
+            continue;
+        }
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let length2 = dx * dx + dy * dy;
+        if length2 <= f64::EPSILON {
+            continue;
+        }
+        let lo = ((lap.start_time - t0) / (t1 - t0)).max(0.0);
+        let hi = ((lap.end_time - t0) / (t1 - t0)).min(1.0);
+        if lo > hi {
+            continue;
+        }
+        let f = (((target_x - x0) * dx + (target_y - y0) * dy) / length2).clamp(lo, hi);
+        let dist2 = (x0 + f * dx - target_x).powi(2) + (y0 + f * dy - target_y).powi(2);
+        if best.is_none_or(|(d, _)| dist2 < d) {
+            best = Some((dist2, t0 + f * (t1 - t0)));
         }
     }
-
-    track.time.get(best_idx).copied().unwrap_or(0.0)
+    // Normalized coordinates are degrees. Require a passage within 30 m; a
+    // partial lap that never visits this section has no time.
+    best.filter(|(d, _)| *d <= (30.0 / METERS_PER_DEGREE).powi(2))
+        .map(|(_, t)| t)
 }
 
 /// Convert HSV to RGB. Hue in [0, 360), saturation and value in [0, 1].
@@ -498,6 +882,207 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distance_sections_interpolate_wrap_and_only_stretch_qualifying_laps() {
+        let mut track = TrackData::from_normalized_parts(
+            vec![0.; 101],
+            vec![0.; 101],
+            (0..101).map(|i| i as f64).collect(),
+            1,
+        );
+        track.distance = Some(((0..101).map(|i| i as f64 * 10.).collect(), 1));
+        let lap = Lap {
+            number: 1,
+            name: "Lap 1".into(),
+            start_time: 0.,
+            end_time: 100.,
+        };
+        let mut section = DistanceSection {
+            start_mm: 800_000,
+            end_mm: 200_000,
+            track_length_mm: 1_000_000,
+        };
+        assert_eq!(
+            distance_section_interval(&section, &lap, &track),
+            Some((80., 20.))
+        );
+        let sector = Sector {
+            name: "Wrapped".into(),
+            start_index: 80,
+            end_index: 20,
+            distance: Some(section.clone()),
+        };
+        assert_eq!(
+            compute_sector_times(&[sector], std::slice::from_ref(&lap), &track)[0][0].time_secs,
+            40.
+        );
+        section.track_length_mm = 1_040_000;
+        let (a, b) = distance_section_interval(&section, &lap, &track).unwrap();
+        assert!((a - 80. / 1.04).abs() < 1e-9 && (b - 20. / 1.04).abs() < 1e-9);
+        section.track_length_mm = 1_100_000;
+        assert_eq!(
+            distance_section_interval(&section, &lap, &track),
+            Some((80., 20.))
+        );
+        section.start_mm = 1_050_000;
+        assert!(distance_section_interval(&section, &lap, &track).is_none());
+        section.track_length_mm = 0;
+        assert!(distance_section_interval(&section, &lap, &track).is_none());
+    }
+    #[test]
+    fn vir_definition_covers_the_model_without_gaps_or_overlap() {
+        let d = vir_full_definition();
+        assert_eq!(d.sections.len(), 33);
+        assert_eq!(d.length_m, 5337.5);
+        let total: f64 = d
+            .sections
+            .iter()
+            .map(|s| {
+                if s.end_m > s.start_m {
+                    s.end_m - s.start_m
+                } else {
+                    d.length_m - s.start_m + s.end_m
+                }
+            })
+            .sum();
+        assert_eq!(total, d.length_m);
+        for i in 0..d.sections.len() {
+            assert_eq!(
+                d.sections[i].end_m,
+                d.sections[(i + 1) % d.sections.len()].start_m
+            );
+        }
+    }
+
+    #[test]
+    fn geographic_sections_survive_a_different_recording_origin_and_indices() {
+        let lat = [36.0, 36.001, 36.001, 36.0, 36.0];
+        let lon = [-79.0, -79.0, -78.999, -78.999, -79.0];
+        let first = normalize_gps_samples(&lat, &lon, 1).unwrap();
+        let lap = Lap {
+            number: 1,
+            name: "Lap 1".into(),
+            start_time: 0.0,
+            end_time: 4.1,
+        };
+        let sectors = split_lap_into_sectors(&first, &lap, 4);
+        assert_eq!(sectors.len(), 4);
+        let total: f64 = compute_sector_times(&sectors, &[lap], &first)[0]
+            .iter()
+            .map(|s| s.time_secs)
+            .sum();
+        assert!((total - 4.1).abs() < 1e-9);
+        let definition = export_track_definition(&first, &sectors, "Test circuit".into()).unwrap();
+        let mut lat2 = vec![0.0, 36.0005];
+        lat2.extend(lat);
+        let mut lon2 = vec![0.0, -79.0005];
+        lon2.extend(lon);
+        let second = normalize_gps_samples(&lat2, &lon2, 1).unwrap();
+        let restored = import_track_definition(&second, &definition).unwrap();
+        assert_eq!(restored.len(), 4);
+        for (a, b) in sectors.iter().zip(restored) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.start_index + 2, b.start_index);
+            assert_eq!(a.end_index + 2, b.end_index);
+        }
+        let distant = normalize_gps_samples(&[37.0, 37.001], &[-80.0, -80.001], 1).unwrap();
+        assert!(import_track_definition(&distant, &definition).is_err());
+    }
+
+    #[test]
+    fn decoded_gps_builder_aligns_rates_and_preserves_origin_and_missing_fixes() {
+        let track = gps_track_from_samples(
+            &[36.0, 36.001, 0.0, 36.003],
+            1,
+            &[-79.0, -79.0, -78.999, -78.999, 0.0, 0.0, -78.997],
+            2,
+        )
+        .unwrap();
+        assert_eq!(track.time, [0.0, 1.0, 2.0, 3.0]);
+        assert!(track.x[2].is_nan() && track.y[2].is_nan());
+        assert!(track.x[0] < track.x[1] && track.x[1] < track.x[3]);
+        let sections = [Sector {
+            name: "Straight".into(),
+            start_index: 0,
+            end_index: 3,
+            distance: None,
+        }];
+        let definition = export_track_definition(&track, &sections, "Test".into()).unwrap();
+        assert_eq!(definition.sections[0].start, [36.0, -79.0]);
+        assert_eq!(definition.sections[0].end, [36.003, -78.997]);
+        assert!(gps_track_from_samples(&[36.0], 0, &[-79.0], 1).is_none());
+    }
+
+    #[test]
+    fn gps_lost_fixes_are_gaps_and_do_not_change_bounds() {
+        let track = normalize_gps_samples(
+            &[f64::NAN, 36.56, 0.0, 36.57],
+            &[f64::NAN, -79.21, 0.0, -79.20],
+            20,
+        )
+        .unwrap();
+        assert!(track.x[0].is_nan() && track.x[2].is_nan());
+        assert!(track.y[0].is_nan() && track.y[2].is_nan());
+        assert_eq!(track.time, [0.0, 0.05, 0.1, 0.15]);
+        assert!(track.x[1].abs() < 0.01 && track.y[3].abs() < 0.01);
+        assert_eq!(find_nearest_sample(&track, track.x[3], track.y[3]), 3);
+        assert!(normalize_gps_samples(&[0.0], &[0.0], 20).is_none());
+        assert!(normalize_gps_samples(&[0.0, 1.0], &[1.0, 0.0], 20).is_some());
+    }
+
+    #[test]
+    fn map_picking_is_scoped_to_the_requested_lap() {
+        let track = TrackData::from_normalized_parts(
+            vec![f64::NAN, 0.0, 1.0, 0.0, 1.0],
+            vec![f64::NAN, 0.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            1,
+        );
+        assert_eq!(
+            find_nearest_sample_in_range(&track, 0.0, 0.0, (3.0, 5.0)),
+            Some(3)
+        );
+        assert_eq!(
+            find_nearest_sample_in_range(&track, 0.0, 0.0, (0.0, 1.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn section_crossing_interpolates_and_rejects_missing_passages() {
+        let track = TrackData::from_normalized_parts(
+            vec![0.00005, 0.00015, f64::NAN, 0.0, 0.0001, 0.0002],
+            vec![0.0, 0.0, f64::NAN, 0.0, 0.0, 0.0],
+            vec![0.0, 0.05, 0.1, 0.15, 0.2, 0.25],
+            20,
+        );
+        let lap = Lap {
+            number: 1,
+            name: "Lap 1".into(),
+            start_time: 0.15,
+            end_time: 0.25,
+        };
+        let sector = Sector {
+            distance: None,
+            name: "Turn 1".into(),
+            start_index: 0,
+            end_index: 1,
+        };
+        let (start, end) = sector_interval(&sector, &lap, &track).unwrap();
+        assert!((start - 0.175).abs() < 1e-9);
+        assert!((end - 0.225).abs() < 1e-9);
+        let missing = Sector {
+            distance: None,
+            start_index: 2,
+            ..sector
+        };
+        assert!(
+            compute_sector_times(&[missing], &[lap], &track)[0][0]
+                .time_secs
+                .is_nan()
+        );
+    }
 
     #[test]
     fn test_hsv_to_rgb() {

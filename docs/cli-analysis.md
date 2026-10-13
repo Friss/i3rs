@@ -22,7 +22,9 @@ i3rs laps session.ld --source auto --format json
 sample-rate counts, and `.ldx` sidecar metadata when present.
 
 `channels` reports channel index, name, unit, sample rate, sample count, data
-type, decimal places, duration, and enum labels.
+type, scaling decimal places, display decimal places, duration, and enum labels.
+Invalid logger samples are preserved at their original timestamps and emitted as
+JSON `null` (or empty CSV cells); statistics exclude them from finite-value counts.
 
 `laps` reports lap number, display name, start time, end time, and duration.
 `--source auto` uses the same `.ld` lap detection as the app and includes `.ldx`
@@ -42,6 +44,13 @@ Selectors:
 - `--time START:END`: absolute session seconds
 - `--lap NAME|N`: one lap
 - `--laps all` or `--laps A,B`: multiple lap segments
+
+Native extraction, lap statistics, histograms, and lap-scoped math statistics
+use the half-open interval `[START, END)`: a sample at the start is included;
+a sample at the end belongs to the next interval. A boundary between samples
+rounds up, matching the GUI. This corrects the earlier behavior that included
+one sample before an off-grid start. Counts and statistics for those selections
+may therefore change. Requested resampling still evaluates the requested times.
 
 Axes:
 

@@ -66,7 +66,9 @@ pub struct ScatterPoint {
     pub y: Option<f64>,
 }
 
-/// Convert a time range in seconds to a bounded sample window.
+/// Native samples whose timestamps lie in `[start_time, end_time)`.
+/// Both boundaries round up: never include a sample before the start of a lap.
+/// Interpolated plots can separately retain adjacent samples for edge clipping.
 pub fn sample_window_for_time(
     freq: u16,
     data_len: usize,
@@ -81,11 +83,21 @@ pub fn sample_window_for_time(
     }
 
     let hz = freq as f64;
-    let start_sample = (start_time.max(0.0) * hz).floor() as usize;
-    let end_sample = (end_time.max(0.0) * hz).ceil() as usize;
+    let boundary = |time: f64| {
+        let mut index = ((time.max(0.0) * hz).ceil() as usize).min(data_len);
+        // Multiplying a timestamp back onto its grid can land one floating-point
+        // step either side of an integer. Compare actual timestamps to preserve
+        // half-open membership even at an exact sample boundary.
+        if index > 0 && (index - 1) as f64 / hz >= time {
+            index -= 1;
+        } else if index < data_len && (index as f64 / hz) < time {
+            index += 1;
+        }
+        index
+    };
     SampleWindow {
-        start_sample: start_sample.min(data_len),
-        end_sample: end_sample.min(data_len),
+        start_sample: boundary(start_time),
+        end_sample: boundary(end_time),
     }
 }
 
@@ -188,17 +200,26 @@ pub fn sample_at_time(data: &[f64], freq: u16, time: f64) -> Option<f64> {
         return None;
     }
 
-    let idx = time * freq as f64;
+    sample_at_position(data, time * freq as f64)
+}
+
+/// Shared interpolation for time queries and exact frequency-to-frequency grids.
+/// Resamplers use sample positions directly to avoid an index → time → index
+/// round trip turning a valid sample beside a NaN into a missing interpolation.
+pub(crate) fn sample_at_position(data: &[f64], idx: f64) -> Option<f64> {
+    if !idx.is_finite() || idx < 0.0 {
+        return None;
+    }
     let lo = idx.floor() as usize;
     if lo >= data.len() {
-        return (idx <= data.len() as f64).then_some(*data.last().unwrap());
+        return None;
     }
     let hi = lo + 1;
-    if hi >= data.len() {
-        return Some(data[lo]);
+    if hi >= data.len() || idx == lo as f64 {
+        return Some(data[lo]).filter(|v| v.is_finite());
     }
     let frac = idx - lo as f64;
-    Some(data[lo] * (1.0 - frac) + data[hi] * frac)
+    Some(data[lo] * (1.0 - frac) + data[hi] * frac).filter(|v| v.is_finite())
 }
 
 /// Resample a channel at explicit absolute session times.
@@ -390,9 +411,56 @@ mod tests {
     }
 
     #[test]
+    fn sample_windows_partition_laps_without_including_previous_samples() {
+        let left = sample_window_for_time(10, 100, 0.03, 0.25);
+        let right = sample_window_for_time(10, 100, 0.25, 0.43);
+        assert_eq!((left.start_sample, left.end_sample), (1, 3));
+        assert_eq!((right.start_sample, right.end_sample), (3, 5));
+        assert!(sample_window_for_time(10, 100, 0.21, 0.25).is_empty());
+        for (freq, start, end) in [
+            (7, 29.0 / 7.0, 30.0 / 7.0),
+            (100, 0.29, 0.58),
+            (10, -1.0, 0.0),
+            (20, 0.03, 0.25),
+            (20, 30.0, 31.0),
+        ] {
+            let window = sample_window_for_time(freq, 100, start, end);
+            let actual: Vec<_> = (window.start_sample..window.end_sample).collect();
+            let expected: Vec<_> = (0..100)
+                .filter(|&i| {
+                    let t = i as f64 / freq as f64;
+                    t >= start && t < end
+                })
+                .collect();
+            assert_eq!(actual, expected, "{freq} Hz, {start}..{end}");
+        }
+        for (start, end) in [
+            (1.0, 1.0),
+            (2.0, 1.0),
+            (f64::NAN, 1.0),
+            (0.0, f64::INFINITY),
+        ] {
+            assert!(sample_window_for_time(10, 100, start, end).is_empty());
+        }
+        assert!(sample_window_for_time(0, 100, 0.0, 1.0).is_empty());
+    }
+
+    #[test]
     fn sample_at_time_interpolates() {
         let data = [0.0, 10.0, 20.0];
         assert_eq!(sample_at_time(&data, 10, 0.05), Some(5.0));
+    }
+
+    #[test]
+    fn interpolation_keeps_exact_valid_samples_and_does_not_bridge_outages() {
+        let data = [1.0, f64::NAN, 3.0, 4.0];
+        assert_eq!(sample_at_time(&data, 1, 0.0), Some(1.0));
+        assert_eq!(sample_at_time(&data, 1, 0.5), None);
+        assert_eq!(sample_at_time(&data, 1, 1.0), None);
+        assert_eq!(sample_at_time(&data, 1, 1.5), None);
+        assert_eq!(sample_at_time(&data, 1, 2.0), Some(3.0));
+        assert_eq!(sample_at_time(&data, 1, 2.5), Some(3.5));
+        assert_eq!(sample_at_time(&data, 1, 4.0), None);
     }
 
     #[test]

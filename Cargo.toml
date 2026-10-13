@@ -14,10 +14,10 @@ repository = "https://github.com/Friss/i3rs"
 i3rs-core = { path = "crates/i3rs-core", version = "0.4.0" }
 half = "2.7.1"
 memmap2 = "0.9.10"
-eframe = "0.35.0"
-egui = "0.35.0"
-egui_plot = "0.36.0"
-egui-dock = { package = "egui_dock", version = "0.20.1", features = ["serde"] }
+eframe = "0.36.2"
+egui = "0.36.2"
+egui_plot = "0.37.0"
+egui-dock = { package = "egui_dock", version = "0.21.1", features = ["serde"] }
 rfd = "0.17.2"
 quick-xml = "0.41.0"
 rustfft = "6.4.1"

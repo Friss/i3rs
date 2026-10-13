@@ -1,0 +1,173 @@
+{
+  "version": 1,
+  "name": "VIR Full",
+  "length_m": 5337.5,
+  "source": "i2 Standard 1.1.4.457 Track Editor, manually transcribed 2026-10-12",
+  "sections": [
+    {
+      "name": "Str 0-1",
+      "start_m": 4785,
+      "end_m": 403
+    },
+    {
+      "name": "Turn 1",
+      "start_m": 403,
+      "end_m": 573
+    },
+    {
+      "name": "Str 1-2",
+      "start_m": 573,
+      "end_m": 700
+    },
+    {
+      "name": "Turn 2",
+      "start_m": 700,
+      "end_m": 738
+    },
+    {
+      "name": "Str 2-3",
+      "start_m": 738,
+      "end_m": 785
+    },
+    {
+      "name": "Turn 3",
+      "start_m": 785,
+      "end_m": 886
+    },
+    {
+      "name": "Str 3-4",
+      "start_m": 886,
+      "end_m": 1054
+    },
+    {
+      "name": "Turn 4",
+      "start_m": 1054,
+      "end_m": 1093
+    },
+    {
+      "name": "Str 4-5",
+      "start_m": 1093,
+      "end_m": 1245
+    },
+    {
+      "name": "Turn 5",
+      "start_m": 1245,
+      "end_m": 1295
+    },
+    {
+      "name": "Str 5-6",
+      "start_m": 1295,
+      "end_m": 1888
+    },
+    {
+      "name": "Turn 6",
+      "start_m": 1888,
+      "end_m": 1936
+    },
+    {
+      "name": "Str 6-7",
+      "start_m": 1936,
+      "end_m": 1996
+    },
+    {
+      "name": "Turn 7",
+      "start_m": 1996,
+      "end_m": 2028
+    },
+    {
+      "name": "Str 7-8",
+      "start_m": 2028,
+      "end_m": 2109
+    },
+    {
+      "name": "Turn 8",
+      "start_m": 2109,
+      "end_m": 2129
+    },
+    {
+      "name": "Str 8-9",
+      "start_m": 2129,
+      "end_m": 2199
+    },
+    {
+      "name": "Turn 9",
+      "start_m": 2199,
+      "end_m": 2248
+    },
+    {
+      "name": "Str 9-10",
+      "start_m": 2248,
+      "end_m": 2409
+    },
+    {
+      "name": "Turn 10",
+      "start_m": 2409,
+      "end_m": 2471
+    },
+    {
+      "name": "Str 10-11",
+      "start_m": 2471,
+      "end_m": 2739
+    },
+    {
+      "name": "Turn 11",
+      "start_m": 2739,
+      "end_m": 2757
+    },
+    {
+      "name": "Str 11-12",
+      "start_m": 2757,
+      "end_m": 2786
+    },
+    {
+      "name": "Turn 12",
+      "start_m": 2786,
+      "end_m": 2893
+    },
+    {
+      "name": "Str 12-13",
+      "start_m": 2893,
+      "end_m": 4202
+    },
+    {
+      "name": "Turn 13",
+      "start_m": 4202,
+      "end_m": 4243
+    },
+    {
+      "name": "Str 13-14",
+      "start_m": 4243,
+      "end_m": 4280
+    },
+    {
+      "name": "Turn 14",
+      "start_m": 4280,
+      "end_m": 4309
+    },
+    {
+      "name": "Turn 15",
+      "start_m": 4309,
+      "end_m": 4377
+    },
+    {
+      "name": "Str 15-16",
+      "start_m": 4377,
+      "end_m": 4509
+    },
+    {
+      "name": "Turn 16",
+      "start_m": 4509,
+      "end_m": 4534
+    },
+    {
+      "name": "Str 16-17",
+      "start_m": 4534,
+      "end_m": 4604
+    },
+    {
+      "name": "Turn 17",
+      "start_m": 4604,
+      "end_m": 4785
+    }
+  ]
+}

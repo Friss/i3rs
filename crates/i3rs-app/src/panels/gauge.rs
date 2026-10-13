@@ -6,8 +6,8 @@ use eframe::egui;
 use crate::state::{ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
-    build_plotted_channel_info, create_plotted_channel, interp_at_time, refresh_plotted_channel,
-    resolve_channel_meta, resolve_plotted_channel_display_meta,
+    build_plotted_channel_info, create_plotted_channel, refresh_plotted_channel,
+    resolve_channel_meta, resolve_plotted_channel_display_meta, uses_discrete_values,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,26 +130,7 @@ impl GaugePanel {
                 let mut context_action = None;
 
                 for (i, gc) in self.gauges.iter().enumerate() {
-                    let (name, unit, freq, dec_places, enum_labels) =
-                        resolve_plotted_channel_display_meta(&gc.channel, shared);
-                    let raw_value = shared
-                        .cursor_time
-                        .and_then(|t| interp_at_time(&gc.channel.data, freq, t));
-                    let discrete = !enum_labels.is_empty();
-                    let value = raw_value.map(|v| {
-                        if discrete {
-                            v
-                        } else {
-                            v * gc.channel.display_scale + gc.channel.display_offset
-                        }
-                    });
-                    let mut min = gc.channel.cached_min * gc.channel.display_scale
-                        + gc.channel.display_offset;
-                    let mut max = gc.channel.cached_max * gc.channel.display_scale
-                        + gc.channel.display_offset;
-                    if gc.channel.display_scale < 0.0 {
-                        std::mem::swap(&mut min, &mut max);
-                    }
+                    let reading = GaugeReading::new(&gc.channel, shared);
 
                     let (rect, response) = ui.allocate_exact_size(
                         egui::vec2(gauge_size, gauge_size),
@@ -158,7 +139,7 @@ impl GaugePanel {
 
                     // Context menu for style change / removal
                     response.context_menu(|ui| {
-                        ui.label(&name);
+                        ui.label(&reading.name);
                         ui.separator();
                         if ui.button("Analog").clicked() {
                             context_action = Some((i, Some(GaugeStyle::Analog)));
@@ -185,22 +166,8 @@ impl GaugePanel {
 
                     let painter = ui.painter_at(rect);
 
-                    let ctx = GaugeDrawContext {
-                        name: &name,
-                        unit: &unit,
-                        value,
-                        min,
-                        max,
-                        dec_places,
-                        color: gc.channel.color,
-                    };
-
-                    match gc.style {
-                        GaugeStyle::Analog => draw_analog_gauge(&painter, rect, &ctx),
-                        GaugeStyle::Bar => draw_bar_gauge(&painter, rect, &ctx),
-                        GaugeStyle::Digital => draw_digital_gauge(&painter, rect, &ctx),
-                        GaugeStyle::SteeringWheel => draw_steering_wheel(&painter, rect, &ctx),
-                    }
+                    let ctx = reading.draw_context(gc.channel.color);
+                    draw_gauge(&painter, rect, gc.style, &ctx);
 
                     if (i + 1) % cols == 0 {
                         ui.end_row();
@@ -253,6 +220,60 @@ pub(crate) fn best_gauge_grid(
 }
 
 /// Display parameters for drawing a gauge.
+/// A gauge channel's labels, cursor value and display range, in display units.
+pub(crate) struct GaugeReading {
+    pub name: String,
+    unit: String,
+    dec_places: i16,
+    value: Option<f64>,
+    min: f64,
+    max: f64,
+}
+
+impl GaugeReading {
+    pub(crate) fn new(channel: &PlottedChannel, shared: &SharedState) -> Self {
+        let (name, unit, freq, dec_places, enum_labels) =
+            resolve_plotted_channel_display_meta(channel, shared);
+        let discrete = uses_discrete_values(&name, &enum_labels);
+        let value = shared
+            .cursor_time
+            .map(|t| super::cursor_readout::value_at_time(&channel.data, freq, t, discrete))
+            .filter(|value| value.is_finite())
+            .map(|v| {
+                if discrete {
+                    v
+                } else {
+                    v * channel.display_scale + channel.display_offset
+                }
+            });
+        let mut min = channel.cached_min * channel.display_scale + channel.display_offset;
+        let mut max = channel.cached_max * channel.display_scale + channel.display_offset;
+        if channel.display_scale < 0.0 {
+            std::mem::swap(&mut min, &mut max);
+        }
+        Self {
+            name,
+            unit,
+            dec_places,
+            value,
+            min,
+            max,
+        }
+    }
+
+    pub(crate) fn draw_context(&self, color: egui::Color32) -> GaugeDrawContext<'_> {
+        GaugeDrawContext {
+            name: &self.name,
+            unit: &self.unit,
+            value: self.value,
+            min: self.min,
+            max: self.max,
+            dec_places: self.dec_places,
+            color,
+        }
+    }
+}
+
 pub(crate) struct GaugeDrawContext<'a> {
     pub name: &'a str,
     pub unit: &'a str,
@@ -356,7 +377,7 @@ fn draw_analog_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawC
         .map(|v| format!("{:.prec$} {}", v, unit, prec = dec))
         .unwrap_or_else(|| "---".into());
     painter.text(
-        egui::pos2(rect.center().x, center.y + radius * 0.5),
+        egui::pos2(rect.center().x, rect.max.y - 14.0),
         egui::Align2::CENTER_CENTER,
         value_text,
         egui::FontId::monospace(16.0),
@@ -443,14 +464,14 @@ fn draw_bar_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawCont
 
     // Min/Max
     painter.text(
-        egui::pos2(bar_rect.min.x, bar_rect.max.y + 8.0),
+        egui::pos2(bar_rect.min.x, bar_rect.min.y - 12.0),
         egui::Align2::LEFT_TOP,
         format!("{:.0}", min),
         egui::FontId::proportional(9.0),
         egui::Color32::GRAY,
     );
     painter.text(
-        egui::pos2(bar_rect.max.x, bar_rect.max.y + 8.0),
+        egui::pos2(bar_rect.max.x, bar_rect.min.y - 12.0),
         egui::Align2::RIGHT_TOP,
         format!("{:.0}", max),
         egui::FontId::proportional(9.0),

@@ -197,6 +197,7 @@ mod tests {
             worksheets: vec![WorksheetConfig {
                 name: "Analysis".into(),
                 panels: vec![PanelConfig::Graph(GraphPanelConfig {
+                    full_resolution: false,
                     id: 1,
                     title: "Graph 1".into(),
                     channel_names: vec![],
@@ -231,6 +232,7 @@ mod tests {
             math_channels: vec![],
             channel_aliases: vec![],
             sectors: vec![],
+            track_definition: None,
             reference_lap: None,
         }
     }

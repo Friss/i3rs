@@ -62,23 +62,31 @@ pub fn downsample_minmax(
             continue;
         }
 
-        let mut min_v = samples[start];
-        let mut max_v = samples[start];
-        for &v in &samples[start + 1..end] {
-            if v < min_v {
-                min_v = v;
+        // Split buckets at missing samples. Ignoring NaNs here would draw a
+        // continuous trace through outages, including single-sample gaps.
+        let mut run_start = start;
+        while run_start < end {
+            let finite = samples[run_start].is_finite();
+            let mut run_end = run_start + 1;
+            while run_end < end && samples[run_end].is_finite() == finite {
+                run_end += 1;
             }
-            if v > max_v {
-                max_v = v;
-            }
+            let (min_v, max_v) = if finite {
+                samples[run_start..run_end]
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                        (lo.min(v), hi.max(v))
+                    })
+            } else {
+                (f64::NAN, f64::NAN)
+            };
+            result.push(DownsampledPoint {
+                time: (start_sample + (run_start + run_end) / 2) as f64 / freq_f,
+                min: min_v,
+                max: max_v,
+            });
+            run_start = run_end;
         }
-
-        let mid_sample = start_sample + (start + end) / 2;
-        result.push(DownsampledPoint {
-            time: mid_sample as f64 / freq_f,
-            min: min_v,
-            max: max_v,
-        });
     }
 
     result
@@ -123,5 +131,16 @@ mod tests {
         let result = downsample_minmax(&samples, 10, 500, 100);
         assert_eq!(result.len(), 3);
         assert!((result[0].time - 50.0).abs() < 1e-9); // sample 500 / 10 Hz
+    }
+
+    #[test]
+    fn decimation_preserves_gaps_even_inside_a_single_bucket() {
+        let samples = [1.0, 2.0, f64::NAN, 8.0, 9.0, f64::NAN];
+        let result = downsample_minmax(&samples, 1, 0, 1);
+        assert_eq!(result.len(), 4);
+        assert_eq!((result[0].min, result[0].max), (1.0, 2.0));
+        assert!(result[1].min.is_nan());
+        assert_eq!((result[2].min, result[2].max), (8.0, 9.0));
+        assert!(result[3].max.is_nan());
     }
 }

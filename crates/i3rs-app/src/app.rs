@@ -239,6 +239,8 @@ impl App {
                             id: tm.id,
                             title: tm.title.clone(),
                             color_channel_name,
+                            section_times_only: tm.section_times_only,
+                            show_annotations: tm.show_annotations,
                         },
                     ));
                 }
@@ -270,6 +272,7 @@ impl App {
         if self.shared.are_math_channels_settled() {
             self.apply_workspace_snapshot(workspace);
         } else {
+            crate::workspace::restore_track_sections(&workspace, &mut self.shared);
             self.pending_workspace_restore = Some(workspace);
         }
     }
@@ -322,6 +325,7 @@ impl App {
         self.shared.ld_path = loaded.ld_path;
         self.shared.selected_lap = None;
         self.shared.cursor_time = None;
+        self.shared.playback_active = false;
         self.shared.zoom_range = Some((0.0, loaded.data_duration));
         self.shared.invalidate_session_caches();
 
@@ -331,6 +335,7 @@ impl App {
                 match tab {
                     PanelTab::Graph(g) => g.reset_for_new_main_session(),
                     PanelTab::TrackMap(t) => t.clear_cache(),
+                    PanelTab::Report(r) => r.clear_channels(),
                     PanelTab::Histogram(h) => h.clear_channels(),
                     PanelTab::Scatter(s) => s.clear_channels(),
                     PanelTab::Fft(f) => f.clear_channels(),
@@ -401,6 +406,7 @@ impl App {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn open_file_async(&mut self, path: PathBuf, ctx: &egui::Context) {
         let file_label = path
             .file_name()
@@ -518,7 +524,6 @@ impl App {
                                 decoded.channel_idx,
                                 decoded.data,
                                 decoded.stats,
-                                decoded.freq,
                             );
                             if !self.shared.math_channels.is_empty() {
                                 math_editor::reevaluate_math_channels_waiting_on_inputs(
@@ -566,16 +571,6 @@ impl App {
                         }
                     }
                     self.maybe_apply_pending_workspace_restore();
-                }
-                JobResult::BuildDownsampledSeries {
-                    session_id,
-                    key,
-                    points,
-                } => {
-                    if self.shared.session_id != session_id {
-                        continue;
-                    }
-                    self.shared.store_downsampled_series(key, points);
                 }
             }
         }
@@ -674,30 +669,6 @@ impl App {
         }
     }
 
-    fn submit_requested_downsampled_series(&mut self, ctx: &egui::Context) {
-        for request in self.shared.take_requested_downsampled_series() {
-            let request_id = self.next_request_id;
-            self.next_request_id += 1;
-
-            if let Err(err) = self.background_jobs.submit(
-                JobRequest::BuildDownsampledSeries {
-                    request_id,
-                    session_id: self.shared.session_id,
-                    key: request.key.clone(),
-                    data: request.data,
-                    freq: request.freq,
-                    start_sample: request.start_sample,
-                    end_sample: request.end_sample,
-                    target_width: request.target_width,
-                },
-                ctx,
-            ) {
-                self.shared.cancel_downsampled_series(&request.key);
-                self.load_error = Some(err);
-            }
-        }
-    }
-
     fn clear_loaded_session(&mut self) {
         self.pending_workspace_restore = None;
         self.shared.ld_file = None;
@@ -707,6 +678,7 @@ impl App {
         self.shared.ldx = None;
         self.shared.selected_lap = None;
         self.shared.cursor_time = None;
+        self.shared.playback_active = false;
         self.shared.zoom_range = None;
         self.shared.data_duration = None;
         self.shared.invalidate_session_caches();
@@ -716,6 +688,7 @@ impl App {
                 match tab {
                     PanelTab::Graph(g) => g.reset_for_new_main_session(),
                     PanelTab::TrackMap(t) => t.clear_cache(),
+                    PanelTab::Report(r) => r.clear_channels(),
                     PanelTab::Histogram(h) => h.clear_channels(),
                     PanelTab::Scatter(s) => s.clear_channels(),
                     PanelTab::Fft(f) => f.clear_channels(),
@@ -945,8 +918,6 @@ impl App {
                     }
                     math_editor::evaluate_all_math_channels(&mut self.shared);
                     self.shared.invalidate_derived_caches();
-                    self.shared.sectors = project.workspace.sectors.clone();
-                    self.shared.reference_lap = project.workspace.reference_lap;
 
                     let workspace = project.workspace;
                     self.sync_project_sessions_from_workspace(&workspace);
@@ -1386,7 +1357,8 @@ impl App {
     fn add_report_panel(&mut self) {
         let id = self.shared.next_panel_id;
         self.shared.next_panel_id += 1;
-        let report = ReportPanel::new(id, format!("Report {}", id));
+        let mut report = ReportPanel::new(id, format!("Report {}", id));
+        report.copy_visible_channels(&self.shared);
         self.worksheets[self.active_worksheet]
             .dock_state
             .push_to_focused_leaf(PanelTab::Report(report));
@@ -1397,7 +1369,7 @@ impl App {
         self.shared.next_panel_id += 1;
         let mut track_map = TrackMapPanel::new(id, format!("Track Map {}", id));
         track_map.home_worksheet = self.active_worksheet;
-        track_map.pop_out_requested = true;
+        // Start docked; pop-out remains an explicit toolbar action.
         self.worksheets[self.active_worksheet]
             .dock_state
             .push_to_focused_leaf(PanelTab::TrackMap(track_map));
@@ -1505,9 +1477,6 @@ impl App {
                         math_editor::evaluate_all_math_channels(&mut self.shared);
                         self.shared.invalidate_derived_caches();
 
-                        self.shared.sectors = workspace.sectors.clone();
-                        self.shared.reference_lap = workspace.reference_lap;
-
                         self.sync_project_sessions_from_workspace(&workspace);
                         self.pending_workspace_restore = None;
                         self.restore_workspace_when_ready(workspace);
@@ -1536,7 +1505,13 @@ impl App {
                 })
                 .collect();
 
-            if let Err(e) = export_csv(&path, &channels, self.shared.zoom_range) {
+            if let Err(e) = export_csv(
+                &path,
+                &channels,
+                self.shared
+                    .zoom_range
+                    .or_else(|| self.shared.data_duration.map(|end| (0.0, end))),
+            ) {
                 eprintln!("Failed to export CSV: {}", e);
             }
         }
@@ -1700,6 +1675,31 @@ impl App {
     }
 
     fn show_session_info(&mut self, ui: &mut egui::Ui) {
+        if self.shared.ld_file.is_some() {
+            ui.horizontal(|ui| {
+                if ui
+                    .button(if self.shared.playback_active {
+                        "Pause"
+                    } else {
+                        "Play"
+                    })
+                    .clicked()
+                {
+                    if !self.shared.playback_active {
+                        let range = self.shared.analysis_range();
+                        self.shared.clamp_cursor_to(range);
+                    }
+                    self.shared.playback_active = !self.shared.playback_active;
+                }
+                ui.add(
+                    egui::DragValue::new(&mut self.shared.playback_speed)
+                        .range(0.1..=16.0)
+                        .speed(0.1)
+                        .suffix("×"),
+                );
+                ui.label("Playback follows lap / zoom");
+            });
+        }
         if let Some(ld) = &self.shared.ld_file {
             let s = &ld.session;
             let current_session = self.shared.ld_path.as_ref();
@@ -1870,21 +1870,25 @@ impl eframe::App for App {
         self.submit_requested_channel_decodes(ui.ctx());
         self.submit_requested_math_channel_evaluations(ui.ctx());
         self.submit_requested_track_data_build(ui.ctx());
-        self.submit_requested_downsampled_series(ui.ctx());
         self.handle_shortcuts(ui.ctx());
+        self.shared
+            .advance_playback(ui.input(|i| i.stable_dt) as f64);
+        if self.shared.playback_active {
+            ui.ctx().request_repaint();
+        }
 
-        // Handle file drops
+        // Native drops expose filesystem paths. Web loading uses bytes from the picker;
+        // egui's browser drop paths are only filenames, not readable local paths.
+        #[cfg(not(target_arch = "wasm32"))]
         let dropped_path = ui.ctx().input(|i| {
             i.raw.dropped_files.first().and_then(|dropped| {
-                dropped.path.as_ref().and_then(|path| {
-                    if path.extension().is_some_and(|ext| ext == "ld") {
-                        Some(path.clone())
-                    } else {
-                        None
-                    }
-                })
+                let path = dropped.path();
+                path.extension()
+                    .is_some_and(|ext| ext == "ld")
+                    .then(|| path.to_path_buf())
             })
         });
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = dropped_path {
             self.open_file_async(path, ui.ctx());
         }
@@ -2139,7 +2143,6 @@ impl eframe::App for App {
         self.submit_requested_channel_decodes(ui.ctx());
         self.submit_requested_math_channel_evaluations(ui.ctx());
         self.submit_requested_track_data_build(ui.ctx());
-        self.submit_requested_downsampled_series(ui.ctx());
 
         // Clear per-frame flags
         self.shared.zoom_from_timeline = false;
@@ -2344,6 +2347,13 @@ mod tests {
     #[test]
     fn workspace_restore_waits_for_math_channels_to_finish() {
         let mut shared = SharedState::new();
+        shared.ld_path = Some("previous.ld".into());
+        shared.sectors = vec![i3rs_core::Sector {
+            name: "Previous recording".into(),
+            start_index: 50,
+            end_index: 100,
+            distance: None,
+        }];
         let mut math_channel =
             shared.create_math_channel_def("Derived".into(), "1".into(), String::new(), 2);
         math_channel.data = Some(Arc::from(vec![1.0]));
@@ -2382,8 +2392,13 @@ mod tests {
         app.shared.math_channels[0].error = Some("Waiting for source channels...".into());
         app.shared.math_channels[0].evaluation_state = MathEvaluationState::WaitingForInputs;
 
+        app.shared.ld_path = Some("current.ld".into());
         app.restore_workspace_when_ready(workspace);
 
+        assert!(
+            app.shared.sectors.is_empty(),
+            "Old recording indices must not remain active while math loads"
+        );
         assert!(app.pending_workspace_restore.is_some());
         let pending_graph = app.worksheets[0]
             .dock_state

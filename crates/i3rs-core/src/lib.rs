@@ -4,6 +4,7 @@
 //! (100MB+) with on-demand channel data decoding.
 
 pub mod analysis;
+pub mod distance;
 mod downsample;
 pub mod export;
 pub mod fft;
@@ -34,6 +35,7 @@ pub use math_expr::{Expr, ParseError, parse_expression, referenced_channels};
 pub use rustfft::FftPlanner;
 pub use state_labels::{format_state_value, is_state_channel, state_channel_labels};
 pub use track::{
-    Sector, SectorTime, TrackData, compute_color_map, compute_sector_times, extract_gps_track,
-    find_nearest_sample,
+    Sector, SectorTime, TrackData, TrackDefinition, compute_color_map, compute_sector_times,
+    export_track_definition, extract_gps_track, find_nearest_sample, find_nearest_sample_in_range,
+    import_track_definition, sector_interval, split_lap_into_sectors,
 };

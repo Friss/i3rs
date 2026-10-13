@@ -159,5 +159,7 @@ fn show_lap_selector(ui: &mut egui::Ui, shared: &mut SharedState) {
             }
         });
 
-    shared.selected_lap = new_selection;
+    if shared.selected_lap != new_selection {
+        shared.select_lap(new_selection);
+    }
 }

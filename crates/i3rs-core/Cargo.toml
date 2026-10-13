@@ -17,6 +17,7 @@ memmap2 = { workspace = true }
 quick-xml = { workspace = true }
 rustfft = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.8"

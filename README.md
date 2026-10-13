@@ -10,7 +10,7 @@ i3rs opens MoTeC `.ld` log files and provides time-series graphs, lap navigation
 
 - **MoTeC .ld/.ldx parsing** -- reads the binary log format produced by MoTeC M1 ECUs, including channel metadata, sample data, and lap timing from `.ldx` sidecar files
 - **Memory-mapped file access** -- opens 100MB+ files instantly via `memmap2`; channel data is decoded on demand
-- **Min-max decimation** -- renders 200+ channels at 60fps by downsampling to pixel resolution while preserving visual peaks and valleys
+- **Adaptive graph rendering** -- native samples for lap views; dense overviews retain each pixel column’s first, minimum, maximum, and last samples at their original timestamps. Choose “Draw every sample” to disable display reduction
 - **Multi-channel graphs** -- overlay or tiled modes, dual Y-axes, color-coded lines, drag-and-drop channels
 - **Lap detection & navigation** -- parses lap boundaries from data or `.ldx` files, lap markers on the timeline, click-to-zoom
 - **Dockable panel layout** -- multiple graph panels, channel browser, cursor readout, and timeline overview in a resizable tabbed workspace
@@ -23,7 +23,7 @@ i3rs opens MoTeC `.ld` log files and provides time-series graphs, lap navigation
 
 ## Building
 
-Requires Rust 2024 edition (rustc 1.85+).
+Requires Rust 2024 edition and rustc 1.95+ for the GUI dependencies.
 
 ```bash
 cargo build --release
