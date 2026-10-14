@@ -25,6 +25,7 @@ pub enum ChannelKey {
     Physical(usize),
     Derived(u64),
     Constant(usize),
+    Generated(String),
 }
 
 #[derive(Clone, Debug)]

@@ -36,6 +36,9 @@ pub struct WorkspaceFile {
     #[serde(default)]
     pub channel_settings: i3rs_core::channels::ChannelSettings,
     #[serde(default)]
+    pub recording_analyses:
+        std::collections::BTreeMap<String, i3rs_core::ranges::RecordingAnalysis>,
+    #[serde(default)]
     pub sectors: Vec<Sector>,
     #[serde(default)]
     pub track_definition: Option<i3rs_core::TrackDefinition>,
@@ -270,6 +273,8 @@ pub struct TrackMapPanelConfig {
     pub section_times_only: bool,
     #[serde(default = "default_track_annotations")]
     pub show_annotations: bool,
+    #[serde(default)]
+    pub annotation_settings: i3rs_core::annotations::AnnotationSettings,
 }
 
 fn default_track_annotations() -> bool {
@@ -590,6 +595,7 @@ pub fn save_workspace(
                             color_channel_name,
                             section_times_only: t.section_times_only,
                             show_annotations: t.show_annotations,
+                            annotation_settings: t.annotation_settings.clone(),
                         })
                     }
                     PanelTab::ChannelBrowser => PanelConfig::ChannelBrowser,
@@ -777,6 +783,7 @@ pub fn save_workspace(
         math_channels,
         channel_aliases,
         channel_settings: shared.channel_settings.clone(),
+        recording_analyses: shared.snapshot_recording_analysis(),
         sectors,
         track_definition: shared
             .track_data_if_ready()
@@ -795,6 +802,38 @@ pub fn save_workspace(
 /// Restore section identity before asynchronous math/layout restoration can wait.
 pub(crate) fn restore_track_sections(workspace: &WorkspaceFile, shared: &mut SharedState) {
     shared.track_definition_error = None;
+    if !workspace.recording_analyses.is_empty() {
+        for (key, analysis) in &workspace.recording_analyses {
+            if key != &analysis.recording {
+                shared.message("Ignored mismatched recording analysis identity");
+                continue;
+            }
+            match analysis.validate() {
+                Ok(()) => {
+                    if key != shared.recording_key() {
+                        shared
+                            .recording_analyses
+                            .insert(key.clone(), analysis.clone());
+                    }
+                }
+                Err(error) => {
+                    shared.message(format!("Recording analysis: {error}"));
+                }
+            }
+        }
+        if let Some(analysis) = workspace
+            .recording_analyses
+            .get(shared.recording_key())
+            .cloned()
+        {
+            let applied = shared.apply_recording_analysis(analysis);
+            if let Err(error) = applied {
+                shared.message(error);
+            }
+            shared.reference_lap = workspace.reference_lap.filter(|i| *i < shared.laps.len());
+            return;
+        }
+    }
     shared.pending_track_definition = workspace.track_definition.clone();
     // Missing paths cannot establish recording identity (e.g. browser uploads).
     let same_recording = workspace
@@ -952,6 +991,7 @@ pub fn load_workspace(
                         track_map.home_worksheet = worksheet_idx;
                         track_map.section_times_only = tc.section_times_only;
                         track_map.show_annotations = tc.show_annotations;
+                        track_map.annotation_settings = tc.annotation_settings.clone();
                         // Resolve color channel by name
                         if let Some(ref color_name) = tc.color_channel_name
                             && let Some(ld) = &shared.ld_file

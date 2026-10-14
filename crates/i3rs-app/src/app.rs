@@ -134,6 +134,7 @@ pub struct App {
     theme_choice: ThemeChoice,
     show_channel_preferences: bool,
     show_session_details: bool,
+    recording_editor: crate::panels::recording_editor::RecordingEditor,
     compare_session_path: Option<PathBuf>,
     session_summary_cache: HashMap<PathBuf, SessionSummary>,
     load_error: Option<String>,
@@ -184,6 +185,7 @@ impl App {
             theme_choice: preferences.theme,
             show_channel_preferences: false,
             show_session_details: false,
+            recording_editor: Default::default(),
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,
@@ -241,6 +243,7 @@ impl App {
                             color_channel_name,
                             section_times_only: tm.section_times_only,
                             show_annotations: tm.show_annotations,
+                            annotation_settings: tm.annotation_settings.clone(),
                         },
                     ));
                 }
@@ -269,10 +272,14 @@ impl App {
     }
 
     fn restore_workspace_when_ready(&mut self, workspace: crate::workspace::WorkspaceFile) {
+        if let Some(load) = &mut self.pending_session_load {
+            load.workspace_snapshot = Some(workspace);
+            return;
+        }
+        crate::workspace::restore_track_sections(&workspace, &mut self.shared);
         if self.shared.are_math_channels_settled() {
             self.apply_workspace_snapshot(workspace);
         } else {
-            crate::workspace::restore_track_sections(&workspace, &mut self.shared);
             self.pending_workspace_restore = Some(workspace);
         }
     }
@@ -310,6 +317,7 @@ impl App {
         loaded: LoadedSession,
         workspace_snapshot: Option<crate::workspace::WorkspaceFile>,
     ) {
+        self.shared.remember_recording_analysis();
         self.load_error = None;
         self.pending_session_load = None;
         self.pending_workspace_restore = None;
@@ -328,6 +336,20 @@ impl App {
         self.shared.playback_active = false;
         self.shared.zoom_range = Some((0.0, loaded.data_duration));
         self.shared.invalidate_session_caches();
+        let detected = self.shared.laps.clone();
+        if let Some(analysis) = loaded.analysis {
+            self.shared
+                .recording_analyses
+                .entry(analysis.recording.clone())
+                .or_insert(analysis);
+        }
+        if let Some(warning) = loaded.analysis_warning {
+            self.shared.message(warning);
+        }
+        self.shared.activate_recording_analysis(&detected);
+        if let Some(selected) = self.shared.selected_lap {
+            self.shared.select_lap(Some(selected));
+        }
 
         // Clear all panels' channels and caches across all worksheets
         for ws in &mut self.worksheets {
@@ -549,12 +571,19 @@ impl App {
                 }
                 JobResult::BuildTrackData {
                     session_id,
-                    track_data,
+                    correction_key,
+                    result,
                 } => {
                     if self.shared.session_id != session_id {
                         continue;
                     }
-                    self.shared.store_track_data(track_data);
+                    if !self
+                        .shared
+                        .apply_correction_result(&correction_key, *result)
+                    {
+                        continue;
+                    }
+                    math_editor::reevaluate_math_channels_waiting_on_inputs(&mut self.shared);
                 }
                 JobResult::EvaluateMathChannel {
                     session_id,
@@ -687,6 +716,9 @@ impl App {
             JobRequest::BuildTrackData {
                 request_id,
                 session_id: self.shared.session_id,
+                correction_key: self.shared.correction_key(),
+                settings: self.shared.current_corrections(),
+                laps: self.shared.competition_laps(),
                 ld,
             },
             ctx,
@@ -697,6 +729,7 @@ impl App {
     }
 
     fn clear_loaded_session(&mut self) {
+        self.shared.remember_recording_analysis();
         self.pending_workspace_restore = None;
         self.shared.ld_file = None;
         self.shared.ld_path = None;
@@ -976,10 +1009,22 @@ impl App {
             file_name: self.shared.file_name.clone(),
             date: ld.session.date.clone(),
             time: ld.session.time.clone(),
-            driver: ld.session.driver.clone(),
-            vehicle_id: ld.session.vehicle_id.clone(),
-            venue: ld.session.venue.clone(),
-            event_name: ld.event.event_name.clone(),
+            driver: self
+                .shared
+                .current_analysis()
+                .map_or_else(|| ld.session.driver.clone(), |a| a.details.driver.clone()),
+            vehicle_id: self.shared.current_analysis().map_or_else(
+                || ld.session.vehicle_id.clone(),
+                |a| a.details.vehicle.clone(),
+            ),
+            venue: self
+                .shared
+                .current_analysis()
+                .map_or_else(|| ld.session.venue.clone(), |a| a.details.venue.clone()),
+            event_name: self
+                .shared
+                .current_analysis()
+                .map_or_else(|| ld.event.event_name.clone(), |a| a.details.event.clone()),
             session_name: ld.event.session.clone(),
             comment: if ld.event.comment.is_empty() {
                 ld.session.short_comment.clone()
@@ -1167,6 +1212,12 @@ impl App {
                     }
                     ui.label("Session labels and notes are stored in the project file.");
                 });
+                if ui
+                    .button("Edit log details, ranges and corrections")
+                    .clicked()
+                {
+                    self.shared.show_recording_editor = true;
+                }
                 ui.separator();
 
                 if let Some(current_path) = current_path.as_ref()
@@ -1693,6 +1744,10 @@ impl App {
                     &mut self.shared.show_channel_status,
                     "Channel Status / Messages",
                 );
+                ui.checkbox(
+                    &mut self.shared.show_recording_editor,
+                    "Ranges / Corrections / Details",
+                );
                 if ui.button("Session Details").clicked() {
                     self.show_session_details = true;
                     ui.close();
@@ -1783,16 +1838,24 @@ impl App {
                 ui.separator();
                 ui.label(format!("{} {}", s.date, s.time));
                 ui.separator();
-                ui.label(&s.venue);
+                ui.label(
+                    self.shared
+                        .current_analysis()
+                        .map_or(s.venue.as_str(), |a| a.details.venue.as_str()),
+                );
                 ui.separator();
-                ui.label(&s.vehicle_id);
+                ui.label(
+                    self.shared
+                        .current_analysis()
+                        .map_or(s.vehicle_id.as_str(), |a| a.details.vehicle.as_str()),
+                );
                 ui.separator();
                 ui.label(i3rs_core::format_duration(ld.duration_secs()));
                 ui.separator();
                 ui.label(format!("{} channels", ld.channels.len()));
                 if !self.shared.laps.is_empty() {
                     ui.separator();
-                    ui.label(format!("{} laps", self.shared.laps.len()));
+                    ui.label(format!("{} ranges", self.shared.laps.len()));
                 }
                 if !self.shared.math_channels.is_empty() {
                     ui.separator();
@@ -2175,6 +2238,7 @@ impl eframe::App for App {
         crate::panels::channel_status::show(ui.ctx(), &mut self.shared);
         self.show_channel_preferences_window(ui.ctx());
         self.show_session_details_window(ui.ctx());
+        self.recording_editor.show(ui.ctx(), &mut self.shared);
         self.submit_requested_channel_decodes(ui.ctx());
         self.submit_requested_math_channel_evaluations(ui.ctx());
         self.submit_requested_track_data_build(ui.ctx());
@@ -2224,6 +2288,7 @@ mod tests {
             theme_choice: ThemeChoice::System,
             show_channel_preferences: false,
             show_session_details: false,
+            recording_editor: Default::default(),
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,
@@ -2241,6 +2306,50 @@ mod tests {
             #[cfg(target_arch = "wasm32")]
             web_load_rx: crate::platform::web_load_channel().1,
         }
+    }
+
+    #[test]
+    fn project_analysis_restore_waits_for_the_requested_recording() {
+        let mut shared = SharedState::new();
+        let ld = LdFile::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/VIR_LAP.ld"
+        ))
+        .unwrap();
+        shared.data_duration = Some(ld.duration_secs());
+        let laps = detect_laps(&ld);
+        shared.ld_file = Some(Arc::new(ld));
+        shared.activate_recording_analysis(&laps);
+        let mut workspace = crate::workspace::save_workspace(&[], 0, &shared);
+        workspace
+            .recording_analyses
+            .get_mut(shared.recording_key())
+            .unwrap()
+            .corrections
+            .gps_enabled = false;
+        let mut app = test_app(shared, vec![]);
+        app.pending_session_load = Some(PendingSessionLoad {
+            request_id: 42,
+            file_label: "Requested recording".into(),
+            workspace_snapshot: None,
+        });
+        app.restore_workspace_when_ready(workspace);
+        assert!(
+            app.shared.current_corrections().gps_enabled,
+            "do not apply the incoming project's settings to the old recording"
+        );
+        let saved = app
+            .pending_session_load
+            .as_ref()
+            .unwrap()
+            .workspace_snapshot
+            .as_ref()
+            .unwrap();
+        assert!(
+            !saved.recording_analyses[app.shared.recording_key()]
+                .corrections
+                .gps_enabled
+        );
     }
 
     #[test]
@@ -2390,6 +2499,7 @@ mod tests {
         let mut shared = SharedState::new();
         shared.ld_path = Some("previous.ld".into());
         shared.sectors = vec![i3rs_core::Sector {
+            semantics: i3rs_core::track::SectionSemantics::default(),
             name: "Previous recording".into(),
             start_index: 50,
             end_index: 100,

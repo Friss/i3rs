@@ -40,6 +40,26 @@ pub fn show(ctx: &egui::Context, shared: &mut SharedState) {
                         ui.label(format!("{name}: {status}"));
                     }
                     ui.separator();
+                    ui.strong("Corrections");
+                    ui.label(if shared.is_track_data_build_pending() {
+                        "Building corrected speed / distance / GPS"
+                    } else {
+                        "Correction outputs"
+                    });
+                    if let Some(error) = &shared.correction_error {
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
+                    for (name, data) in [
+                        ("Corr Speed", &shared.correction_speed),
+                        ("Corr Dist", &shared.correction_distance),
+                        ("Corr GPS Speed", &shared.correction_gps_speed),
+                    ] {
+                        ui.label(data.as_ref().map_or_else(
+                            || format!("{name}: unavailable"),
+                            |(v, f)| format!("{name}: {} samples at {f} Hz", v.len()),
+                        ));
+                    }
+                    ui.separator();
                     ui.strong("Maths");
                     for (idx, mc) in shared.math_channels.iter().enumerate() {
                         ui.label(format!(
@@ -91,6 +111,7 @@ pub fn show(ctx: &egui::Context, shared: &mut SharedState) {
     shared.show_channel_status = open;
     if retry {
         shared.channel_errors.borrow_mut().clear();
+        shared.invalidate_correction_caches();
         shared.invalidate_math_results();
     }
 }

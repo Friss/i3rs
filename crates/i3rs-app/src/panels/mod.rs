@@ -12,6 +12,7 @@ mod graph_line;
 pub mod histogram;
 pub mod math_editor;
 pub mod mixture_map;
+pub mod recording_editor;
 pub mod report;
 pub mod scatter;
 pub mod timeline;

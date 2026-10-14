@@ -69,6 +69,21 @@ impl SharedState {
                 }
             }
         }
+        let corrections = self.current_corrections();
+        for (name, enabled) in [
+            ("Corr Speed", corrections.speed_enabled),
+            ("Corr Dist", corrections.distance_enabled),
+            ("Corr GPS Speed", corrections.gps_enabled),
+        ] {
+            if enabled {
+                catalog.push(ChannelCandidate {
+                    name: name.into(),
+                    source: "MoTeC".into(),
+                    recording: Some(recording.into()),
+                    key: ChannelKey::Generated(name.into()),
+                });
+            }
+        }
         for mc in &self.math_channels {
             catalog.push(ChannelCandidate {
                 name: mc.name.clone(),
@@ -182,6 +197,7 @@ impl SharedState {
             definitions,
             aliases,
             &self.channel_settings,
+            self.correction_key(),
         ))
         .expect("serializable analysis settings")
     }

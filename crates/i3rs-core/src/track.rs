@@ -15,6 +15,7 @@ pub struct TrackData {
     pub time: Vec<f64>,
     /// GPS sample frequency (Hz).
     pub freq: u16,
+    pub distance_stretch_tolerance: Option<f64>,
     spatial_index: Option<TrackSpatialIndex>,
     origin: Option<(f64, f64, f64)>,
     pub distance: Option<(Vec<f64>, u16)>,
@@ -23,6 +24,20 @@ pub struct TrackData {
 }
 
 impl TrackData {
+    pub fn geographic_fixes(&self) -> Option<Vec<[f64; 2]>> {
+        let (lat, lon, cos) = self.origin?;
+        if cos.abs() < 1e-9 {
+            return None;
+        }
+        Some(
+            self.x
+                .iter()
+                .zip(&self.y)
+                .map(|(x, y)| [y + lat, x / cos + lon])
+                .collect(),
+        )
+    }
+
     pub fn from_normalized_parts(x: Vec<f64>, y: Vec<f64>, time: Vec<f64>, freq: u16) -> Self {
         let spatial_index = TrackSpatialIndex::build(&x, &y);
         Self {
@@ -30,6 +45,7 @@ impl TrackData {
             y,
             time,
             freq,
+            distance_stretch_tolerance: Some(DISTANCE_STRETCH_TOLERANCE),
             spatial_index,
             origin: None,
             distance: None,
@@ -213,9 +229,36 @@ impl TrackSpatialIndex {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SectionKind {
+    Corner,
+    Straight,
+    #[default]
+    Other,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SectionSemantics {
+    pub id: String,
+    pub kind: SectionKind,
+    pub categories: std::collections::BTreeSet<String>,
+}
+
+impl SectionSemantics {
+    fn with_identity(&self, fallback: String) -> Self {
+        let mut semantics = self.clone();
+        if semantics.id.is_empty() {
+            semantics.id = fallback;
+        }
+        semantics
+    }
+}
+
 /// A track sector defined by GPS sample index boundaries.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Sector {
+    #[serde(default)]
+    pub semantics: SectionSemantics,
     pub name: String,
     /// Index into GPS data where this sector starts.
     pub start_index: usize,
@@ -361,6 +404,8 @@ pub struct DistanceTrackDefinition {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DistanceSectionDefinition {
+    #[serde(default)]
+    pub semantics: SectionSemantics,
     pub name: String,
     pub start_m: f64,
     pub end_m: f64,
@@ -381,7 +426,7 @@ pub fn sectors_from_distance_definition(
     if track.time.is_empty()
         || track.x.len() != track.time.len()
         || track.y.len() != track.time.len()
-        || definition.version != 1
+        || !(1..=2).contains(&definition.version)
         || !definition.length_m.is_finite()
         || definition.length_m <= 0.0
         || definition.length_m > 1_000_000.0
@@ -427,6 +472,10 @@ pub fn sectors_from_distance_definition(
                 return Err("GPS is missing at a section boundary".into());
             }
             Ok(Sector {
+                semantics: s.semantics.with_identity(format!(
+                    "distance-{}-{}-{}",
+                    distance.start_mm, distance.end_mm, distance.track_length_mm
+                )),
                 name: s.name.clone(),
                 start_index,
                 end_index,
@@ -449,7 +498,10 @@ fn distance_section_interval(
     if length <= 0.0 || !section.is_valid() {
         return None;
     }
-    let scale = if ((length - model) / model).abs() <= DISTANCE_STRETCH_TOLERANCE {
+    let scale = if track
+        .distance_stretch_tolerance
+        .is_some_and(|t| ((length - model) / model).abs() <= t)
+    {
         length / model
     } else {
         1.0
@@ -488,12 +540,45 @@ pub struct TrackDefinition {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GeographicSection {
+    #[serde(default)]
+    pub semantics: SectionSemantics,
     pub name: String,
     /// Latitude, longitude in degrees.
     pub start: [f64; 2],
     pub end: [f64; 2],
     #[serde(default)]
     pub distance: Option<DistanceSection>,
+}
+
+impl TrackDefinition {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=2).contains(&self.version) {
+            return Err("Unsupported track definition version".into());
+        }
+        if self.sections.len() > 100 {
+            return Err("Track definitions support up to 100 sections".into());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for s in &self.sections {
+            if s.name.trim().is_empty()
+                || s.start.iter().chain(s.end.iter()).any(|v| !v.is_finite())
+                || s.start[0].abs() > 90.
+                || s.end[0].abs() > 90.
+                || s.start[1].abs() > 180.
+                || s.end[1].abs() > 180.
+                || s.start == s.end
+            {
+                return Err("Invalid geographic section boundary or name".into());
+            }
+            if s.distance.as_ref().is_some_and(|d| !d.is_valid()) {
+                return Err("Invalid distance section boundary".into());
+            }
+            if !s.semantics.id.is_empty() && !ids.insert(&s.semantics.id) {
+                return Err("Duplicate track section identity".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn export_track_definition(
@@ -514,6 +599,9 @@ pub fn export_track_definition(
         .iter()
         .map(|s| {
             Some(GeographicSection {
+                semantics: s
+                    .semantics
+                    .with_identity(format!("gps-{}-{}", s.start_index, s.end_index)),
                 name: s.name.clone(),
                 start: point(s.start_index)?,
                 end: point(s.end_index)?,
@@ -522,7 +610,7 @@ pub fn export_track_definition(
         })
         .collect();
     Some(TrackDefinition {
-        version: 1,
+        version: 2,
         name,
         sections: sections?,
     })
@@ -532,6 +620,7 @@ pub fn import_track_definition(
     track: &TrackData,
     definition: &TrackDefinition,
 ) -> Result<Vec<Sector>, String> {
+    definition.validate()?;
     if definition
         .sections
         .iter()
@@ -539,7 +628,7 @@ pub fn import_track_definition(
     {
         return Err("Invalid distance section boundary".into());
     }
-    if definition.version != 1 {
+    if !(1..=2).contains(&definition.version) {
         return Err("Unsupported track definition version".into());
     }
     let (lat, lon, scale) = track.origin.ok_or("GPS origin is unavailable")?;
@@ -573,6 +662,13 @@ pub fn import_track_definition(
                 return Err(format!("{} has identical boundaries", s.name));
             }
             Ok(Sector {
+                semantics: s.semantics.with_identity(format!(
+                    "geo-{:016x}-{:016x}-{:016x}-{:016x}",
+                    s.start[0].to_bits(),
+                    s.start[1].to_bits(),
+                    s.end[0].to_bits(),
+                    s.end[1].to_bits()
+                )),
                 name: s.name.clone(),
                 start_index,
                 end_index,
@@ -633,6 +729,10 @@ pub fn split_lap_into_sectors(track: &TrackData, lap: &Lap, count: usize) -> Vec
     }
     (0..count)
         .map(|i| Sector {
+            semantics: SectionSemantics {
+                id: format!("split-{}-{}", boundaries[i], boundaries[(i + 1) % count]),
+                ..Default::default()
+            },
             name: format!("Section {}", i + 1),
             start_index: boundaries[i],
             end_index: boundaries[(i + 1) % count],
@@ -908,6 +1008,7 @@ mod tests {
             Some((80., 20.))
         );
         let sector = Sector {
+            semantics: SectionSemantics::default(),
             name: "Wrapped".into(),
             start_index: 80,
             end_index: 20,
@@ -1003,6 +1104,7 @@ mod tests {
         assert!(track.x[2].is_nan() && track.y[2].is_nan());
         assert!(track.x[0] < track.x[1] && track.x[1] < track.x[3]);
         let sections = [Sector {
+            semantics: SectionSemantics::default(),
             name: "Straight".into(),
             start_index: 0,
             end_index: 3,
@@ -1064,6 +1166,7 @@ mod tests {
             end_time: 0.25,
         };
         let sector = Sector {
+            semantics: Default::default(),
             distance: None,
             name: "Turn 1".into(),
             start_index: 0,

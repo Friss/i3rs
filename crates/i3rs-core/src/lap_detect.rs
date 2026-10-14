@@ -39,6 +39,16 @@ pub fn format_duration(secs: f64) -> String {
 ///
 /// Recorded beacon events take priority over ECU timers, which can reset when
 /// the engine stops and can miss two crossings between consecutive samples.
+pub fn recorded_beacon_times(ld: &LdFile) -> Vec<f64> {
+    find_channel(ld, &["beacon (internal)"])
+        .filter(|ch| ch.data_type == crate::DataType::Int16)
+        .and_then(|ch| {
+            ld.read_channel_data(ch)
+                .map(|data| beacon_boundaries(&data, ch.freq, ld.duration_secs()))
+        })
+        .unwrap_or_default()
+}
+
 pub fn detect_laps(ld: &LdFile) -> Vec<Lap> {
     if let Some(ch) = find_channel(ld, &["beacon (internal)"])
         && ch.data_type == crate::ld_parser::DataType::Int16

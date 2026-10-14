@@ -55,6 +55,20 @@ impl TimelinePanel {
         painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 30, 35));
 
         self.draw_lap_blocks(&painter, rect, shared, duration);
+        if let Some(analysis) = shared.current_analysis() {
+            for marker in &analysis.markers {
+                let x = rect.left() + (marker.time / duration) as f32 * rect.width();
+                let color = if marker.kind == i3rs_core::ranges::MarkerKind::MissedBeacon {
+                    egui::Color32::LIGHT_RED
+                } else {
+                    egui::Color32::WHITE
+                };
+                painter.line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(1., color),
+                );
+            }
+        }
 
         // Zoom window rectangle
         let zoom_left = rect.left() + (zoom.0 / duration) as f32 * rect.width();
@@ -143,8 +157,19 @@ impl TimelinePanel {
             let right = inner_rect.left() + (lap.end_time / duration) as f32 * inner_rect.width();
             let lap_rect =
                 egui::Rect::from_x_y_ranges(left..=right.max(left + 1.0), inner_rect.y_range());
-            let color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()].gamma_multiply(0.75);
+            let range = shared.current_analysis().and_then(|a| a.ranges.get(i));
+            let color = if range.is_some_and(|r| !r.kind.competition()) {
+                egui::Color32::from_gray(90)
+            } else {
+                CHANNEL_COLORS[i % CHANNEL_COLORS.len()].gamma_multiply(0.75)
+            };
             painter.rect_filled(lap_rect, 0.0, color);
+            if range.is_some_and(|r| r.trust == i3rs_core::ranges::Trust::Untrusted) {
+                painter.line_segment(
+                    [lap_rect.left_bottom(), lap_rect.right_bottom()],
+                    egui::Stroke::new(2., egui::Color32::LIGHT_RED),
+                );
+            }
 
             if let Some(label) = self.label_for_lap(lap.name.as_str(), lap_rect.width()) {
                 let label_painter = painter.with_clip_rect(lap_rect.shrink2(egui::vec2(2.0, 0.0)));

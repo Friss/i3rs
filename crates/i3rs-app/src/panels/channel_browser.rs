@@ -148,16 +148,27 @@ fn show_lap_selector(ui: &mut egui::Ui, shared: &mut SharedState) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let all_selected = shared.selected_lap.is_none();
-            if ui.selectable_label(all_selected, "All laps").clicked() {
+            if ui.selectable_label(all_selected, "All ranges").clicked() {
                 new_selection = None;
             }
 
             for (i, lap) in shared.laps.iter().enumerate() {
-                let label = format!(
-                    "{} - {}",
-                    lap.name,
-                    i3rs_core::format_duration(lap.duration())
-                );
+                let label =
+                    if let Some(range) = shared.current_analysis().and_then(|a| a.ranges.get(i)) {
+                        format!(
+                            "{} [{} · {:?}] - {}",
+                            lap.name,
+                            range.kind.label(),
+                            range.trust,
+                            i3rs_core::format_duration(lap.duration())
+                        )
+                    } else {
+                        format!(
+                            "{} - {}",
+                            lap.name,
+                            i3rs_core::format_duration(lap.duration())
+                        )
+                    };
 
                 let is_selected = shared.selected_lap == Some(i);
                 if ui.selectable_label(is_selected, &label).clicked() {

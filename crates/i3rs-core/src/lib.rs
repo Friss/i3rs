@@ -29,7 +29,7 @@ pub use channels::{
 pub use downsample::{DownsampledPoint, downsample_minmax};
 pub use export::{ExportChannel, export_csv};
 pub use fft::{FftResult, compute_fft, compute_fft_with_planner};
-pub use lap_detect::{Lap, detect_laps, format_duration};
+pub use lap_detect::{Lap, detect_laps, format_duration, recorded_beacon_times};
 pub use ld_parser::{ChannelMeta, DataType, Event, LdFile, Session, normalize_channel_name};
 pub use ldx_parser::{LdxFile, LdxLap, find_ldx_for_ld};
 pub use math_engine::{
@@ -45,3 +45,8 @@ pub use track::{
     export_track_definition, extract_gps_track, find_nearest_sample, find_nearest_sample_in_range,
     import_track_definition, sector_interval, split_lap_into_sectors,
 };
+
+pub mod corrections;
+pub mod ranges;
+
+pub mod annotations;

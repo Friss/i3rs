@@ -20,6 +20,10 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState) {
             shared.show_channel_status = true;
         }
     });
+    let selection = shared.range_selection();
+    if let Some(kind) = selection.kind {
+        ui.weak(format!("{} · {:?}", kind.label(), selection.trust));
+    }
     let time = shared.cursor_time;
     ui.label(time.map_or_else(
         || "Hover a graph for cursor values".into(),
@@ -34,6 +38,9 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState) {
     ui.separator();
     let filter = shared.values_filter.to_lowercase();
     if shared.values_all_channels {
+        if shared.channel_settings.enabled("MoTeC") {
+            shared.request_track_data_build();
+        }
         let mut channels: Vec<_> = shared
             .ld_file
             .as_ref()
@@ -59,6 +66,32 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState) {
                     }
                 }
             });
+        for (name, unit, data) in [
+            ("Corr Speed", "m/s", shared.correction_speed.as_ref()),
+            ("Corr Dist", "m", shared.correction_distance.as_ref()),
+            (
+                "Corr GPS Speed",
+                "m/s",
+                shared.correction_gps_speed.as_ref(),
+            ),
+        ] {
+            if name.to_lowercase().contains(&filter) && shared.channel_settings.enabled("MoTeC") {
+                let value = data.and_then(|(samples, f)| {
+                    time.and_then(|t| {
+                        i3rs_core::channels::sample_with_policy(
+                            samples,
+                            *f,
+                            t,
+                            i3rs_core::Interpolation::Linear,
+                        )
+                    })
+                });
+                ui.label(value.map_or_else(
+                    || format!("{name}: unavailable source"),
+                    |v| format!("{name}: {v:.2} {unit}"),
+                ));
+            }
+        }
         for constant in shared.channel_settings.constants.iter().filter(|c| {
             c.recording == shared.recording_key() && c.name.to_lowercase().contains(&filter)
         }) {

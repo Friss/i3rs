@@ -227,6 +227,9 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState, editor: &mut MathEditor
                 shared.resolve_analysis_reference(&editor.setup.filter_channel)
             {
                 editor.new_unit = match key {
+                    i3rs_core::channels::ChannelKey::Generated(name) => {
+                        if name.contains("Speed") { "m/s" } else { "m" }.into()
+                    }
                     i3rs_core::channels::ChannelKey::Physical(idx) => {
                         super::utils::resolve_channel_meta(
                             crate::state::ChannelId::Physical(idx),
@@ -715,6 +718,38 @@ fn build_channel_data_map(
                         freq: 1,
                     },
                 );
+            }
+            ChannelResolution::Resolved {
+                key: ChannelKey::Generated(name),
+                ..
+            } => {
+                input_units.insert(
+                    reference.clone(),
+                    if name.contains("Speed") { "m/s" } else { "m" }.into(),
+                );
+                let data = match name.as_str() {
+                    "Corr Speed" => shared.correction_speed.as_ref(),
+                    "Corr GPS Speed" => shared.correction_gps_speed.as_ref(),
+                    _ => shared.correction_distance.as_ref(),
+                };
+                if let Some((samples, freq)) = data {
+                    channel_data.insert(
+                        reference,
+                        ChannelData {
+                            samples: samples.to_vec(),
+                            freq: *freq,
+                        },
+                    );
+                } else if let Some(failure) = &shared.correction_error {
+                    error = Some(format!("{name}: {failure}"));
+                    break;
+                } else if shared.corrections_settled() {
+                    error = Some(format!("{name}: no usable correction source"));
+                    break;
+                } else {
+                    shared.request_track_data_build();
+                    waiting_on_inputs = true;
+                }
             }
             ChannelResolution::Unresolved { reason, .. } => {
                 error = Some(reason);

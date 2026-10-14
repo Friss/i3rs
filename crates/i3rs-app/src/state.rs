@@ -424,6 +424,14 @@ pub struct SharedState {
     pub file_name: String,
 
     // Lap data
+    pub recording_analyses:
+        std::collections::BTreeMap<String, i3rs_core::ranges::RecordingAnalysis>,
+    pub correction_gps_speed: Option<(Arc<[f64]>, u16)>,
+    pub correction_speed: Option<(Arc<[f64]>, u16)>,
+    pub correction_distance: Option<(Arc<[f64]>, u16)>,
+    pub correction_error: Option<String>,
+    pub correction_revision: u64,
+    pub show_recording_editor: bool,
     pub laps: Vec<Lap>,
     pub ldx: Option<LdxFile>,
     pub selected_lap: Option<usize>,
@@ -492,6 +500,13 @@ impl SharedState {
     pub fn new() -> Self {
         Self {
             session_id: 0,
+            recording_analyses: Default::default(),
+            correction_gps_speed: None,
+            correction_speed: None,
+            correction_distance: None,
+            correction_error: None,
+            correction_revision: 0,
+            show_recording_editor: false,
             ld_file: None,
             ld_path: None,
             file_name: String::new(),
@@ -543,7 +558,26 @@ impl SharedState {
         self.distance_axis_cache = None;
     }
 
+    pub fn invalidate_correction_caches(&mut self) {
+        self.correction_revision += 1;
+        self.correction_gps_speed = None;
+        self.correction_speed = None;
+        self.correction_distance = None;
+        self.correction_error = None;
+        self.invalidate_derived_caches();
+        self.track_data_cache.borrow_mut().take();
+        *self.pending_track_data_build.borrow_mut() = false;
+        *self.requested_track_data_build.borrow_mut() = false;
+        *self.resolved_track_data_build.borrow_mut() = false;
+        self.request_track_data_build();
+    }
+
     pub fn invalidate_session_caches(&mut self) {
+        self.correction_gps_speed = None;
+        self.correction_speed = None;
+        self.correction_distance = None;
+        self.correction_error = None;
+        self.correction_revision += 1;
         self.invalidate_derived_caches();
         self.decoded_channel_cache.borrow_mut().clear();
         self.channel_errors.borrow_mut().clear();
@@ -632,6 +666,10 @@ impl SharedState {
         was_requested
     }
 
+    pub fn corrections_settled(&self) -> bool {
+        *self.resolved_track_data_build.borrow()
+    }
+
     pub fn is_track_data_build_pending(&self) -> bool {
         *self.pending_track_data_build.borrow()
     }
@@ -676,6 +714,10 @@ impl SharedState {
     /// Select a lap (or the whole session) and zoom every panel to it.
     pub fn select_lap(&mut self, lap: Option<usize>) {
         self.selected_lap = lap;
+        let key = self.recording_key().to_string();
+        if let Some(model) = self.recording_analyses.get_mut(&key) {
+            model.selected_range = lap.and_then(|i| model.ranges.get(i)).map(|r| r.id.clone());
+        }
         self.zoom_from_timeline = true;
         self.zoom_range = lap
             .and_then(|index| self.laps.get(index))
