@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the local May 8 S1 reference log"]
-    fn matches_live_i2_short_lap_histogram() {
+    fn matches_live_i2_lap_histograms() {
         // i2 Standard 1.1.4.457, RPM Histo, observed 2026-10-14:
         // Lap 2 is 59 ms, with one sample in 4900–5000 rpm / 90–100% throttle.
         let ld = i3rs_core::LdFile::open(concat!(
@@ -611,6 +611,37 @@ mod tests {
         assert_eq!(bins.iter().flat_map(|b| &b.counts).sum::<u64>(), 1);
         assert_eq!(bins[10].counts[49], 1);
         assert_eq!(histogram_height(1, bins[10].denominator, true), 100.0);
+
+        // Lap 3: the ten band totals are transcribed from the live i2 legend.
+        // Its top band includes the 566 native samples decoded as exactly 100%.
+        let lap = &laps[3];
+        assert!((lap.duration() - 134.114).abs() < 1e-9);
+        let samples: Vec<_> =
+            sample_range(rpm_data.len(), rpm.freq, (lap.start_time, lap.end_time))
+                .map(|i| {
+                    (
+                        rpm_data[i],
+                        interp_at_time(&throttle_data, throttle.freq, i as f64 / rpm.freq as f64)
+                            .unwrap(),
+                    )
+                })
+                .collect();
+        let bins = histogram_bins(
+            &samples,
+            90,
+            (0.0, 9000.0),
+            Some(ColorBands {
+                count: 10,
+                centered: false,
+                ..ColorBands::default()
+            }),
+        );
+        assert_eq!(samples.len(), 2682);
+        let totals: Vec<u64> = bins.iter().map(|b| b.counts.iter().sum()).collect();
+        assert_eq!(
+            totals,
+            [0, 1037, 204, 94, 59, 36, 29, 16, 15, 23, 1169, 0, 0]
+        );
     }
 
     #[test]
@@ -640,7 +671,8 @@ mod tests {
         assert_eq!(bins[1].counts[1], 1);
         assert_eq!(bins[2].counts[1], 1);
         assert_eq!(bins[10].counts[2], 1);
-        assert_eq!(bins[11].counts[89], 2);
+        assert_eq!(bins[10].counts[89], 1);
+        assert_eq!(bins[11].counts[89], 1);
         assert_eq!(bins[12].counts[5], 1);
         assert_eq!(bins[0].denominator, 8);
         let percentage: f64 = bins

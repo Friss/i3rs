@@ -14,7 +14,7 @@ Switching Fusion from full screen to Single Window restored enough guest input t
 | RPM Histo displays one sample, 100%, in the 4900–5000 rpm bin and the 90–100% throttle band | Native extraction yields one sample at 814.55 s: 4911.42334 rpm, 99.99623% throttle. The app's sampling/binning functions produce the same bin, band and percentage | Match; local reference regression added |
 | RPM Histo axis spans 0–9000 rpm; legend has ten throttle bands plus under/overflow | I3R-1 Circuit configuration | Observed configuration consistent; properties dialog not rechecked |
 
-The local regression `matches_live_i2_short_lap_histogram` uses the actual recording and the app's histogram sampling/binning path. It is ignored in public CI because the private recording is not distributed. Run it with `cargo test -p i3rs-app matches_live_i2_short_lap_histogram -- --ignored`.
+The local regression `matches_live_i2_lap_histograms` uses the actual recording and the app's histogram sampling/binning path. It is ignored in public CI because the private recording is not distributed. Run it with `cargo test -p i3rs-app matches_live_i2_lap_histograms -- --ignored`.
 
 Guest mouse/keyboard routing remains intermittent: worksheet selection worked, but attempts to select Out Lap/open the Data menu had no reliable effect or opened context/Start menus. The fresh candidate native bundle launch previously timed out. These observations therefore validate reference behavior against the candidate numerical path, not a fresh side-by-side native GUI pass. No raw log, i2 corrections or math definitions were edited.
 
@@ -27,4 +27,32 @@ Guest mouse/keyboard routing remains intermittent: worksheet selection worked, b
 - Validate Oversteer with resolvable inputs and the actual vehicle wheelbase; retain result radians/display degrees and compare samples.
 - Exercise range edits, trust, markers and sidecar reload in the candidate GUI. Keep applicable Pro acceptance separate from the Standard session.
 
-The three ticket reports retain their explicit acceptance gaps. This initial live pass does not close the tickets.
+## Review check and retry later on October 14
+
+PR #22 had no review comments, conversation comments or submitted reviews. All checks passed on `7a42bec`. The retry successfully selected Lap 3 with i2's next-lap toolbar button, read Histogram Properties and opened Track Report.
+
+Lap 3 spans 814.574–948.688 s and displays `2:14.114`, with 2,682 histogram samples. i2's ten throttle-band totals, from low to high, are **1037, 204, 94, 59, 36, 29, 16, 15, 23, 1169**; both outlier populations are zero. Before the fix, i3rs's top band held 603 samples and overflow held 566, all decoded as exactly 100%. Including the outer upper endpoint in the final band reproduces every observed total. Internal boundaries and genuinely above-range values retain their existing behavior. The expanded local reference test passes. The i2 table still labels its top interval `90 ≤ v < 100` and overflow `100 ≤ v`; the observed populations, rather than those labels alone, justify this candidate endpoint policy. A controlled constant-input probe would establish i2's internal arithmetic more precisely.
+
+Eleven visible Track Report speed labels match i3rs at one decimal place:
+
+| Section | Event | mph |
+| --- | --- | --- |
+| Str 0-1 | Maximum | 133.6 |
+| Str 1-2 | Maximum | 91.7 |
+| Str 3-4 | Maximum | 80.0 |
+| Str 5-6 | Maximum | 125.0 |
+| Turn 7 | Minimum | 106.0 |
+| Turn 8 | Minimum | 98.9 |
+| Str 10-11 | Maximum | 104.2 |
+| Str 12-13 | Maximum | 141.9 |
+| Str 13-14 | Maximum | 64.9 |
+| Turn 15 | Minimum | 65.1 |
+| Str 16-17 | Maximum | 103.4 |
+
+`matches_visible_live_i2_lap3_track_speed_labels` preserves these comparisons as a local core regression and passes. The live view also has a 101.8 mph maximum near the upper track sections that is not accepted by this test; its section association/boundaries need closer comparison. Candidate Str 2-3 currently yields 67.3 mph. Remaining labels, event positions, annotation suppression and gear transitions are still open acceptance items.
+
+The user explicitly approved launching `/tmp/i3rs-I3R3.app` after automatic review required confirmation for that local build. Launch timed out; the app then appeared running in the inventory, but binding to it by bundle ID also timed out. Thus the candidate native GUI comparison remains unavailable; the recorded matches use its numerical paths. No i2 correction or math settings were changed.
+
+After the endpoint fix, 235 workspace tests and all 12 local reference regressions pass. Workspace Clippy with warnings denied, release build, formatting and diff checks also pass. Raw reference logs remain local.
+
+The three ticket reports retain their explicit acceptance gaps. These partial live comparisons do not close the tickets.
