@@ -26,7 +26,7 @@ Focused regressions cover kPa→psi, C→°F including offset, mixed rates, outp
 
 ## Reference evidence and remaining acceptance limits
 
-The implementation was checked against the saved [RPM bin settings](evidence/i2-feature-audit/40-histo-properties.png), [throttle bands](evidence/i2-feature-audit/42-histo-color.png) and [Spare view](evidence/i2-feature-audit/54-spare.png) from i2 Standard 1.1.4.457. The throttle table explicitly shows lower-inclusive, upper-exclusive intervals.
+The implementation was checked against the saved [RPM bin settings](evidence/i3r-1/40-histo-properties.png), [throttle bands](evidence/i3r-1/42-histo-color.png) and [Spare view](evidence/i3r-1/54-spare.png) from i2 Standard 1.1.4.457. The throttle table explicitly shows lower-inclusive, upper-exclusive intervals.
 
 The local reference recording `S1_#28299_20260508_174455_02.ld` contains neither Feed Forward nor ECU Acceleration X/Y/Z. The reference Spare screenshot lists them without displayed values. A fixture with those names verifies resolution and tile placement; a local-reference test verifies missing names do not bind to unrelated channels. Resolving these channels against an actual recording that contains them remains an acceptance check. Preserving visible unresolved worksheet slots belongs to W05.
 
