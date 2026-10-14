@@ -1388,17 +1388,19 @@ impl App {
         let add_scatter = KeyboardShortcut::new(command_shift, Key::X);
         let add_fft = KeyboardShortcut::new(command_shift, Key::F);
 
-        if ctx.input_mut(|i| i.consume_shortcut(&open_file)) {
-            self.start_open_session(ctx);
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&save_project)) {
-            self.save_project();
-        }
+        // egui allows extra Shift/Alt modifiers, so consume the more specific
+        // shortcuts first before their unshifted counterparts.
         if ctx.input_mut(|i| i.consume_shortcut(&load_project)) {
             self.load_project();
         }
         if ctx.input_mut(|i| i.consume_shortcut(&save_workspace)) {
             self.save_workspace();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&open_file)) {
+            self.start_open_session(ctx);
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&save_project)) {
+            self.save_project();
         }
         if ctx.input_mut(|i| i.consume_shortcut(&toggle_browser)) {
             self.show_channel_browser = !self.show_channel_browser;

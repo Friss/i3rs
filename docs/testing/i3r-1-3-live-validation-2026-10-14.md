@@ -2,6 +2,8 @@
 
 Branch: `friss/i3r-1-3-i2-parity`. [Draft PR #22](https://github.com/Friss/i3rs/pull/22) contains all three tickets. Linux tests/lint, macOS/Linux/Windows builds, web build, performance reporting and Semgrep passed for the initial consolidated implementation.
 
+Latest result: after the user's desktop approval, the candidate native GUI responded and the full Lap 3 histogram matched all ten observed i2 throttle-band populations. The eleven checked speed labels also appeared with matching values in the candidate Track Report. Project restore and a range trust edit passed the GUI smoke check. Full annotation/correction/Oversteer and Pro acceptance remain open; details of this pass are recorded below.
+
 ## Fresh VMware observations
 
 Reference: MoTeC i2 **Standard 1.1.4.457**, Circuit workspace, Windows 11 Arm in VMware Fusion. This is not live Pro acceptance.
@@ -56,3 +58,19 @@ The user explicitly approved launching `/tmp/i3rs-I3R3.app` after automatic revi
 After the endpoint fix, 235 workspace tests and all 12 local reference regressions pass. Workspace Clippy with warnings denied, release build, formatting and diff checks also pass. Raw reference logs remain local.
 
 The three ticket reports retain their explicit acceptance gaps. These partial live comparisons do not close the tickets.
+
+## Native GUI pass after desktop approval
+
+The approved `/tmp/i3rs-I3R3.app` became controllable. The first running process still used the pre-endpoint-fix binary, so the validation project was saved to `/tmp/i3r-gui-validation-20261014.i3rsproj` before restarting. Loading that project through File → Load Project restored Lap 3 (`2:14.114`), the recording and RPM Histo worksheet.
+
+The rebuilt native histogram visibly showed **2,682 samples**, 90 bins, locked 0–9000 rpm, percent mode, ten non-centered 0–100% throttle bands, totals **1037, 204, 94, 59, 36, 29, 16, 15, 23, 1169**, and zero underflow/overflow/missing samples. This confirms the population comparison through the GUI, beyond the earlier numerical regression. Individual RPM-bin counts still need an exported reference comparison.
+
+Applying **VIR Full sections** produced 33 named distance sections and displayed all eleven previously checked speed values. The fresh i2 view still showed the 101.8 mph maximum near the upper sections. i3rs showed a 67.3 mph maximum for Str 2-3 and more extrema labels than i2; section association, boundary treatment and suppression remain unresolved. The six native gear changes rendered, but their exact i2 times/positions remain unverified. The gear transition arrow rendered as a missing-glyph box in this build; labels now use ASCII `->`.
+
+The GUI Oversteer template populated the exact supplied expression, Angle quantity, `rad` result, `deg` display, two decimals, automatic highest-input rate and linear interpolation. A recording-scoped definition produced the explicit diagnostic `no enabled source for 'G Force Lat' (tried G Force Lat)`. No wheelbase or input aliases were invented, so this is a metadata/diagnostic smoke check, not a numerical Oversteer comparison.
+
+In the range editor, Lap 2 trust was changed from Unknown to Untrusted and applied. The browser updated that label while Lap 3 selection remained intact. Saving the temporary project preserved the typed range and bounds, all 33 sections and scoped Oversteer definition. The legacy **Fastest** display still reads the `.ldx` fastest-time string (`0:00.059`), independent of edited trust; this pass does not claim downstream trust-based ranking/exclusion. The raw recording and i2 settings were not edited.
+
+The GUI also exposed `Cmd+Shift+O` opening the `.ld` picker: egui's unshifted shortcut consumed the event before Load Project. Shifted Open/Save shortcuts now run first, as required by egui's modifier matching. Existing app tests (80 passed, 6 ignored), Clippy with warnings denied, release build, formatting and diff checks pass for these two UI fixes. All remote checks passed on `f8ceab2`; there were still no PR review/conversation/inline comments at the latest check.
+
+After saving and verifying the temporary project on disk, another restart was attempted to check the shortcut and glyph fixes live. App launch/binding timed out again although the process appeared running. Those two fixes have compiled/unit validation but their final GUI recheck, and restore of the newly edited trust state, remain pending.

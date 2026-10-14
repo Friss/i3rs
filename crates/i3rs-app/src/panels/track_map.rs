@@ -1266,7 +1266,7 @@ fn build_section_annotations(
                     precision = settings.precision as usize
                 )
             }
-            AnnotationKind::GearChange { from, to } => format!("G{from} → G{to}"),
+            AnnotationKind::GearChange { from, to } => format!("G{from} -> G{to}"),
         };
         labels.push((PlotPoint::new(event.x, event.y), text));
     }
@@ -1348,15 +1348,15 @@ mod tests {
         let stats = crate::state::compute_channel_stats(&gear);
         shared.store_decoded_physical_channel(gear_index, gear, stats);
         let decoded = panel.section_annotations(&track, &shared);
-        assert!(decoded.iter().any(|(_, label)| label == "G1 → G2"));
+        assert!(decoded.iter().any(|(_, label)| label == "G1 -> G2"));
         assert!(!Arc::ptr_eq(&before, &decoded));
         shared.sectors[0].name = "Renamed".into();
         let renamed = panel.section_annotations(&track, &shared);
         assert!(renamed[0].1.starts_with("Renamed"));
         shared.laps[0].start_time = 2.0;
         let next_lap = panel.section_annotations(&track, &shared);
-        assert!(next_lap.iter().any(|(_, label)| label == "G3 → G4"));
-        assert!(!next_lap.iter().any(|(_, label)| label == "G1 → G2"));
+        assert!(next_lap.iter().any(|(_, label)| label == "G3 -> G4"));
+        assert!(!next_lap.iter().any(|(_, label)| label == "G1 -> G2"));
         shared.selected_lap = None;
         assert!(panel.section_annotations(&track, &shared).is_empty());
         panel.clear_cache();
