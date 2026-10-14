@@ -46,6 +46,9 @@ pub struct PlottedChannel {
     pub display_scale: f64,
     pub display_offset: f64,
     pub display_unit: Option<String>,
+    pub math_id: Option<u64>,
+    pub math_display_signature: Option<(String, Option<String>)>,
+    pub recording_display_base: Option<(f64, f64, Option<String>)>,
     /// How the display (Y) range is determined for this channel.
     pub scale_mode: ScaleMode,
     /// Fixed lower bound (in display units) used when `scale_mode` is `Manual`.
@@ -61,6 +64,7 @@ pub struct PlottedChannel {
 }
 
 /// Info about a plotted channel, registered by graph panels each frame for the readout panel.
+#[derive(Clone)]
 pub struct PlottedChannelInfo {
     pub channel_id: ChannelId,
     pub name: String,
@@ -71,6 +75,7 @@ pub struct PlottedChannelInfo {
     pub data: Arc<[f64]>,
     pub display_scale: f64,
     pub display_offset: f64,
+    pub interpolation: i3rs_core::channels::Interpolation,
     /// Enum/state labels parsed from the .ld file (value → label).
     pub enum_labels: Arc<HashMap<i64, String>>,
 }
@@ -122,6 +127,8 @@ pub struct MathChannelDef {
     pub id: u64,
     pub name: String,
     pub expression: String,
+    pub options: i3rs_core::channels::MathOptions,
+    pub evaluation_key: Option<String>,
     pub unit: String,
     pub dec_places: i16,
     pub freq: u16,
@@ -150,6 +157,8 @@ impl MathChannelDef {
             id,
             name,
             expression,
+            options: Default::default(),
+            evaluation_key: None,
             unit,
             dec_places,
             freq: 0,
@@ -445,6 +454,12 @@ pub struct SharedState {
 
     // Channel aliases: maps alias name → canonical channel name
     pub channel_aliases: HashMap<String, String>,
+    pub channel_settings: i3rs_core::channels::ChannelSettings,
+    pub analysis_messages: crate::channel_analysis::AnalysisMessages,
+    pub channel_errors: RefCell<HashMap<usize, String>>,
+    pub values_all_channels: bool,
+    pub values_filter: String,
+    pub show_channel_status: bool,
 
     // Global channel display preferences keyed by canonicalized channel name.
     pub channel_preferences: HashMap<String, ChannelPreference>,
@@ -497,6 +512,12 @@ impl SharedState {
             pending_toggle_channel: None,
             math_channels: Vec::new(),
             channel_aliases: HashMap::new(),
+            channel_settings: Default::default(),
+            analysis_messages: Default::default(),
+            channel_errors: RefCell::new(HashMap::new()),
+            values_all_channels: false,
+            values_filter: String::new(),
+            show_channel_status: false,
             channel_preferences: HashMap::new(),
             channel_preferences_dirty: false,
             sectors: Vec::new(),
@@ -525,6 +546,7 @@ impl SharedState {
     pub fn invalidate_session_caches(&mut self) {
         self.invalidate_derived_caches();
         self.decoded_channel_cache.borrow_mut().clear();
+        self.channel_errors.borrow_mut().clear();
         self.pending_channel_decodes.borrow_mut().clear();
         self.requested_channel_decodes.borrow_mut().clear();
         self.pending_math_evaluations.borrow_mut().clear();
@@ -713,6 +735,9 @@ impl SharedState {
     }
 
     pub fn request_physical_channel_decode(&self, channel_idx: usize) {
+        if self.channel_errors.borrow().contains_key(&channel_idx) {
+            return;
+        }
         if self
             .decoded_channel_cache
             .borrow()

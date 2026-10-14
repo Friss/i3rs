@@ -4,10 +4,7 @@ use std::sync::Arc;
 use crate::state::{ChannelStats, compute_channel_stats};
 #[cfg(not(target_arch = "wasm32"))]
 use i3rs_core::extract_gps_track;
-use i3rs_core::{
-    ChannelData, Lap, LdFile, LdxFile, TrackData, detect_laps, evaluate_expression_with_aliases,
-    find_ldx_for_ld,
-};
+use i3rs_core::{ChannelData, Lap, LdFile, LdxFile, TrackData, detect_laps, find_ldx_for_ld};
 
 pub struct LoadedSession {
     pub file_name: String,
@@ -44,6 +41,8 @@ pub enum JobRequest {
         session_id: u64,
         math_id: u64,
         expression: String,
+        evaluation_key: String,
+        options: i3rs_core::math_engine::EvaluationOptions,
         aliases: std::collections::HashMap<String, String>,
         channel_data: std::collections::HashMap<String, ChannelData>,
     },
@@ -84,6 +83,7 @@ pub enum JobResult {
         session_id: u64,
         math_id: u64,
         expression: String,
+        evaluation_key: String,
         result: Result<EvaluatedMathChannel, String>,
     },
 }
@@ -99,6 +99,8 @@ fn perform_load_session(source: LoadSessionSource) -> Result<LoadedSession, Stri
             let ldx = find_ldx_for_ld(&path);
             let ld = LdFile::open(&path)?;
             let data_duration = ld.duration_secs();
+            // Compute source identity in the load job, before UI metadata needs it.
+            ld.recording_id();
             let ld = std::sync::Arc::new(ld);
             let laps = {
                 let _perf = crate::perf_metrics::scope("lap detection");
@@ -124,6 +126,8 @@ fn perform_load_session(source: LoadSessionSource) -> Result<LoadedSession, Stri
         } => {
             let ld = LdFile::from_bytes(bytes)?;
             let data_duration = ld.duration_secs();
+            // Compute source identity in the load job, before UI metadata needs it.
+            ld.recording_id();
             let ld = std::sync::Arc::new(ld);
             let laps = {
                 let _perf = crate::perf_metrics::scope("lap detection");
@@ -175,10 +179,16 @@ fn perform_evaluate_math_channel(
     expression: String,
     channel_data: std::collections::HashMap<String, ChannelData>,
     aliases: std::collections::HashMap<String, String>,
+    options: i3rs_core::math_engine::EvaluationOptions,
 ) -> Result<EvaluatedMathChannel, String> {
     let _perf = crate::perf_metrics::scope("math evaluation");
-    let (samples, freq) = evaluate_expression_with_aliases(&expression, &channel_data, &aliases)
-        .map_err(|err| err.to_string())?;
+    let (samples, freq) = i3rs_core::math_engine::evaluate_expression_with_options(
+        &expression,
+        &channel_data,
+        &aliases,
+        &options,
+    )
+    .map_err(|err| err.to_string())?;
     let stats = compute_channel_stats(&samples);
     Ok(EvaluatedMathChannel {
         samples,
@@ -246,16 +256,20 @@ async fn run_wasm_job(request: JobRequest) -> JobResult {
             session_id,
             math_id,
             expression,
+            evaluation_key,
+            options,
             aliases,
             channel_data,
         } => {
             yield_to_browser().await;
-            let result = perform_evaluate_math_channel(expression.clone(), channel_data, aliases);
+            let result =
+                perform_evaluate_math_channel(expression.clone(), channel_data, aliases, options);
             yield_to_browser().await;
             JobResult::EvaluateMathChannel {
                 session_id,
                 math_id,
                 expression,
+                evaluation_key,
                 result,
             }
         }
@@ -305,13 +319,21 @@ impl BackgroundJobs {
                         session_id,
                         math_id,
                         expression,
+                        evaluation_key,
+                        options,
                         aliases,
                         channel_data,
                     } => JobResult::EvaluateMathChannel {
                         session_id,
                         math_id,
                         expression: expression.clone(),
-                        result: perform_evaluate_math_channel(expression, channel_data, aliases),
+                        evaluation_key,
+                        result: perform_evaluate_math_channel(
+                            expression,
+                            channel_data,
+                            aliases,
+                            options,
+                        ),
                     },
                 };
 

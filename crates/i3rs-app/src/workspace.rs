@@ -13,7 +13,9 @@ use crate::panels::histogram::HistogramPanel;
 use crate::panels::mixture_map::MixtureMapPanel;
 use crate::panels::scatter::ScatterPanel;
 use crate::panels::track_map::TrackMapPanel;
-use crate::panels::utils::{apply_channel_preferences, create_plotted_channel};
+use crate::panels::utils::{
+    apply_channel_preferences, apply_math_display_defaults, create_plotted_channel,
+};
 use crate::state::{
     CHANNEL_COLORS, ChannelId, GraphMode, GraphXAxis, SharedState, compute_channel_stats,
 };
@@ -31,6 +33,8 @@ pub struct WorkspaceFile {
     pub math_channels: Vec<MathChannelConfig>,
     #[serde(default)]
     pub channel_aliases: Vec<ChannelAliasConfig>,
+    #[serde(default)]
+    pub channel_settings: i3rs_core::channels::ChannelSettings,
     #[serde(default)]
     pub sectors: Vec<Sector>,
     #[serde(default)]
@@ -159,16 +163,35 @@ impl Default for GraphDisplayTransformConfig {
 
 impl GraphDisplayTransformConfig {
     fn of(pc: &crate::state::PlottedChannel) -> Self {
+        let (scale, offset, unit) = pc.recording_display_base.clone().unwrap_or((
+            pc.display_scale,
+            pc.display_offset,
+            pc.display_unit.clone(),
+        ));
+        let scale_manual = (pc.scale_mode == crate::state::ScaleMode::Manual).then(|| {
+            let convert = |value| {
+                if pc.recording_display_base.is_none() {
+                    value
+                } else if pc.display_scale.abs() > f64::EPSILON {
+                    (value - pc.display_offset) / pc.display_scale * scale + offset
+                } else {
+                    value
+                }
+            };
+            let a = convert(pc.manual_min);
+            let b = convert(pc.manual_max);
+            (a.min(b), a.max(b))
+        });
         Self {
-            scale: pc.display_scale,
-            offset: pc.display_offset,
-            unit: pc.display_unit.clone(),
-            scale_manual: (pc.scale_mode == crate::state::ScaleMode::Manual)
-                .then_some((pc.manual_min, pc.manual_max)),
+            scale,
+            offset,
+            unit,
+            scale_manual,
         }
     }
 
     fn apply_to(&self, pc: &mut crate::state::PlottedChannel) {
+        pc.recording_display_base = None;
         pc.display_scale = self.scale;
         pc.display_offset = self.offset;
         pc.display_unit = self.unit.clone();
@@ -359,10 +382,25 @@ pub struct MixtureMapPanelConfig {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MathChannelConfig {
+    #[serde(default)]
+    pub options: i3rs_core::channels::MathOptions,
     pub name: String,
     pub expression: String,
     pub unit: String,
     pub dec_places: i16,
+}
+
+impl MathChannelConfig {
+    pub fn create_definition(&self, shared: &mut SharedState) -> crate::state::MathChannelDef {
+        let mut definition = shared.create_math_channel_def(
+            self.name.clone(),
+            self.expression.clone(),
+            self.unit.clone(),
+            self.dec_places,
+        );
+        definition.options = self.options.clone();
+        definition
+    }
 }
 
 fn channel_name_and_kind(channel_id: ChannelId, shared: &SharedState) -> Option<(String, bool)> {
@@ -370,7 +408,10 @@ fn channel_name_and_kind(channel_id: ChannelId, shared: &SharedState) -> Option<
         ChannelId::Physical(idx) => {
             Some((shared.ld_file.as_ref()?.channels[idx].name.clone(), false))
         }
-        ChannelId::Math(idx) => Some((shared.math_channels.get(idx)?.name.clone(), true)),
+        ChannelId::Math(idx) => {
+            let mc = shared.math_channels.get(idx)?;
+            Some((format!("{}::{}", mc.options.source, mc.name), true))
+        }
     }
 }
 
@@ -382,10 +423,7 @@ fn resolve_saved_plotted_channel(
     tile_group: usize,
 ) -> Option<crate::state::PlottedChannel> {
     if is_math {
-        let idx = shared
-            .math_channels
-            .iter()
-            .position(|mc| mc.name == channel_name)?;
+        let idx = shared.resolved_math_index(channel_name)?;
         let data = shared.math_channels.get(idx)?.data.clone()?;
         let stats = compute_channel_stats(&data);
         let mut plotted = crate::state::PlottedChannel {
@@ -397,6 +435,9 @@ fn resolve_saved_plotted_channel(
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            math_id: Some(shared.math_channels[idx].id),
+            recording_display_base: None,
+            math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
             manual_min: stats.min,
             manual_max: stats.max,
@@ -404,6 +445,7 @@ fn resolve_saved_plotted_channel(
             cached_max: stats.max,
             cached_avg: stats.avg,
         };
+        apply_math_display_defaults(&mut plotted, shared);
         apply_channel_preferences(&mut plotted, shared);
         Some(plotted)
     } else {
@@ -450,7 +492,8 @@ pub fn save_workspace(
                                 }
                                 ChannelId::Math(idx) => {
                                     if let Some(mc) = shared.math_channels.get(idx) {
-                                        channel_names.push(mc.name.clone());
+                                        channel_names
+                                            .push(format!("{}::{}", mc.options.source, mc.name));
                                     }
                                     is_math.push(true);
                                 }
@@ -499,7 +542,8 @@ pub fn save_workspace(
                                         (shared.ld_file.as_ref()?.channels[idx].name.clone(), false)
                                     }
                                     ChannelId::Math(idx) => {
-                                        (shared.math_channels.get(idx)?.name.clone(), true)
+                                        let mc = shared.math_channels.get(idx)?;
+                                        (format!("{}::{}", mc.options.source, mc.name), true)
                                     }
                                 };
                                 Some(GraphGaugeConfig {
@@ -702,6 +746,7 @@ pub fn save_workspace(
         .math_channels
         .iter()
         .map(|mc| MathChannelConfig {
+            options: mc.options.clone(),
             name: mc.name.clone(),
             expression: mc.expression.clone(),
             unit: mc.unit.clone(),
@@ -709,7 +754,7 @@ pub fn save_workspace(
         })
         .collect();
 
-    let channel_aliases: Vec<ChannelAliasConfig> = shared
+    let mut channel_aliases: Vec<ChannelAliasConfig> = shared
         .channel_aliases
         .iter()
         .map(|(alias, target)| ChannelAliasConfig {
@@ -717,6 +762,8 @@ pub fn save_workspace(
             target: target.clone(),
         })
         .collect();
+
+    channel_aliases.sort_by(|a, b| a.alias.cmp(&b.alias));
 
     let sectors: Vec<Sector> = shared.sectors.clone();
 
@@ -729,6 +776,7 @@ pub fn save_workspace(
             .map(|p| p.to_string_lossy().to_string()),
         math_channels,
         channel_aliases,
+        channel_settings: shared.channel_settings.clone(),
         sectors,
         track_definition: shared
             .track_data_if_ready()
@@ -767,6 +815,7 @@ pub fn load_workspace(
     workspace: &WorkspaceFile,
     shared: &mut SharedState,
 ) -> Vec<(String, DockState<PanelTab>)> {
+    shared.channel_settings = workspace.channel_settings.clone();
     restore_track_sections(workspace, shared);
     workspace
         .worksheets
@@ -807,8 +856,7 @@ pub fn load_workspace(
 
                             if is_math {
                                 // Find math channel by name
-                                if let Some(mc_idx) =
-                                    shared.math_channels.iter().position(|mc| mc.name == *name)
+                                if let Some(mc_idx) = shared.resolved_math_index(name)
                                     && let Some(data) = &shared.math_channels[mc_idx].data
                                 {
                                     let stats = compute_channel_stats(data);
@@ -821,6 +869,9 @@ pub fn load_workspace(
                                         display_scale: 1.0,
                                         display_offset: 0.0,
                                         display_unit: None,
+                                        math_id: Some(shared.math_channels[mc_idx].id),
+                                        recording_display_base: None,
+                                        math_display_signature: None,
                                         scale_mode: crate::state::ScaleMode::Auto,
                                         manual_min: stats.min,
                                         manual_max: stats.max,
@@ -828,7 +879,10 @@ pub fn load_workspace(
                                         cached_max: stats.max,
                                         cached_avg: stats.avg,
                                     };
-                                    display_transform.apply_to(&mut plotted);
+                                    apply_math_display_defaults(&mut plotted, shared);
+                                    if gc.display_transforms.get(i).is_some() {
+                                        display_transform.apply_to(&mut plotted);
+                                    }
                                     graph.plotted_channels.push(plotted);
                                 }
                             } else if let Some(ld) = &shared.ld_file
@@ -850,9 +904,7 @@ pub fn load_workspace(
                         for gauge in &gc.embedded_gauges {
                             let channel_id = if gauge.is_math {
                                 shared
-                                    .math_channels
-                                    .iter()
-                                    .position(|mc| mc.name == gauge.channel_name)
+                                    .resolved_math_index(&gauge.channel_name)
                                     .map(ChannelId::Math)
                             } else {
                                 shared.ld_file.as_ref().and_then(|ld| {
@@ -1117,6 +1169,9 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            math_id: None,
+            recording_display_base: None,
+            math_display_signature: None,
             scale_mode: ScaleMode::Manual,
             manual_min: 10.0,
             manual_max: 20.0,
@@ -1124,6 +1179,108 @@ mod tests {
             cached_max: 100.0,
             cached_avg: 50.0,
         }
+    }
+
+    #[test]
+    fn scoped_display_transforms_save_base_units_and_manual_limits() {
+        use super::*;
+        let mut channel = sample_channel();
+        channel.recording_display_base = Some((1.0, 0.0, None));
+        channel.display_scale = 2.0;
+        channel.display_offset = 10.0;
+        channel.display_unit = Some("converted".into());
+        channel.manual_min = 30.0;
+        channel.manual_max = 50.0;
+        let config = GraphDisplayTransformConfig::of(&channel);
+        assert_eq!((config.scale, config.offset), (1.0, 0.0));
+        assert_eq!(config.scale_manual, Some((10.0, 20.0)));
+        assert!(config.unit.is_none());
+        config.apply_to(&mut channel);
+        assert!(channel.recording_display_base.is_none());
+        assert_eq!((channel.manual_min, channel.manual_max), (10.0, 20.0));
+    }
+
+    #[test]
+    fn math_default_units_and_explicit_raw_panel_override_survive_reload() {
+        use super::*;
+        let mut shared = SharedState::new();
+        let mut mc = shared.create_math_channel_def("Angle".into(), "0.1".into(), "rad".into(), 2);
+        mc.options.display_unit = Some("deg".into());
+        mc.freq = 1;
+        mc.data = Some(Arc::from(vec![0.1]));
+        shared.math_channels.push(mc);
+        let mut graph = GraphPanel::new(1, "Angle");
+        graph
+            .plotted_channels
+            .push(create_plotted_channel(ChannelId::Math(0), &shared, 0).unwrap());
+        graph
+            .plotted_channels
+            .push(create_plotted_channel(ChannelId::Math(0), &shared, 1).unwrap());
+        crate::panels::utils::set_plotted_channel_display_transform(
+            &mut graph.plotted_channels[1],
+            1.0,
+            0.0,
+            None,
+        );
+        let dock = DockState::new(vec![PanelTab::Graph(graph)]);
+        let workspace = save_workspace(&[("Angle".into(), &dock)], 0, &shared);
+        let mut restored = load_workspace(&workspace, &mut shared);
+        let (_, PanelTab::Graph(graph)) = restored[0].1.iter_all_tabs_mut().next().unwrap() else {
+            panic!()
+        };
+        let channels = &mut graph.plotted_channels;
+        for channel in channels.iter_mut() {
+            crate::panels::utils::refresh_plotted_channel(channel, &shared);
+        }
+        assert_eq!(channels[0].display_unit.as_deref(), Some("deg"));
+        assert_eq!(channels[1].display_scale, 1.0);
+        assert!(channels[1].display_unit.is_none());
+        assert_eq!(
+            resolve_saved_plotted_channel(&shared, "User::Angle", true, egui::Color32::WHITE, 0)
+                .unwrap()
+                .display_unit
+                .as_deref(),
+            Some("deg")
+        );
+    }
+
+    #[test]
+    fn workspace_preserves_source_qualified_math_selections() {
+        use super::*;
+        let mut shared = SharedState::new();
+        for (source, value) in [("User", 1.0), ("Temporary", 2.0)] {
+            let mut mc =
+                shared.create_math_channel_def("Same".into(), value.to_string(), "".into(), 0);
+            mc.options.source = source.into();
+            mc.freq = 1;
+            mc.data = Some(Arc::from(vec![value]));
+            shared.math_channels.push(mc);
+        }
+        let mut graph = crate::panels::graph::GraphPanel::new(1, "Sources");
+        graph
+            .plotted_channels
+            .push(create_plotted_channel(ChannelId::Math(0), &shared, 0).unwrap());
+        graph.add_embedded_gauge_with_style(
+            ChannelId::Math(0),
+            &shared,
+            crate::panels::gauge::GaugeStyle::Digital,
+        );
+        let dock = DockState::new(vec![PanelTab::Graph(graph)]);
+        let workspace = save_workspace(&[("Source choice".into(), &dock)], 0, &shared);
+        let PanelConfig::Graph(config) = &workspace.worksheets[0].panels[0] else {
+            panic!()
+        };
+        assert_eq!(config.channel_names, ["User::Same"]);
+        assert_eq!(config.embedded_gauges[0].channel_name, "User::Same");
+        let restored = load_workspace(&workspace, &mut shared);
+        let (_, PanelTab::Graph(graph)) = restored[0].1.iter_all_tabs().next().unwrap() else {
+            panic!()
+        };
+        assert_eq!(graph.plotted_channels[0].channel_id, ChannelId::Math(0));
+        assert_eq!(
+            graph.embedded_gauges[0].channel.channel_id,
+            ChannelId::Math(0)
+        );
     }
 
     #[test]

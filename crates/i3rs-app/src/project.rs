@@ -231,6 +231,7 @@ mod tests {
             last_file_path: Some("/tmp/weekend/session-01.ld".into()),
             math_channels: vec![],
             channel_aliases: vec![],
+            channel_settings: Default::default(),
             sectors: vec![],
             track_definition: None,
             reference_lap: None,

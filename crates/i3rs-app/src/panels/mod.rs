@@ -1,6 +1,8 @@
 //! UI panels for the application.
 
 pub mod channel_browser;
+pub mod channel_setup;
+pub mod channel_status;
 pub mod cursor_readout;
 pub mod distribution;
 pub mod fft;

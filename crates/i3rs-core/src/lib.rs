@@ -4,6 +4,7 @@
 //! (100MB+) with on-demand channel data decoding.
 
 pub mod analysis;
+pub mod channels;
 pub mod distance;
 mod downsample;
 pub mod export;
@@ -21,6 +22,10 @@ pub use analysis::{
     compute_stats, evenly_spaced_times, find_lap, fixed_hz_times, histogram_bins,
     resample_at_times, sample_at_time, sample_window_for_time, scatter_pairs_at_times,
 };
+pub use channels::{
+    ChannelKey, ChannelMapping, ChannelReference, ChannelResolution, ChannelSettings,
+    Interpolation, MathOptions, SetupConstant, SourcePolicy, component_gate_includes,
+};
 pub use downsample::{DownsampledPoint, downsample_minmax};
 pub use export::{ExportChannel, export_csv};
 pub use fft::{FftResult, compute_fft, compute_fft_with_planner};
@@ -28,8 +33,9 @@ pub use lap_detect::{Lap, detect_laps, format_duration};
 pub use ld_parser::{ChannelMeta, DataType, Event, LdFile, Session, normalize_channel_name};
 pub use ldx_parser::{LdxFile, LdxLap, find_ldx_for_ld};
 pub use math_engine::{
-    ChannelData, MathError, evaluate_expression, evaluate_expression_with_aliases,
-    resolve_alias_target,
+    ChannelData, EvaluationOptions, MathError, evaluate_expression,
+    evaluate_expression_with_aliases, evaluate_expression_with_options, lowpass,
+    resolve_alias_target, smooth_samples,
 };
 pub use math_expr::{Expr, ParseError, parse_expression, referenced_channels};
 pub use rustfft::FftPlanner;

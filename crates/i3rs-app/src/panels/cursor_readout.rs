@@ -4,90 +4,138 @@ use eframe::egui;
 
 use crate::state::SharedState;
 
-/// Render the cursor readout panel.
-pub fn show(ui: &mut egui::Ui, shared: &SharedState) {
-    let cursor_time = match shared.cursor_time {
-        Some(t) => t,
-        None => {
-            ui.centered_and_justified(|ui| {
-                ui.label("Hover over a graph to see values");
-            });
-            return;
+/// Render active-component or searchable all-channel Values. Only visible rows
+/// request source decoding, keeping the all-channel view lazy.
+pub fn show(ui: &mut egui::Ui, shared: &mut SharedState) {
+    ui.horizontal_wrapped(|ui| {
+        ui.selectable_value(&mut shared.values_all_channels, false, "Active component");
+        ui.selectable_value(&mut shared.values_all_channels, true, "All channels");
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut shared.values_filter)
+                .desired_width(ui.available_width()),
+        );
+        if ui.small_button("Status / Messages").clicked() {
+            shared.show_channel_status = true;
         }
-    };
-
-    ui.add(
-        egui::Label::new(egui::RichText::new(format!("Time: {:.3}s", cursor_time)).heading())
-            .truncate(),
-    );
-    ui.separator();
-
-    if shared.display_channel_registry.is_empty() {
-        ui.label("No channels plotted");
-        return;
+    });
+    let time = shared.cursor_time;
+    ui.label(time.map_or_else(
+        || "Hover a graph for cursor values".into(),
+        |t| format!("Time: {t:.3} s"),
+    ));
+    if let Some(t) = time
+        && let Some(axis) = &shared.distance_axis_cache
+        && let Some(distance) = i3rs_core::sample_at_time(&axis.data, axis.freq, t)
+    {
+        ui.label(format!("Distance: {distance:.1} m"));
     }
-
-    egui::ScrollArea::vertical()
-        .auto_shrink([true, false])
-        .show(ui, |ui| {
-            for info in &shared.display_channel_registry {
-                let discrete = info.uses_discrete_values();
-                let value = value_at_time(&info.data, info.freq, cursor_time, discrete);
-                let display_value = if discrete {
-                    value
-                } else {
-                    info.transform_value(value)
-                };
-
-                let value_text = if let Some(label) = info.format_value(display_value) {
-                    label
-                } else {
-                    let dec = info.dec_places.max(0) as usize;
-                    if info.unit.is_empty() {
-                        format!("{:.prec$}", display_value, prec = dec)
+    ui.separator();
+    let filter = shared.values_filter.to_lowercase();
+    if shared.values_all_channels {
+        let mut channels: Vec<_> = shared
+            .ld_file
+            .as_ref()
+            .into_iter()
+            .flat_map(|ld| ld.channels.iter())
+            .map(|ch| crate::state::ChannelId::Physical(ch.index))
+            .chain((0..shared.math_channels.len()).map(crate::state::ChannelId::Math))
+            .map(|id| (id, super::utils::resolve_channel_meta(id, shared).0))
+            .filter(|(_, name)| name.to_lowercase().contains(&filter))
+            .collect();
+        channels.sort_by_key(|(_, name)| name.to_lowercase());
+        let height = ui.spacing().interact_size.y;
+        egui::ScrollArea::vertical()
+            .id_salt("all_values")
+            .show_rows(ui, height, channels.len(), |ui, rows| {
+                for row in rows {
+                    let (id, name) = &channels[row];
+                    if let Some(pc) = super::utils::create_plotted_channel(*id, shared, row) {
+                        let info = super::utils::build_plotted_channel_info(&pc, shared);
+                        value_row(ui, &info, time);
                     } else {
-                        format!("{:.prec$} {}", display_value, info.unit, prec = dec)
+                        ui.label(format!("{name}: unavailable source"));
                     }
-                };
+                }
+            });
+        for constant in shared.channel_settings.constants.iter().filter(|c| {
+            c.recording == shared.recording_key() && c.name.to_lowercase().contains(&filter)
+        }) {
+            ui.label(format!(
+                "{}: {} {}",
+                constant.name, constant.value, constant.unit
+            ))
+            .on_hover_text(&constant.comment);
+        }
+    } else {
+        egui::ScrollArea::vertical()
+            .id_salt("component_values")
+            .show(ui, |ui| {
+                for info in shared
+                    .display_channel_registry
+                    .iter()
+                    .filter(|info| info.name.to_lowercase().contains(&filter))
+                {
+                    value_row(ui, info, time);
+                }
+            });
+    }
+}
 
-                ui.horizontal(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 2.0, info.color);
-
-                    let gap_width = ui.spacing().item_spacing.x;
-                    let content_width = (ui.available_width() - gap_width * 2.0).max(0.0);
-                    let value_width = (content_width * 0.34).clamp(24.0, 110.0).min(content_width);
-                    let name_width = (content_width - value_width).max(0.0);
-                    let row_height = ui.spacing().interact_size.y;
-
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(name_width, row_height),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.set_width(name_width);
-                            ui.add(
-                                egui::Label::new(&info.name)
-                                    .truncate()
-                                    .halign(egui::Align::LEFT),
-                            );
-                        },
-                    );
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(value_width, row_height),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.set_width(value_width);
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(value_text).monospace())
-                                    .truncate()
-                                    .halign(egui::Align::RIGHT),
-                            );
-                        },
-                    );
-                });
-            }
-        });
+fn value_row(ui: &mut egui::Ui, info: &crate::state::PlottedChannelInfo, time: Option<f64>) {
+    let raw = time.and_then(|time| {
+        i3rs_core::channels::sample_with_policy(
+            &info.data,
+            info.freq,
+            time,
+            if info.uses_discrete_values() {
+                i3rs_core::channels::Interpolation::Previous
+            } else {
+                info.interpolation
+            },
+        )
+    });
+    let text = raw.map_or_else(
+        || "---".into(),
+        |raw| {
+            let display = if info.uses_discrete_values() {
+                raw
+            } else {
+                info.transform_value(raw)
+            };
+            info.format_value(display).unwrap_or_else(|| {
+                format!(
+                    "{:.precision$} {}",
+                    display,
+                    info.unit,
+                    precision = info.dec_places.clamp(0, 12) as usize
+                )
+            })
+        },
+    );
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, info.color);
+        let width = ui.available_width();
+        let value_width = (width * 0.4).min(110.0);
+        let name_width = (width - value_width - ui.spacing().item_spacing.x).max(0.0);
+        let height = ui.spacing().interact_size.y;
+        ui.allocate_ui_with_layout(
+            egui::vec2(name_width, height),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.add(egui::Label::new(&info.name).truncate());
+            },
+        );
+        ui.allocate_ui_with_layout(
+            egui::vec2(value_width, height),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(text).monospace()).truncate());
+            },
+        );
+    });
 }
 
 /// Read a channel value at a given time, using sample-hold semantics for discrete channels.

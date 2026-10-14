@@ -61,12 +61,25 @@ pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> Chan
             if let Some(ld) = &shared.ld_file
                 && let Some(ch) = ld.channels.get(idx)
             {
+                let mapping = shared
+                    .channel_settings
+                    .mapping(&ch.name, shared.recording_key());
+                let labels = mapping.filter(|m| !m.enum_labels.is_empty()).map_or_else(
+                    || Arc::clone(&ch.enum_labels),
+                    |m| Arc::new(m.enum_labels.iter().map(|(v, l)| (*v, l.clone())).collect()),
+                );
                 (
-                    ch.name.clone(),
-                    ch.unit.clone(),
+                    mapping
+                        .filter(|m| !m.name.is_empty())
+                        .map_or_else(|| ch.name.clone(), |m| m.name.clone()),
+                    mapping
+                        .and_then(|m| m.unit.clone())
+                        .unwrap_or_else(|| ch.unit.clone()),
                     ch.freq,
-                    ch.display_decimals as i16,
-                    Arc::clone(&ch.enum_labels),
+                    mapping
+                        .and_then(|m| m.precision)
+                        .unwrap_or(ch.display_decimals as i16),
+                    labels,
                 )
             } else {
                 (
@@ -85,7 +98,13 @@ pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> Chan
                     mc.unit.clone(),
                     mc.freq,
                     mc.dec_places,
-                    Arc::clone(&EMPTY_ENUM_LABELS),
+                    Arc::new(
+                        mc.options
+                            .enum_labels
+                            .iter()
+                            .map(|(v, l)| (*v, l.clone()))
+                            .collect(),
+                    ),
                 )
             } else {
                 (
@@ -124,6 +143,18 @@ fn normalized_unit(unit: &str) -> String {
 
 pub fn display_presets_for_unit(unit: &str) -> Vec<DisplayUnitPreset> {
     match normalized_unit(unit).as_str() {
+        "rad" => vec![DisplayUnitPreset {
+            label: "Show as degrees",
+            scale: 180.0 / std::f64::consts::PI,
+            offset: 0.0,
+            unit: "deg",
+        }],
+        "deg" | "°" => vec![DisplayUnitPreset {
+            label: "Show as radians",
+            scale: std::f64::consts::PI / 180.0,
+            offset: 0.0,
+            unit: "rad",
+        }],
         "km/h" | "kph" => vec![DisplayUnitPreset {
             label: "Show as mph",
             scale: 0.621_371_192,
@@ -236,6 +267,9 @@ pub fn sample_range(len: usize, freq: u16, range: (f64, f64)) -> std::ops::Range
 
 /// Load raw channel data from a ChannelId, returning the immutable shared sample buffer.
 pub fn load_channel_data(channel_id: ChannelId, shared: &SharedState) -> Option<Arc<[f64]>> {
+    if !shared.channel_enabled(channel_id) {
+        return None;
+    }
     match channel_id {
         ChannelId::Physical(idx) => {
             if let Some(decoded) = shared.decoded_physical_channel_if_ready(idx) {
@@ -281,6 +315,12 @@ pub fn create_plotted_channel(
         display_scale: 1.0,
         display_offset: 0.0,
         display_unit: None,
+        math_id: match channel_id {
+            ChannelId::Math(idx) => shared.math_channels.get(idx).map(|mc| mc.id),
+            _ => None,
+        },
+        recording_display_base: None,
+        math_display_signature: None,
         scale_mode: crate::state::ScaleMode::Auto,
         manual_min: cached_min,
         manual_max: cached_max,
@@ -288,11 +328,84 @@ pub fn create_plotted_channel(
         cached_max,
         cached_avg,
     };
+    apply_math_display_defaults(&mut plotted, shared);
     apply_channel_preferences(&mut plotted, shared);
     Some(plotted)
 }
 
+/// Definition display defaults are separate from raw result units and panel overrides.
+pub fn apply_math_display_defaults(channel: &mut PlottedChannel, shared: &SharedState) {
+    let ChannelId::Math(idx) = channel.channel_id else {
+        return;
+    };
+    let Some(mc) = shared.math_channels.get(idx) else {
+        return;
+    };
+    let signature = (mc.unit.clone(), mc.options.display_unit.clone());
+    if channel.math_display_signature.as_ref() == Some(&signature) {
+        return;
+    }
+    let projection = |from: &str, to: &Option<String>| {
+        to.as_ref()
+            .and_then(|unit| i3rs_core::channels::unit_transform(from, unit).ok())
+            .map_or((1.0, 0.0, None), |(scale, offset)| {
+                (scale, offset, to.clone())
+            })
+    };
+    let before = channel
+        .math_display_signature
+        .as_ref()
+        .map(|(from, to)| projection(from, to));
+    let follows_default = before.map_or(
+        channel.display_scale == 1.0
+            && channel.display_offset == 0.0
+            && channel.display_unit.is_none(),
+        |(scale, offset, unit)| {
+            (channel.display_scale - scale).abs() < 1e-9
+                && (channel.display_offset - offset).abs() < 1e-9
+                && channel.display_unit == unit
+        },
+    );
+    if follows_default {
+        let (scale, offset, unit) = projection(&signature.0, &signature.1);
+        set_plotted_channel_display_transform(channel, scale, offset, unit);
+    } else if channel
+        .math_display_signature
+        .as_ref()
+        .is_some_and(|(from, _)| from != &signature.0)
+        && let Some(unit) = &channel.display_unit
+    {
+        if let Ok((scale, offset)) = i3rs_core::channels::unit_transform(&signature.0, unit) {
+            set_plotted_channel_display_transform(channel, scale, offset, Some(unit.clone()));
+        } else {
+            let (scale, offset, unit) = projection(&signature.0, &signature.1);
+            set_plotted_channel_display_transform(channel, scale, offset, unit);
+            shared.message(format!(
+                "{}: display units reset after result unit change",
+                mc.name
+            ));
+        }
+    }
+    channel.math_display_signature = Some(signature);
+}
+
 pub fn refresh_plotted_channel(channel: &mut PlottedChannel, shared: &SharedState) -> bool {
+    if let Some(id) = channel.math_id {
+        let Some(idx) = shared.math_channel_index_by_id(id) else {
+            channel.channel_id = ChannelId::Math(usize::MAX);
+            let changed = !channel.data.is_empty();
+            channel.data = Arc::clone(&EMPTY_SAMPLES);
+            return changed;
+        };
+        channel.channel_id = ChannelId::Math(idx);
+    }
+    if !shared.channel_enabled(channel.channel_id) {
+        let changed = !channel.data.is_empty();
+        channel.data = Arc::clone(&EMPTY_SAMPLES);
+        return changed;
+    }
+    apply_math_display_defaults(channel, shared);
+    apply_recording_display_transform(channel, shared);
     match channel.channel_id {
         ChannelId::Physical(idx) => {
             if let Some(decoded) = shared.decoded_physical_channel_if_ready(idx) {
@@ -318,7 +431,9 @@ pub fn refresh_plotted_channel(channel: &mut PlottedChannel, shared: &SharedStat
                 return false;
             };
             let Some(data) = &math_channel.data else {
-                return false;
+                let changed = !channel.data.is_empty();
+                channel.data = Arc::clone(&EMPTY_SAMPLES);
+                return changed;
             };
             let changed = channel.data.as_ptr() != data.as_ptr()
                 || channel.data.len() != data.len()
@@ -353,18 +468,68 @@ pub fn build_plotted_channel_info(
         data: channel.data.clone(),
         display_scale: channel.display_scale,
         display_offset: channel.display_offset,
+        interpolation: match channel.channel_id {
+            ChannelId::Physical(idx) => shared
+                .ld_file
+                .as_ref()
+                .and_then(|ld| ld.channels.get(idx))
+                .and_then(|ch| {
+                    shared
+                        .channel_settings
+                        .mapping(&ch.name, shared.recording_key())
+                })
+                .map_or(Default::default(), |m| m.interpolation),
+            ChannelId::Math(idx) => shared
+                .math_channels
+                .get(idx)
+                .map_or(Default::default(), |mc| mc.options.interpolation),
+        },
         enum_labels,
+    }
+}
+
+fn apply_recording_display_transform(channel: &mut PlottedChannel, shared: &SharedState) {
+    let mapping = if let ChannelId::Physical(idx) = channel.channel_id {
+        shared
+            .ld_file
+            .as_ref()
+            .and_then(|ld| ld.channels.get(idx))
+            .and_then(|ch| {
+                shared
+                    .channel_settings
+                    .mapping(&ch.name, shared.recording_key())
+            })
+    } else {
+        None
+    };
+    if let Some(mapping) = mapping
+        .filter(|m| m.display_scale != 1.0 || m.display_offset != 0.0 || m.display_unit.is_some())
+    {
+        if channel.recording_display_base.is_none() {
+            channel.recording_display_base = Some((
+                channel.display_scale,
+                channel.display_offset,
+                channel.display_unit.clone(),
+            ));
+        }
+        set_plotted_channel_display_transform(
+            channel,
+            mapping.display_scale,
+            mapping.display_offset,
+            mapping.display_unit.clone(),
+        );
+    } else if let Some((scale, offset, unit)) = channel.recording_display_base.take() {
+        set_plotted_channel_display_transform(channel, scale, offset, unit);
     }
 }
 
 pub fn apply_channel_preferences(channel: &mut PlottedChannel, shared: &SharedState) {
     let (name, _, _, _, _) = resolve_channel_display_meta(channel.channel_id, shared);
     let key = channel_preference_key(&name);
-    let Some(pref) = shared.channel_preferences.get(&key) else {
-        return;
-    };
-
-    apply_channel_preference(channel, pref);
+    if let Some(pref) = shared.channel_preferences.get(&key) {
+        apply_channel_preference(channel, pref);
+    }
+    apply_recording_display_transform(channel, shared);
 }
 
 pub fn apply_channel_preference(channel: &mut PlottedChannel, pref: &ChannelPreference) {
@@ -494,6 +659,47 @@ pub fn show_plotted_channel_display_menu(
         }
     }
 
+    if let ChannelId::Physical(idx) = channel.channel_id
+        && !uses_discrete_values(
+            &name,
+            &resolve_channel_display_meta(channel.channel_id, shared).4,
+        )
+        && let Some(time) = shared.cursor_time
+        && let Some(raw) = i3rs_core::channels::sample_with_policy(
+            &channel.data,
+            resolve_channel_meta(channel.channel_id, shared).2,
+            time,
+            i3rs_core::channels::Interpolation::Linear,
+        )
+        && ui.button("Zero at cursor for this recording").clicked()
+    {
+        let original = shared.ld_file.as_ref().unwrap().channels[idx].name.clone();
+        let recording = shared.recording_key().to_string();
+        let mut mapping = shared
+            .channel_settings
+            .mapping(&original, &recording)
+            .cloned()
+            .unwrap_or_default();
+        mapping.original = original;
+        mapping.recording = Some(recording);
+        mapping.display_scale = channel.display_scale;
+        mapping.display_offset = -raw * channel.display_scale;
+        mapping.display_unit = channel.display_unit.clone();
+        if let Some(existing) = shared
+            .channel_settings
+            .mappings
+            .iter_mut()
+            .find(|m| m.original == mapping.original && m.recording == mapping.recording)
+        {
+            *existing = mapping;
+        } else {
+            shared.channel_settings.mappings.push(mapping);
+        }
+        shared.invalidate_math_results();
+        apply_recording_display_transform(channel, shared);
+        ui.close();
+    }
+
     let pref_key = channel_preference_key(&name);
     let has_global_pref = shared.channel_preferences.contains_key(&pref_key);
     ui.separator();
@@ -593,6 +799,9 @@ mod tests {
             display_scale: 2.0,
             display_offset: 5.0,
             display_unit: Some("psi".into()),
+            math_id: None,
+            recording_display_base: None,
+            math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
             manual_min: 1.0,
             manual_max: 1.0,
@@ -620,6 +829,9 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            math_id: None,
+            recording_display_base: None,
+            math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
             manual_min: 0.0,
             manual_max: 1.0,
@@ -652,6 +864,9 @@ mod tests {
             display_scale: 0.145_037_738,
             display_offset: 0.0,
             display_unit: Some("psi".into()),
+            math_id: None,
+            recording_display_base: None,
+            math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Manual,
             manual_min: 0.0,
             manual_max: 145.037_738,

@@ -239,6 +239,7 @@ impl ChannelMeta {
 /// is decoded on-demand from the memory map.
 pub struct LdFile {
     backing: LdBacking,
+    recording_id: std::sync::OnceLock<String>,
     pub session: Session,
     pub event: Event,
     pub channels: Vec<ChannelMeta>,
@@ -262,6 +263,18 @@ impl LdBacking {
 }
 
 impl LdFile {
+    /// Stable content identity, computed lazily when recording-scoped analysis is used.
+    /// FNV-1a 128 is an identity fingerprint, not a cryptographic integrity check.
+    pub fn recording_id(&self) -> &str {
+        self.recording_id.get_or_init(|| {
+            let mut hash = 0x6c62272e07bb014262b821756295c58du128;
+            for byte in self.data() {
+                hash = (hash ^ *byte as u128).wrapping_mul(0x1000000000000000000013bu128);
+            }
+            format!("ld:{hash:032x}")
+        })
+    }
+
     /// Open and parse a .ld file.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let file = File::open(path.as_ref()).map_err(|e| format!("Failed to open file: {}", e))?;
@@ -318,6 +331,7 @@ impl LdFile {
 
         Ok(LdFile {
             backing,
+            recording_id: std::sync::OnceLock::new(),
             session,
             event,
             channels,

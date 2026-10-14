@@ -42,20 +42,25 @@ pub fn show_standalone(ui: &mut egui::Ui, shared: &mut SharedState) {
                     sorted_channels.sort_by_key(|a| a.name.to_lowercase());
 
                     for ch in &sorted_channels {
+                        let (name, unit, _, _) = super::utils::resolve_channel_meta(
+                            ChannelId::Physical(ch.index),
+                            shared,
+                        );
                         if !filter_lower.is_empty()
-                            && !ch.name.to_lowercase().contains(&filter_lower)
-                            && !ch.unit.to_lowercase().contains(&filter_lower)
+                            && !name.to_lowercase().contains(&filter_lower)
+                            && !unit.to_lowercase().contains(&filter_lower)
                         {
                             continue;
                         }
                         let label = format!(
                             "{} [{}] {}Hz",
-                            ch.name,
-                            if ch.unit.is_empty() { "-" } else { &ch.unit },
+                            name,
+                            if unit.is_empty() { "-" } else { &unit },
                             ch.freq
                         );
 
-                        let response = ui.add(
+                        let response = ui.add_enabled(
+                            shared.channel_enabled(ChannelId::Physical(ch.index)),
                             egui::Button::selectable(false, &label)
                                 .sense(egui::Sense::click_and_drag()),
                         );
@@ -82,14 +87,16 @@ pub fn show_standalone(ui: &mut egui::Ui, shared: &mut SharedState) {
                         }
                         // Skip channels with evaluation errors
                         if mc.data.is_none() {
-                            let label = format!("\u{26A0} {} (error)", mc.name);
-                            ui.colored_label(egui::Color32::from_rgb(200, 100, 100), &label);
+                            let label = format!("\u{26A0} {} ({:?})", mc.name, mc.evaluation_state);
+                            ui.colored_label(egui::Color32::from_rgb(200, 100, 100), &label)
+                                .on_hover_text(mc.error.as_deref().unwrap_or("unavailable source"));
                             continue;
                         }
                         let label = format!(
-                            "\u{0192} {} [{}] {}Hz",
+                            "\u{0192} {} [{}] · {} · {}Hz",
                             mc.name,
                             if mc.unit.is_empty() { "-" } else { &mc.unit },
+                            mc.options.source,
                             mc.freq
                         );
 

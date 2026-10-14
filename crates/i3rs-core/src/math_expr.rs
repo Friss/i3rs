@@ -25,6 +25,8 @@ pub enum Expr {
     Number(f64),
     /// Channel reference. The string is exactly as written (quoted or bare ident).
     Channel(String),
+    /// Explicit requested result unit, as in MoTeC channel references.
+    ChannelInUnit(String, String),
     BinaryOp(Box<Expr>, BinOp, Box<Expr>),
     UnaryNeg(Box<Expr>),
     FuncCall(String, Vec<Expr>),
@@ -98,6 +100,7 @@ enum Token {
     Number(f64),
     Ident(String),
     QuotedString(String),
+    Unit(String),
     Plus,
     Minus,
     Star,
@@ -238,7 +241,23 @@ impl<'a> Tokenizer<'a> {
                     self.pos += 1;
                     Token::Comma
                 }
-                b'"' => self.read_quoted_string()?,
+                b'[' => {
+                    self.pos += 1;
+                    let unit_start = self.pos;
+                    while self.pos < self.input.len() && self.input.as_bytes()[self.pos] != b']' {
+                        self.pos += 1;
+                    }
+                    if self.pos == self.input.len() {
+                        return Err(ParseError {
+                            message: "unterminated unit".into(),
+                            position: start,
+                        });
+                    }
+                    let unit = self.input[unit_start..self.pos].trim().to_string();
+                    self.pos += 1;
+                    Token::Unit(unit)
+                }
+                b'"' | b'\'' => self.read_quoted_string()?,
                 b'0'..=b'9' | b'.' => self.read_number()?,
                 b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.read_ident(),
                 _ => {
@@ -300,9 +319,10 @@ impl<'a> Tokenizer<'a> {
 
     fn read_quoted_string(&mut self) -> Result<Token, ParseError> {
         let start = self.pos;
+        let quote = self.input.as_bytes()[self.pos];
         self.pos += 1; // skip opening quote
         let content_start = self.pos;
-        while self.pos < self.input.len() && self.input.as_bytes()[self.pos] != b'"' {
+        while self.pos < self.input.len() && self.input.as_bytes()[self.pos] != quote {
             self.pos += 1;
         }
         if self.pos >= self.input.len() {
@@ -323,6 +343,14 @@ impl<'a> Tokenizer<'a> {
 
 const BUILTIN_FUNCTIONS: &[&str] = &[
     "smooth",
+    "smooth_samples",
+    "smooth_time",
+    "lowpass",
+    "component_gate",
+    "choose",
+    "sqr",
+    "sgn",
+    "stat_mean",
     "derivative",
     "integrate",
     "abs",
@@ -529,7 +557,12 @@ impl Parser {
             }
             Some(Token::QuotedString(s)) => {
                 self.advance();
-                Ok(Expr::Channel(s))
+                if let Some(Token::Unit(unit)) = self.peek().cloned() {
+                    self.advance();
+                    Ok(Expr::ChannelInUnit(s, unit))
+                } else {
+                    Ok(Expr::Channel(s))
+                }
             }
             Some(Token::Ident(name)) => {
                 // Look ahead: if next is '(' and it's a builtin, parse as function call
@@ -613,7 +646,7 @@ pub fn referenced_channels(expr: &Expr) -> Vec<String> {
 
 fn collect_channels(expr: &Expr, out: &mut Vec<String>) {
     match expr {
-        Expr::Channel(name) => out.push(name.clone()),
+        Expr::Channel(name) | Expr::ChannelInUnit(name, _) => out.push(name.clone()),
         Expr::Number(_) => {}
         Expr::BinaryOp(lhs, _, rhs) => {
             collect_channels(lhs, out);
