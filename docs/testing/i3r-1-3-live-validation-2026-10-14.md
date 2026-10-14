@@ -2,7 +2,7 @@
 
 Branch: `friss/i3r-1-3-i2-parity`. [Draft PR #22](https://github.com/Friss/i3rs/pull/22) contains all three tickets. Linux tests/lint, macOS/Linux/Windows builds, web build, performance reporting and Semgrep passed for the initial consolidated implementation.
 
-Latest result: after the user's desktop approval, the candidate native GUI responded and the full Lap 3 histogram matched all ten observed i2 throttle-band populations. The eleven checked speed labels also appeared with matching values in the candidate Track Report. Project restore and a range trust edit passed the GUI smoke check. Full annotation/correction/Oversteer and Pro acceptance remain open; details of this pass are recorded below.
+Latest result: after the user's desktop approval, the candidate native GUI responded and the full Lap 3 histogram matched all ten observed i2 throttle-band populations. The eleven checked speed labels also appeared with matching values in the candidate Track Report. Project restore, a range trust edit and reload, shifted file shortcuts and readable gear labels passed the GUI smoke check. Full annotation/correction/Oversteer and Pro acceptance remain open; details of this pass are recorded below.
 
 ## Fresh VMware observations
 
@@ -74,3 +74,9 @@ In the range editor, Lap 2 trust was changed from Unknown to Untrusted and appli
 The GUI also exposed `Cmd+Shift+O` opening the `.ld` picker: egui's unshifted shortcut consumed the event before Load Project. Shifted Open/Save shortcuts now run first, as required by egui's modifier matching. Existing app tests (80 passed, 6 ignored), Clippy with warnings denied, release build, formatting and diff checks pass for these two UI fixes. All remote checks passed on `f8ceab2`; there were still no PR review/conversation/inline comments at the latest check.
 
 After saving and verifying the temporary project on disk, another restart was attempted to check the shortcut and glyph fixes live. App launch/binding timed out again although the process appeared running. Those two fixes have compiled/unit validation but their final GUI recheck, and restore of the newly edited trust state, remain pending.
+
+## Successful reconnect and final GUI recheck
+
+After the user reported the desktop issue fixed, the compiled `8070961` app reconnected successfully. **Cmd+Shift+O** opened the project picker and loaded the saved `.i3rsproj` directly, confirming that Open File no longer intercepts it. The browser restored **Lap 2 · Untrusted**, retained Lap 3 selection, and Track Report restored the saved sections and annotations. All six gear-change labels visibly use readable `->` separators, including `G2 -> G3`, `G3 -> G4` and `G4 -> G3`.
+
+**Cmd+Shift+S** opened Save Workspace with default filename `workspace.json`, confirming it no longer invokes Save Project. The save dialog was cancelled after inspection. The earlier shortcut/glyph/trust-reload recheck gaps are now closed; broader reference acceptance listed above is unchanged. At this check, native builds, lint/tests, performance reporting and Semgrep passed on `8070961`; web build was still running. No conversation or submitted review comments had appeared.
