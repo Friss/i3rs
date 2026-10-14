@@ -90,6 +90,19 @@ impl PlottedChannelInfo {
         value * self.display_scale + self.display_offset
     }
 
+    /// Export the same values, units and precision used by the readout.
+    pub fn export_channel(&self) -> i3rs_core::ExportChannel<'_> {
+        i3rs_core::ExportChannel {
+            name: &self.name,
+            unit: &self.unit,
+            data: &self.data,
+            freq: self.freq,
+            dec_places: self.dec_places,
+            display_scale: self.display_scale,
+            display_offset: self.display_offset,
+        }
+    }
+
     /// Statistics of `data` in display units (a negative scale swaps min and max).
     fn display_stats(&self, data: &[f64]) -> ChannelStats {
         let mut stats = compute_channel_stats(data);
@@ -751,6 +764,38 @@ impl SharedState {
 #[cfg(test)]
 mod tests {
     use super::SharedState;
+
+    #[test]
+    fn readout_and_csv_share_display_conversion_and_metadata() {
+        let mut shared = SharedState::new();
+        let mut definition =
+            shared.create_math_channel_def("Temperature".into(), "0".into(), "C".into(), 1);
+        definition.freq = 1;
+        definition.dec_places = 1;
+        definition.data = Some(std::sync::Arc::from([0.0, 100.0, f64::NAN]));
+        shared.math_channels.push(definition);
+        let mut plotted =
+            crate::panels::utils::create_plotted_channel(super::ChannelId::Math(0), &shared, 0)
+                .unwrap();
+        let preset = crate::panels::utils::display_presets_for_unit("C")[0];
+        plotted.display_scale = preset.scale;
+        plotted.display_offset = preset.offset;
+        plotted.display_unit = Some(preset.unit.into());
+        let info = crate::panels::utils::build_plotted_channel_info(&plotted, &shared);
+        let path = std::env::temp_dir().join("i3rs_gui_export_display.csv");
+        i3rs_core::export_csv(&path, &[info.export_channel()], None).unwrap();
+        let csv = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(csv.lines().next(), Some("Time (s),Temperature (°F)"));
+        for (row, raw) in csv.lines().skip(1).zip(info.data.iter()) {
+            let cell = row.split(',').nth(1).unwrap();
+            if raw.is_finite() {
+                assert_eq!(cell, format!("{:.1}", info.transform_value(*raw)));
+            } else {
+                assert!(cell.is_empty());
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn playback_respects_range_speed_and_hover_and_stops_at_end() {

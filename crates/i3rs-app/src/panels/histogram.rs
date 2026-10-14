@@ -571,6 +571,47 @@ fn bins_to_bar_chart(
 mod tests {
     use super::*;
     #[test]
+    fn rpm_and_throttle_boundaries_use_100_rpm_bins_and_ten_noncentered_bands() {
+        let bands = ColorBands {
+            count: 10,
+            centered: false,
+            ..ColorBands::default()
+        };
+        let samples = [
+            (0.0, -0.1),
+            (99.9, 0.0),
+            (100.0, 9.9),
+            (199.9, 10.0),
+            (200.0, 99.9),
+            (8999.9, 100.0),
+            (9000.0, 100.1),
+            (-0.1, 50.0),
+            (9000.1, 50.0),
+            (500.0, f64::NAN),
+        ];
+        let bins = histogram_bins(&samples, 90, (0.0, 9000.0), Some(bands));
+        assert_eq!(bins.len(), 13); // Underflow, 10 bands, overflow, missing.
+        assert_eq!(bins[0].bin_width, 100.0);
+        assert_eq!(bins[0].counts[0], 1);
+        assert_eq!(bins[1].counts[0], 1);
+        assert_eq!(bins[1].counts[1], 1);
+        assert_eq!(bins[2].counts[1], 1);
+        assert_eq!(bins[10].counts[2], 1);
+        assert_eq!(bins[11].counts[89], 2);
+        assert_eq!(bins[12].counts[5], 1);
+        assert_eq!(bins[0].denominator, 8);
+        let percentage: f64 = bins
+            .iter()
+            .flat_map(|b| {
+                b.counts
+                    .iter()
+                    .map(|n| histogram_height(*n, b.denominator, true))
+            })
+            .sum();
+        assert!((percentage - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn automatic_bounds_follow_selected_samples_and_share_edges_across_laps() {
         let data = [-1000.0, 1.0, 2.0, f64::NAN, 1000.0, 3.0, 4.0, 2000.0];
         let bounds = selected_bounds(&data, 1, [(1.0, 3.0)].into_iter(), 2.0, 10.0);

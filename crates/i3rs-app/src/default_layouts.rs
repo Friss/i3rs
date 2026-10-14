@@ -10,6 +10,7 @@ use egui_dock::{DockState, NodeIndex};
 use i3rs_core::LdFile;
 
 use crate::panels::PanelTab;
+use crate::panels::distribution::ColorBands;
 use crate::panels::gauge::GaugeStyle;
 use crate::panels::graph::GraphPanel;
 use crate::panels::histogram::HistogramPanel;
@@ -272,11 +273,12 @@ const SPARE_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
         "Torque Control Cut",
         "Throttle Pedal",
         "CP Engine Speed Targeting Throttle Control Aim",
-        "CP Engine Speed Targeting Throttle Control Forced Forward",
+        "CP Engine Speed Targeting Throttle Control Feed Forward",
         "Torque Limit State",
         "Engine Speed Limit State",
         "ECU Acceleration X",
         "ECU Acceleration Y",
+        "ECU Acceleration Z",
         "CP Lotus ESP Lateral Acceleration",
         "CP Engine Speed Targeting Target",
         "CP Rev Match Engine Speed Target",
@@ -287,12 +289,13 @@ const SPARE_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
             "Torque Control Cut",
             "Throttle Pedal",
             "CP Engine Speed Targeting Throttle Control Aim",
-            "CP Engine Speed Targeting Throttle Control Forced Forward",
+            "CP Engine Speed Targeting Throttle Control Feed Forward",
         ],
         &["Torque Limit State", "Engine Speed Limit State"],
         &[
             "ECU Acceleration X",
             "ECU Acceleration Y",
+            "ECU Acceleration Z",
             "CP Lotus ESP Lateral Acceleration",
         ],
         &[
@@ -635,13 +638,19 @@ fn build_rpm_histo_worksheet(
         shared,
         "Engine Speed",
         &[&["Engine Speed"]],
-        48,
+        90,
         Some((0.0, 9000.0)),
         Some((0.0, 0.0)),
         10.0,
     );
     if let Some(panel) = &mut histogram {
         panel.percentage = true;
+        panel.color_bands = ColorBands {
+            min: 0.0,
+            max: 100.0,
+            count: 10,
+            centered: false,
+        };
         panel.color_channel = find_first_channel(ld, &["Throttle Position", "Throttle Pedal"])
             .and_then(|idx| make_plotted_channel(shared, idx, CHANNEL_COLORS[2], 0));
     }
@@ -749,4 +758,108 @@ pub fn create_default_worksheets(
     }
 
     worksheets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_file(path: &str) -> (Arc<LdFile>, SharedState) {
+        let ld = Arc::new(LdFile::open(path).unwrap());
+        let mut shared = SharedState::new();
+        shared.ld_file = Some(Arc::clone(&ld));
+        shared.data_duration = Some(ld.duration_secs());
+        (ld, shared)
+    }
+
+    #[test]
+    fn rpm_defaults_are_independent_of_centered_mixture_bands() {
+        let (ld, mut shared) = load_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/VIR_LAP.ld"
+        ));
+        let (_, dock) = build_rpm_histo_worksheet(&ld, &mut shared).unwrap();
+        let histogram = dock
+            .iter_all_tabs()
+            .find_map(|(_, tab)| match tab {
+                PanelTab::Histogram(h) => Some(h),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(histogram.bin_count, 90);
+        assert!(histogram.percentage && histogram.lock_x_range);
+        assert_eq!((histogram.x_min, histogram.x_max), (0.0, 9000.0));
+        assert_eq!(histogram.color_bands.count, 10);
+        assert!(!histogram.color_bands.centered);
+        assert!(histogram.color_channel.is_some());
+        let (_, mixture_dock) = build_mixture_map_worksheet(&ld, &mut shared).unwrap();
+        let mixture = mixture_dock
+            .iter_all_tabs()
+            .find_map(|(_, tab)| match tab {
+                PanelTab::MixtureMap(m) => Some(m),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(mixture.color_bands.count, 11);
+        assert!(mixture.color_bands.centered);
+    }
+
+    #[test]
+    fn spare_feed_forward_and_acceleration_z_resolve_and_use_correct_groups() {
+        let mut ld = LdFile::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/VIR_LAP.ld"
+        ))
+        .unwrap();
+        // The audit recording lacks these configured channels. Supply their
+        // names on real fixture metadata to exercise resolution and grouping.
+        let names = [
+            "CP Engine Speed Targeting Throttle Control Feed Forward",
+            "ECU Acceleration X",
+            "ECU Acceleration Y",
+            "ECU Acceleration Z",
+        ];
+        for (channel, name) in ld.channels.iter_mut().zip(names) {
+            channel.name = name.into();
+        }
+        let ld = Arc::new(ld);
+        let mut shared = SharedState::new();
+        shared.ld_file = Some(Arc::clone(&ld));
+        let graph = build_graph_panel(&ld, &mut shared, &SPARE_WORKSHEET).unwrap();
+        for (index, name) in names.into_iter().enumerate() {
+            let pc = graph
+                .plotted_channels
+                .iter()
+                .find(|pc| pc.channel_id == ChannelId::Physical(index))
+                .unwrap_or_else(|| panic!("Spare is missing {name}"));
+            assert_eq!(pc.tile_group, if index == 0 { 1 } else { 3 });
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local May 8 S1 reference log"]
+    fn spare_reference_log_missing_channels_are_not_misbound() {
+        let (ld, mut shared) = load_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../S1_#28299_20260508_174455_02.ld"
+        ));
+        let graph = build_graph_panel(&ld, &mut shared, &SPARE_WORKSHEET).unwrap();
+        for name in [
+            "CP Engine Speed Targeting Throttle Control Feed Forward",
+            "ECU Acceleration X",
+            "ECU Acceleration Y",
+            "ECU Acceleration Z",
+        ] {
+            assert!(
+                find_channel(&ld, name).is_none(),
+                "unexpected match for {name}"
+            );
+        }
+        let lateral = ld
+            .find_channel_by_name("CP Lotus ESP Lateral Acceleration")
+            .unwrap();
+        assert!(graph.plotted_channels.iter().any(|pc|
+            pc.channel_id == ChannelId::Physical(lateral.index) && pc.tile_group == 3
+        ));
+    }
 }

@@ -1495,15 +1495,8 @@ impl App {
         }
 
         if let Some(path) = crate::platform::save_csv_file() {
-            let channels: Vec<ExportChannel<'_>> = registry
-                .iter()
-                .map(|info| ExportChannel {
-                    name: &info.name,
-                    data: &info.data,
-                    freq: info.freq,
-                    dec_places: info.dec_places,
-                })
-                .collect();
+            let channels: Vec<ExportChannel<'_>> =
+                registry.iter().map(|info| info.export_channel()).collect();
 
             if let Err(e) = export_csv(
                 &path,

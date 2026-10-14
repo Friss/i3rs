@@ -1139,6 +1139,12 @@ mod tests {
         report.add_channel(ChannelId::Math(0), &shared);
         let mut histogram = HistogramPanel::new(2, "RPM");
         histogram.percentage = true;
+        histogram.bin_count = 90;
+        histogram.lock_x_range = true;
+        histogram.x_min = 0.0;
+        histogram.x_max = 9000.0;
+        histogram.color_bands.count = 10;
+        histogram.color_bands.centered = false;
         histogram.channels.push(sample_channel());
         histogram.channels[0].channel_id = ChannelId::Math(0);
         histogram.color_channel = create_plotted_channel(ChannelId::Math(0), &shared, 0);
@@ -1176,7 +1182,9 @@ mod tests {
         assert_eq!(report.channels.len(), 1);
         assert_eq!(report.channels[0].channel_id, ChannelId::Math(0));
         assert!(tabs.iter().any(
-            |t| matches!(t, PanelTab::Histogram(h) if h.percentage && h.color_channel.is_some())
+            |t| matches!(t, PanelTab::Histogram(h) if h.percentage && h.color_channel.is_some()
+                && h.bin_count == 90 && h.lock_x_range && h.x_min == 0.0 && h.x_max == 9000.0
+                && h.color_bands.count == 10 && !h.color_bands.centered)
         ));
         assert!(
             tabs.iter()

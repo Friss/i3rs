@@ -6,21 +6,39 @@ use std::path::Path;
 /// A channel to export.
 pub struct ExportChannel<'a> {
     pub name: &'a str,
+    /// Unit of the exported values (empty for unitless channels).
+    pub unit: &'a str,
+    /// Source samples; the display transform is applied when writing each cell.
     pub data: &'a [f64],
     pub freq: u16,
     pub dec_places: i16,
+    pub display_scale: f64,
+    pub display_offset: f64,
 }
 
 struct ExportResamplePlan<'a> {
     data: &'a [f64],
     dec_places: usize,
+    display_scale: f64,
+    display_offset: f64,
     source_indices: Vec<usize>,
+}
+
+fn write_header_cell(writer: &mut impl Write, value: &str) -> std::io::Result<()> {
+    if value.contains([',', '"', '\n', '\r']) {
+        write!(writer, "\"{}\"", value.replace('"', "\"\""))
+    } else {
+        write!(writer, "{value}")
+    }
 }
 
 /// Export channels to a CSV file.
 ///
 /// All channels are resampled to the highest frequency via nearest-neighbor.
 /// The first column is "Time (s)".
+/// Values use `raw * display_scale + display_offset` and the supplied precision.
+/// Headers are `Name (unit)`, or just `Name` for unitless channels. Missing or
+/// non-finite values produce empty cells, including non-finite transformed values.
 pub fn export_csv(
     path: &Path,
     channels: &[ExportChannel<'_>],
@@ -52,7 +70,13 @@ pub fn export_csv(
     // Header
     write!(writer, "Time (s)").map_err(|e| e.to_string())?;
     for ch in channels {
-        write!(writer, ",{}", ch.name).map_err(|e| e.to_string())?;
+        write!(writer, ",").map_err(|e| e.to_string())?;
+        let header = if ch.unit.is_empty() {
+            ch.name.to_string()
+        } else {
+            format!("{} ({})", ch.name, ch.unit)
+        };
+        write_header_cell(&mut writer, &header).map_err(|e| e.to_string())?;
     }
     writeln!(writer).map_err(|e| e.to_string())?;
 
@@ -71,6 +95,8 @@ pub fn export_csv(
             ExportResamplePlan {
                 data: channel.data,
                 dec_places,
+                display_scale: channel.display_scale,
+                display_offset: channel.display_offset,
                 source_indices,
             }
         })
@@ -84,7 +110,14 @@ pub fn export_csv(
 
         for plan in &channel_plans {
             let src_idx = plan.source_indices[row];
-            if let Some(val) = plan.data.get(src_idx).filter(|v| v.is_finite()) {
+            let value = plan
+                .data
+                .get(src_idx)
+                .copied()
+                .filter(|v| v.is_finite())
+                .map(|v| v * plan.display_scale + plan.display_offset)
+                .filter(|v| v.is_finite());
+            if let Some(val) = value {
                 write!(writer, ",{:.prec$}", val, prec = plan.dec_places)
                     .map_err(|e| e.to_string())?;
             } else {
@@ -110,12 +143,18 @@ mod tests {
 
         let ch1 = ExportChannel {
             name: "Speed",
+            unit: "km/h",
+            display_scale: 1.0,
+            display_offset: 0.0,
             data: &[10.0, 20.0, 30.0],
             freq: 1,
             dec_places: 1,
         };
         let ch2 = ExportChannel {
             name: "RPM",
+            unit: "rpm",
+            display_scale: 1.0,
+            display_offset: 0.0,
             data: &[1000.0, 2000.0, 3000.0],
             freq: 1,
             dec_places: 0,
@@ -125,7 +164,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines[0], "Time (s),Speed,RPM");
+        assert_eq!(lines[0], "Time (s),Speed (km/h),RPM (rpm)");
         assert_eq!(lines[1], "0.000000,10.0,1000");
         assert_eq!(lines[2], "1.000000,20.0,2000");
         assert_eq!(lines[3], "2.000000,30.0,3000");
@@ -141,6 +180,9 @@ mod tests {
 
         let ch = ExportChannel {
             name: "Speed",
+            unit: "km/h",
+            display_scale: 1.0,
+            display_offset: 0.0,
             data: &[10.0, 20.0, 30.0, 40.0, 50.0],
             freq: 1,
             dec_places: 0,
@@ -150,7 +192,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines[0], "Time (s),Speed");
+        assert_eq!(lines[0], "Time (s),Speed (km/h)");
         // Should have 2 rows (samples at t=1 and t=2)
         assert_eq!(lines.len(), 3);
 
@@ -165,10 +207,75 @@ mod tests {
     }
 
     #[test]
+    fn export_display_units_scale_offset_and_precision_with_mixed_rates() {
+        let path = std::env::temp_dir().join("i3rs_export_display_units.csv");
+        let channels = [
+            ExportChannel {
+                name: "Pressure",
+                unit: "psi",
+                data: &[100.0, 200.0],
+                freq: 2,
+                dec_places: 3,
+                display_scale: 0.145_037_738,
+                display_offset: 0.0,
+            },
+            ExportChannel {
+                name: "Temperature",
+                unit: "°F",
+                data: &[0.0, 100.0],
+                freq: 1,
+                dec_places: 1,
+                display_scale: 1.8,
+                display_offset: 32.0,
+            },
+        ];
+        export_csv(&path, &channels, Some((0.0, 1.0))).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "Time (s),Pressure (psi),Temperature (°F)\n0.000000,14.504,32.0\n0.500000,29.008,212.0\n"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn export_escapes_headers_and_leaves_nonfinite_transformed_cells_empty() {
+        let path = std::env::temp_dir().join("i3rs_export_escaped_headers.csv");
+        let channels = [
+            ExportChannel {
+                name: "Pressure, \"left\"",
+                unit: "psi",
+                data: &[1.0, f64::MAX, f64::INFINITY, f64::NAN],
+                freq: 1,
+                dec_places: 0,
+                display_scale: -2.0,
+                display_offset: 10.0,
+            },
+            ExportChannel {
+                name: "State",
+                unit: "",
+                data: &[1.0],
+                freq: 1,
+                dec_places: 0,
+                display_scale: 1.0,
+                display_offset: 0.0,
+            },
+        ];
+        export_csv(&path, &channels, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "Time (s),\"Pressure, \"\"left\"\" (psi)\",State\n0.000000,8,1\n1.000000,,\n2.000000,,\n3.000000,,\n"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn missing_samples_export_as_empty_cells() {
         let path = std::env::temp_dir().join("i3rs_missing_samples.csv");
         let channel = ExportChannel {
             name: "Lambda",
+            unit: "",
+            display_scale: 1.0,
+            display_offset: 0.0,
             data: &[0.895, f64::NAN, 1.020],
             freq: 1,
             dec_places: 3,

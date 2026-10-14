@@ -32,8 +32,8 @@ impl ColorBands {
             ..self
         }
     }
-    // Underflow, N normal bands, overflow, missing color. Last normal band
-    // includes the upper endpoint; samples outside the range remain visible.
+    // Underflow, N normal bands, overflow, missing color. Non-centered bands
+    // are [lower, upper); centered bands include their outer upper endpoint.
     pub fn len(self) -> usize {
         self.valid().count + 3
     }
@@ -62,7 +62,7 @@ impl ColorBands {
         if value < lower {
             return 0;
         }
-        if value > upper {
+        if value > upper || (!b.centered && value == upper) {
             return b.count + 1;
         }
         (((value - lower) / self.step()).floor() as usize).min(b.count - 1) + 1
@@ -74,7 +74,11 @@ impl ColorBands {
         if index == 0 {
             format!("< {lower:.1}")
         } else if index == b.count + 1 {
-            format!("> {upper:.1}")
+            if b.centered {
+                format!("> {upper:.1}")
+            } else {
+                format!("≥ {upper:.1}")
+            }
         } else if index > b.count + 1 {
             "Missing".into()
         } else if b.centered {
@@ -123,11 +127,14 @@ mod tests {
         };
         let values = [f64::NAN, -1.0, 0.0, 9.9, 10.0, 99.9, 100.0, 100.1];
         let indices: Vec<_> = values.into_iter().map(|v| b.index(v)).collect();
-        assert_eq!(indices, [12, 0, 1, 1, 2, 10, 10, 11]);
+        assert_eq!(indices, [12, 0, 1, 1, 2, 10, 11, 11]);
+        assert_eq!(b.label(11), "≥ 100.0");
         let b = ColorBands::default();
         assert_eq!(
             [0., 4.99, 5., 95., 100.].map(|v| b.index(v)),
             [1, 1, 2, 11, 11]
         );
+        assert_eq!(b.index(105.0), 11);
+        assert_eq!(b.index(105.1), 12);
     }
 }
