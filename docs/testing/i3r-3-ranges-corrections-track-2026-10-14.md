@@ -20,7 +20,7 @@ The inspected [corrected-speed](evidence/i3r-3/59-corrected-speed.png), [distanc
 
 A fixture regression checks that default speed, integrated distance, GPS coordinates and timestamps remain bit-for-bit equal to the existing builders. Automatic graph distance preserves its existing monotonic recorded/derived-distance preference; map distance keeps corrected-speed integration. Corrections are recording-owned. External comparisons still need W04 to consume each recording's edited policies consistently.
 
-The live VM was readable and showed i2 with no log loaded. Keyboard input did not open a log picker, and a subsequent click returned `noWindowsAvailable`. Launching the new native validation bundle timed out. Consequently a fresh matched GUI/annotation comparison was not completed. Headless egui renders the editor/diagnostics, while numerical/persistence regressions exercise the underlying changes. Applicable live Pro checks remain outstanding.
+The initial live VM attempt was readable and showed i2 with no log loaded. Keyboard input did not open a log picker, and a subsequent click returned `noWindowsAvailable`. Launching the new native validation bundle timed out. A [subsequent consolidated validation pass](i3r-1-3-live-validation-2026-10-14.md) opened the reference recording and matched the short-lap histogram against the candidate numerical path. A fresh matched GUI/annotation comparison was not completed. Headless egui renders the editor/diagnostics, while numerical/persistence regressions exercise the underlying changes. Applicable live Pro checks remain outstanding.
 
 ## Validation
 

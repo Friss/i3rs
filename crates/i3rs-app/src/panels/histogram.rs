@@ -570,6 +570,49 @@ fn bins_to_bar_chart(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the local May 8 S1 reference log"]
+    fn matches_live_i2_short_lap_histogram() {
+        // i2 Standard 1.1.4.457, RPM Histo, observed 2026-10-14:
+        // Lap 2 is 59 ms, with one sample in 4900–5000 rpm / 90–100% throttle.
+        let ld = i3rs_core::LdFile::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../S1_#28299_20260508_174455_02.ld"
+        ))
+        .unwrap();
+        let laps = i3rs_core::detect_laps(&ld);
+        let lap = &laps[2];
+        assert!((lap.duration() - 0.059).abs() < 1e-9);
+        let rpm = ld.find_channel_by_name("Engine Speed").unwrap();
+        let throttle = ld.find_channel_by_name("Throttle Position").unwrap();
+        let rpm_data = ld.read_channel_data(rpm).unwrap();
+        let throttle_data = ld.read_channel_data(throttle).unwrap();
+        let samples: Vec<_> =
+            sample_range(rpm_data.len(), rpm.freq, (lap.start_time, lap.end_time))
+                .map(|i| {
+                    (
+                        rpm_data[i],
+                        interp_at_time(&throttle_data, throttle.freq, i as f64 / rpm.freq as f64)
+                            .unwrap(),
+                    )
+                })
+                .collect();
+        let bins = histogram_bins(
+            &samples,
+            90,
+            (0.0, 9000.0),
+            Some(ColorBands {
+                count: 10,
+                centered: false,
+                ..ColorBands::default()
+            }),
+        );
+        assert_eq!(bins.iter().flat_map(|b| &b.counts).sum::<u64>(), 1);
+        assert_eq!(bins[10].counts[49], 1);
+        assert_eq!(histogram_height(1, bins[10].denominator, true), 100.0);
+    }
+
     #[test]
     fn rpm_and_throttle_boundaries_use_100_rpm_bins_and_ten_noncentered_bands() {
         let bands = ColorBands {
