@@ -4,6 +4,20 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, LazyLock, RwLock};
 
+use crate::channels::{Interpolation, sample_at_position_with_policy};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationOptions {
+    #[serde(default)]
+    pub input_units: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub input_interpolation: std::collections::BTreeMap<String, Interpolation>,
+    pub output_freq: Option<u16>,
+    pub interpolation: Interpolation,
+    pub duration: Option<f64>,
+}
+
 use crate::math_expr::{BinOp, Expr, parse_expression, referenced_channels};
 
 // ---------------------------------------------------------------------------
@@ -36,7 +50,7 @@ impl std::error::Error for MathError {}
 // ---------------------------------------------------------------------------
 
 fn normalize_channel_name(name: &str) -> String {
-    name.to_ascii_lowercase().replace(['.', '_'], " ")
+    crate::channels::normalized_name(name)
 }
 
 fn resolve_actual_channel_name<'a>(
@@ -75,7 +89,9 @@ fn resolve_channel_name<'a>(
     aliases: &HashMap<String, String>,
 ) -> Option<&'a str> {
     let mut normalized_name_index = HashMap::new();
-    for key in available.keys() {
+    let mut keys: Vec<_> = available.keys().collect();
+    keys.sort();
+    for key in keys {
         normalized_name_index
             .entry(normalize_channel_name(key))
             .or_insert_with(|| key.clone());
@@ -97,7 +113,9 @@ fn resolve_channel_name<'a>(
     }
 
     let normalized_reference = normalize_channel_name(reference);
-    for (alias, target) in aliases {
+    let mut entries: Vec<_> = aliases.iter().collect();
+    entries.sort_by_key(|(alias, _)| *alias);
+    for (alias, target) in entries {
         if normalize_channel_name(alias) == normalized_reference
             && let Some(key) =
                 resolve_actual_channel_name(target, available, &normalized_name_index)
@@ -123,8 +141,10 @@ pub fn resolve_alias_target(reference: &str, aliases: &HashMap<String, String>) 
     if let Some(target) = aliases.get(&with_dots) {
         return Some(target.clone());
     }
-    for (alias, target) in aliases {
-        if alias.eq_ignore_ascii_case(reference) {
+    let mut entries: Vec<_> = aliases.iter().collect();
+    entries.sort_by_key(|(alias, _)| *alias);
+    for (alias, target) in entries {
+        if normalize_channel_name(alias) == normalize_channel_name(reference) {
             return Some(target.clone());
         }
     }
@@ -144,7 +164,7 @@ fn resample(data: &[f64], src_freq: u16, target_freq: u16, target_len: usize) ->
         return data.to_vec();
     }
     if data.is_empty() {
-        return vec![0.0; target_len];
+        return vec![f64::NAN; target_len];
     }
 
     (0..target_len)
@@ -177,6 +197,16 @@ fn parse_expression_cached(expression: &str) -> Result<Arc<Expr>, crate::math_ex
     Ok(parsed)
 }
 
+fn has_explicit_units(expr: &Expr) -> bool {
+    match expr {
+        Expr::ChannelInUnit(_, _) => true,
+        Expr::BinaryOp(a, _, b) => has_explicit_units(a) || has_explicit_units(b),
+        Expr::UnaryNeg(a) => has_explicit_units(a),
+        Expr::FuncCall(_, args) => args.iter().any(has_explicit_units),
+        _ => false,
+    }
+}
+
 struct ChannelResolver<'a> {
     channels: &'a HashMap<String, ChannelData>,
     normalized_name_index: HashMap<String, String>,
@@ -186,14 +216,18 @@ struct ChannelResolver<'a> {
 impl<'a> ChannelResolver<'a> {
     fn new(channels: &'a HashMap<String, ChannelData>, aliases: &HashMap<String, String>) -> Self {
         let mut normalized_name_index = HashMap::new();
-        for key in channels.keys() {
+        let mut keys: Vec<_> = channels.keys().collect();
+        keys.sort();
+        for key in keys {
             normalized_name_index
                 .entry(normalize_channel_name(key))
                 .or_insert_with(|| key.clone());
         }
 
         let mut alias_name_index = HashMap::new();
-        for (alias, target) in aliases {
+        let mut entries: Vec<_> = aliases.iter().collect();
+        entries.sort_by_key(|(alias, _)| *alias);
+        for (alias, target) in entries {
             if let Some(actual) =
                 resolve_actual_channel_name(target, channels, &normalized_name_index)
             {
@@ -245,6 +279,9 @@ struct EvaluationContext<'a> {
     resolver: ChannelResolver<'a>,
     output_freq: u16,
     output_len: usize,
+    interpolation: Interpolation,
+    input_units: std::collections::BTreeMap<String, String>,
+    input_interpolation: std::collections::BTreeMap<String, Interpolation>,
     resample_cache: HashMap<(String, u16, u16, usize), Arc<Vec<f64>>>,
     node_outputs: HashMap<usize, Arc<Vec<f64>>>,
 }
@@ -260,8 +297,22 @@ impl<'a> EvaluationContext<'a> {
             resolver: ChannelResolver::new(channels, aliases),
             output_freq,
             output_len,
+            interpolation: Interpolation::Linear,
+            input_units: Default::default(),
+            input_interpolation: Default::default(),
             resample_cache: HashMap::new(),
             node_outputs: HashMap::new(),
+        }
+    }
+
+    fn interpolation_for(&self, name: &str) -> Interpolation {
+        if self.interpolation != Interpolation::Linear {
+            self.interpolation
+        } else {
+            self.input_interpolation
+                .get(name)
+                .copied()
+                .unwrap_or(self.interpolation)
         }
     }
 
@@ -293,18 +344,78 @@ impl<'a> EvaluationContext<'a> {
                     {
                         channel.samples.clone()
                     } else {
-                        resample(
-                            &channel.samples,
-                            channel.freq,
-                            self.output_freq,
-                            self.output_len,
-                        )
+                        if self.interpolation_for(resolved) == Interpolation::Linear {
+                            resample(
+                                &channel.samples,
+                                channel.freq,
+                                self.output_freq,
+                                self.output_len,
+                            )
+                        } else {
+                            (0..self.output_len)
+                                .map(|i| {
+                                    sample_at_position_with_policy(
+                                        &channel.samples,
+                                        i as f64 * channel.freq as f64 / self.output_freq as f64,
+                                        self.interpolation_for(resolved),
+                                    )
+                                    .unwrap_or(f64::NAN)
+                                })
+                                .collect()
+                        }
                     };
                     let resampled = Arc::new(resampled);
                     self.resample_cache
                         .insert(cache_key, Arc::clone(&resampled));
                     resampled
                 }
+            }
+
+            Expr::ChannelInUnit(name, unit) => {
+                let (resolved, _) = self.resolver.get_channel(name).ok_or_else(|| MathError {
+                    message: format!("unknown channel '{name}'"),
+                })?;
+                let source_unit = self
+                    .input_units
+                    .get(resolved)
+                    .or_else(|| self.input_units.get(name))
+                    .ok_or_else(|| MathError {
+                        message: format!(
+                            "channel '{name}' has no input unit metadata for [{unit}]"
+                        ),
+                    })?;
+                let (scale, offset) = crate::channels::unit_transform(source_unit, unit)
+                    .map_err(|message| MathError { message })?;
+                // Do not cache a temporary AST node by its stack address.
+                let (resolved, source) = self.resolver.get_channel(name).unwrap();
+                let key = (
+                    resolved.to_string(),
+                    source.freq,
+                    self.output_freq,
+                    self.output_len,
+                );
+                let values = if let Some(values) = self.resample_cache.get(&key) {
+                    Arc::clone(values)
+                } else {
+                    let values = Arc::new(
+                        (0..self.output_len)
+                            .map(|i| {
+                                if source.freq == 0 {
+                                    return f64::NAN;
+                                }
+                                sample_at_position_with_policy(
+                                    &source.samples,
+                                    i as f64 * source.freq as f64 / self.output_freq as f64,
+                                    self.interpolation_for(resolved),
+                                )
+                                .unwrap_or(f64::NAN)
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    self.resample_cache.insert(key, Arc::clone(&values));
+                    values
+                };
+                Arc::new(values.iter().map(|v| v * scale + offset).collect())
             }
 
             Expr::UnaryNeg(inner) => {
@@ -404,21 +515,83 @@ impl<'a> EvaluationContext<'a> {
         Ok(output)
     }
 
+    fn scalar(&mut self, expression: &Expr) -> Result<f64, MathError> {
+        if let Expr::Number(value) = expression {
+            return Ok(*value);
+        }
+        self.evaluate(expression)?
+            .first()
+            .copied()
+            .ok_or_else(|| MathError {
+                message: "filter parameter contains no samples".into(),
+            })
+    }
+
     fn evaluate_function(&mut self, name: &str, args: &[Expr]) -> Result<Arc<Vec<f64>>, MathError> {
         match name {
-            "smooth" => {
-                if args.len() != 2 {
+            "smooth" | "smooth_samples" | "smooth_time" => {
+                if !(2..=3).contains(&args.len()) {
                     return Err(MathError {
-                        message: "smooth() requires 2 arguments: smooth(channel, window_size)"
-                            .into(),
+                        message: format!(
+                            "{name}() requires data, window and optional centered (0/1)"
+                        ),
                     });
                 }
                 let data = self.evaluate(&args[0])?;
-                let window = match &args[1] {
-                    Expr::Number(n) => *n as usize,
-                    _ => self.evaluate(&args[1])?[0] as usize,
+                let window = self.scalar(&args[1])?;
+                if !window.is_finite() || window <= 0.0 {
+                    return Err(MathError {
+                        message: "smoothing window must be finite and positive".into(),
+                    });
+                }
+                let samples = if name == "smooth_time"
+                    || (name == "smooth" && has_explicit_units(&args[0]))
+                {
+                    (window * self.output_freq as f64).ceil()
+                } else {
+                    window.round()
                 };
-                Ok(Arc::new(moving_average(&data, window.max(1))))
+                let centered = args
+                    .get(2)
+                    .map(|arg| self.scalar(arg))
+                    .transpose()?
+                    .is_some_and(|v| v != 0.0);
+                Ok(Arc::new(smooth_samples(
+                    &data,
+                    (samples as usize).max(1),
+                    centered,
+                )))
+            }
+            "lowpass" => {
+                if args.len() != 2 {
+                    return Err(MathError {
+                        message: "lowpass() requires data and cutoff Hz".into(),
+                    });
+                }
+                let data = self.evaluate(&args[0])?;
+                let cutoff = self.scalar(&args[1])?;
+                Ok(Arc::new(lowpass(&data, self.output_freq, cutoff)?))
+            }
+            "component_gate" => {
+                if args.len() != 2 {
+                    return Err(MathError {
+                        message: "component_gate() requires data and gate".into(),
+                    });
+                }
+                let data = self.evaluate(&args[0])?;
+                let gate = self.evaluate(&args[1])?;
+                Ok(Arc::new(
+                    data.iter()
+                        .zip(gate.iter())
+                        .map(|(&v, &g)| {
+                            if crate::channels::component_gate_includes(g) {
+                                v
+                            } else {
+                                f64::NAN
+                            }
+                        })
+                        .collect(),
+                ))
             }
             "derivative" => {
                 if args.len() != 1 {
@@ -440,6 +613,36 @@ impl<'a> EvaluationContext<'a> {
             }
             "abs" => self.unary_fn(args, f64::abs),
             "sqrt" => self.unary_fn(args, f64::sqrt),
+            "sqr" => self.unary_fn(args, |v| v * v),
+            "sgn" => self.unary_fn(args, |v| {
+                if v.is_nan() {
+                    f64::NAN
+                } else if v > 0.0 {
+                    1.0
+                } else if v < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                }
+            }),
+            "stat_mean" => {
+                if args.len() != 1 {
+                    return Err(MathError {
+                        message: "stat_mean() requires one argument".into(),
+                    });
+                }
+                let values = self.evaluate(&args[0])?;
+                let (sum, count) = values
+                    .iter()
+                    .filter(|v| v.is_finite())
+                    .fold((0.0, 0usize), |(sum, n), v| (sum + v, n + 1));
+                let mean = if count == 0 {
+                    f64::NAN
+                } else {
+                    sum / count as f64
+                };
+                Ok(Arc::new(vec![mean; self.output_len]))
+            }
             "sin" => self.unary_fn(args, f64::sin),
             "cos" => self.unary_fn(args, f64::cos),
             "tan" => self.unary_fn(args, f64::tan),
@@ -468,7 +671,13 @@ impl<'a> EvaluationContext<'a> {
                     val.iter()
                         .zip(lo.iter())
                         .zip(hi.iter())
-                        .map(|((&v, &l), &h)| v.clamp(l, h))
+                        .map(|((&v, &l), &h)| {
+                            if l.is_nan() || h.is_nan() || l > h {
+                                f64::NAN
+                            } else {
+                                v.clamp(l, h)
+                            }
+                        })
                         .collect(),
                 ))
             }
@@ -487,7 +696,7 @@ impl<'a> EvaluationContext<'a> {
                         .collect(),
                 ))
             }
-            "if_then" => {
+            "if_then" | "choose" => {
                 if args.len() != 3 {
                     return Err(MathError {
                         message:
@@ -571,24 +780,63 @@ pub fn evaluate(
 // DSP helpers
 // ---------------------------------------------------------------------------
 
-fn moving_average(data: &[f64], window: usize) -> Vec<f64> {
-    if data.is_empty() || window == 0 {
-        return data.to_vec();
-    }
-    let mut result = Vec::with_capacity(data.len());
-    let mut sum = 0.0;
-    let mut count = 0usize;
-
-    for (i, &val) in data.iter().enumerate() {
-        sum += val;
-        count += 1;
-        if count > window {
-            sum -= data[i - window];
-            count = window;
+/// Moving average on each contiguous finite segment. Missing samples stay missing;
+/// windows are clipped at segment boundaries. Even centered windows put the extra
+/// sample after the cursor. Runtime is linear in the sample count.
+pub fn smooth_samples(data: &[f64], window: usize, centered: bool) -> Vec<f64> {
+    let window = window.max(1).min(data.len().max(1));
+    let mut result = vec![f64::NAN; data.len()];
+    let mut start = 0;
+    while start < data.len() {
+        if !data[start].is_finite() {
+            start += 1;
+            continue;
         }
-        result.push(sum / count as f64);
+        let end = (start..data.len())
+            .find(|&i| !data[i].is_finite())
+            .unwrap_or(data.len());
+        let mut sums = Vec::with_capacity(end - start + 1);
+        sums.push(0.0);
+        for &value in &data[start..end] {
+            sums.push(sums.last().unwrap() + value);
+        }
+        for (i, output) in result.iter_mut().enumerate().take(end).skip(start) {
+            let left = if centered {
+                (window - 1) / 2
+            } else {
+                window - 1
+            };
+            let right = if centered { window / 2 } else { 0 };
+            let lo = i.saturating_sub(left).max(start);
+            let hi = i.saturating_add(right).saturating_add(1).min(end);
+            *output = (sums[hi - start] - sums[lo - start]) / (hi - lo) as f64;
+        }
+        start = end;
     }
     result
+}
+
+/// One-pole low-pass with an exponential discrete coefficient. Restarts after gaps.
+pub fn lowpass(data: &[f64], freq: u16, cutoff: f64) -> Result<Vec<f64>, MathError> {
+    if freq == 0 || !cutoff.is_finite() || cutoff <= 0.0 || cutoff > freq as f64 / 2.0 {
+        return Err(MathError {
+            message: "low-pass cutoff must be positive and at most the Nyquist frequency".into(),
+        });
+    }
+    let alpha = 1.0 - (-2.0 * std::f64::consts::PI * cutoff / freq as f64).exp();
+    let mut previous = None;
+    Ok(data
+        .iter()
+        .map(|&value| {
+            if !value.is_finite() {
+                previous = None;
+                return f64::NAN;
+            }
+            let output = previous.map_or(value, |p| p + alpha * (value - p));
+            previous = Some(output);
+            output
+        })
+        .collect())
 }
 
 fn finite_derivative(data: &[f64], freq: u16) -> Vec<f64> {
@@ -684,14 +932,40 @@ pub fn evaluate_expression_with_aliases(
     channels: &HashMap<String, ChannelData>,
     aliases: &HashMap<String, String>,
 ) -> Result<(Vec<f64>, u16), String> {
+    evaluate_expression_with_options(expression, channels, aliases, &EvaluationOptions::default())
+}
+
+/// Evaluate with an explicit result rate, interpolation policy and optional recording duration.
+/// A duration permits constant-only expressions; source values are never display-converted.
+pub fn evaluate_expression_with_options(
+    expression: &str,
+    channels: &HashMap<String, ChannelData>,
+    aliases: &HashMap<String, String>,
+    options: &EvaluationOptions,
+) -> Result<(Vec<f64>, u16), String> {
     let expr = parse_expression_cached(expression).map_err(|e| e.to_string())?;
     let resolver = ChannelResolver::new(channels, aliases);
-    let freq = output_freq_impl(&expr, &resolver);
-    let len = output_len_impl(&expr, &resolver, freq);
+    let freq = options
+        .output_freq
+        .unwrap_or_else(|| output_freq_impl(&expr, &resolver));
+    if freq == 0 {
+        return Err("output frequency must be positive".into());
+    }
+    let len = if let Some(duration) = options.duration {
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err("recording duration must be finite and positive".into());
+        }
+        (duration * freq as f64).ceil() as usize
+    } else {
+        output_len_impl(&expr, &resolver, freq)
+    };
     if len == 0 {
         return Err("expression references no channels with data".into());
     }
     let mut context = EvaluationContext::new(channels, aliases, freq, len);
+    context.interpolation = options.interpolation;
+    context.input_units = options.input_units.clone();
+    context.input_interpolation = options.input_interpolation.clone();
     let samples = context.evaluate(&expr).map_err(|e| e.to_string())?;
     Ok(((*samples).clone(), freq))
 }
@@ -703,6 +977,188 @@ pub fn evaluate_expression_with_aliases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_rates_and_interpolation_preserve_missing_samples() {
+        let channels = HashMap::from([(
+            "X".into(),
+            ChannelData {
+                samples: vec![0.0, 10.0, f64::NAN, 30.0],
+                freq: 1,
+            },
+        )]);
+        for (policy, expected) in [
+            (Interpolation::Linear, 5.0),
+            (Interpolation::Previous, 0.0),
+            (Interpolation::Nearest, 10.0),
+        ] {
+            let options = EvaluationOptions {
+                output_freq: Some(2),
+                interpolation: policy,
+                ..Default::default()
+            };
+            let (values, freq) =
+                evaluate_expression_with_options("X", &channels, &HashMap::new(), &options)
+                    .unwrap();
+            assert_eq!(freq, 2);
+            assert_eq!(values.len(), 8);
+            assert_eq!(values[1], expected);
+            assert!(values[4].is_nan());
+        }
+        let options = EvaluationOptions {
+            output_freq: Some(5),
+            duration: Some(1.2),
+            ..Default::default()
+        };
+        let (values, _) =
+            evaluate_expression_with_options("2 + 3", &HashMap::new(), &HashMap::new(), &options)
+                .unwrap();
+        assert_eq!(values, vec![5.0; 6]);
+    }
+
+    #[test]
+    fn previous_resampling_keeps_exact_boundaries_and_unit_qualified_outages() {
+        let mut samples: Vec<_> = (0..50).map(|i| i as f64).collect();
+        samples[30] = f64::NAN;
+        let channels = HashMap::from([("Speed".into(), ChannelData { samples, freq: 50 })]);
+        let options = EvaluationOptions {
+            output_freq: Some(100),
+            interpolation: Interpolation::Previous,
+            input_units: std::collections::BTreeMap::from([("Speed".into(), "km/h".into())]),
+            ..Default::default()
+        };
+        for expression in ["Speed", "'Speed'[km/h]"] {
+            let (values, _) =
+                evaluate_expression_with_options(expression, &channels, &HashMap::new(), &options)
+                    .unwrap();
+            for (i, value) in values.into_iter().enumerate() {
+                if i / 2 == 30 {
+                    assert!(value.is_nan());
+                } else {
+                    assert_eq!(value, (i / 2) as f64, "{expression} sample {i}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sample_time_centered_filters_and_lowpass_restart_after_gaps() {
+        let channels = HashMap::from([(
+            "X".into(),
+            ChannelData {
+                samples: vec![0.0, 10.0, 20.0, f64::NAN, 40.0, 50.0],
+                freq: 10,
+            },
+        )]);
+        let (samples, _) = evaluate_expression("smooth_samples(X, 2)", &channels).unwrap();
+        let (time, _) = evaluate_expression("smooth_time(X, 0.2)", &channels).unwrap();
+        for (a, b) in samples.iter().zip(&time) {
+            assert!((a.is_nan() && b.is_nan()) || a == b);
+        }
+        assert_eq!(&samples[..3], &[0.0, 5.0, 15.0]);
+        assert!(samples[3].is_nan());
+        assert_eq!(&samples[4..], &[40.0, 45.0]);
+        let (centered, _) = evaluate_expression("smooth_samples(X, 3, 1)", &channels).unwrap();
+        assert_eq!(&centered[..3], &[5.0, 10.0, 15.0]);
+        let (filtered, _) = evaluate_expression("lowpass(X, 1)", &channels).unwrap();
+        let alpha = 1.0 - (-std::f64::consts::TAU / 10.0).exp();
+        assert!((filtered[1] - 10.0 * alpha).abs() < 1e-12);
+        assert!(filtered[3].is_nan());
+        assert_eq!(filtered[4], 40.0);
+        for expr in ["lowpass(X, 0)", "lowpass(X, 6)", "smooth_time(X, -1)"] {
+            assert!(evaluate_expression(expr, &channels).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_clamp_bounds_produce_missing_values_without_panicking() {
+        let channels = HashMap::from([(
+            "X".into(),
+            ChannelData {
+                samples: vec![1.0, 2.0],
+                freq: 1,
+            },
+        )]);
+        for expr in ["clamp(X, 2, 1)", "clamp(X, sqrt(-1), 5)"] {
+            let (samples, _) = evaluate_expression(expr, &channels).unwrap();
+            assert!(samples.iter().all(|v| v.is_nan()));
+        }
+    }
+
+    #[test]
+    fn component_gate_does_not_redefine_expression_truth() {
+        let channels = HashMap::from([(
+            "Gate".into(),
+            ChannelData {
+                samples: vec![-2.0, 0.0, 2.0],
+                freq: 1,
+            },
+        )]);
+        let (component, _) = evaluate_expression("component_gate(7, Gate)", &channels).unwrap();
+        assert!(component[0].is_nan() && component[1].is_nan());
+        assert_eq!(component[2], 7.0);
+        let (legacy, _) = evaluate_expression("gate(7, Gate)", &channels).unwrap();
+        assert_eq!(legacy[0], 7.0);
+        assert!(legacy[1].is_nan());
+        let (conditional, _) = evaluate_expression("if_then(Gate, 7, 9)", &channels).unwrap();
+        assert_eq!(conditional, [7.0, 9.0, 7.0]);
+    }
+
+    #[test]
+    fn supplied_motec_oversteer_uses_input_units_and_recording_mean() {
+        let expression = "smooth(choose('Corr Speed'[km/h] < 50, 0, sgn('G Force Lat'[m/s/s]) * (('Vehicle Wheelbase'[m] * 'G Force Lat'[m/s/s] / sqr('Corr Speed'[m/s])) - sgn(stat_mean('Steered Angle'[rad] * 'G Force Lat'[m/s/s])) * 'Steered Angle'[rad])), 0.2)";
+        let channels = HashMap::from([
+            (
+                "Corr Speed".into(),
+                ChannelData {
+                    samples: vec![36.0, 72.0, 72.0, 72.0],
+                    freq: 10,
+                },
+            ),
+            (
+                "G Force Lat".into(),
+                ChannelData {
+                    samples: vec![1.0, 1.0, -1.0, -1.0],
+                    freq: 10,
+                },
+            ),
+            (
+                "Steered Angle".into(),
+                ChannelData {
+                    samples: vec![5.0, 5.0, -5.0, -5.0],
+                    freq: 10,
+                },
+            ),
+            (
+                "Vehicle Wheelbase".into(),
+                ChannelData {
+                    samples: vec![2700.0],
+                    freq: 1,
+                },
+            ),
+        ]);
+        let options = EvaluationOptions {
+            input_units: std::collections::BTreeMap::from([
+                ("Corr Speed".into(), "km/h".into()),
+                ("G Force Lat".into(), "G".into()),
+                ("Steered Angle".into(), "deg".into()),
+                ("Vehicle Wheelbase".into(), "mm".into()),
+            ]),
+            ..Default::default()
+        };
+        let (values, freq) =
+            evaluate_expression_with_options(expression, &channels, &HashMap::new(), &options)
+                .unwrap();
+        assert_eq!(freq, 10);
+        let expected = 2.7 * 9.80665 / (20.0 * 20.0) - 5.0_f64.to_radians();
+        for (actual, expected) in values[..4]
+            .iter()
+            .zip([0.0, expected / 2.0, expected, expected])
+        {
+            assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
+        }
+        assert!(evaluate_expression(expression, &channels).is_err()); // Explicit units must have metadata.
+    }
 
     fn make_channels() -> HashMap<String, ChannelData> {
         let mut m = HashMap::new();

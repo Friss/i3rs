@@ -126,6 +126,54 @@ fn circuit_gps_bounds_and_outlap_rpm_count() {
 }
 
 #[test]
+#[ignore = "requires the local May 8 S1 reference log"]
+fn matches_visible_live_i2_lap3_track_speed_labels() {
+    use i3rs_core::annotations::{AnnotationKind, track_annotations};
+    let ld = LdFile::open(FILE).unwrap();
+    let track = i3rs_core::extract_gps_track(&ld).unwrap();
+    let laps = detect_laps(&ld);
+    let sectors = i3rs_core::track::sectors_from_distance_definition(
+        &track,
+        &laps[3],
+        &i3rs_core::track::vir_full_definition(),
+    )
+    .unwrap();
+    let events = track_annotations(&track, &laps[3], &sectors, None, &Default::default());
+    // Transcribed from i2 Standard's live Track Report, 2026-10-14.
+    // This compares displayed values only; pixel positions and the remaining
+    // section labels are not accepted by this test.
+    for (name, maximum, mph) in [
+        ("Str 0-1", true, 133.6),
+        ("Str 1-2", true, 91.7),
+        ("Str 3-4", true, 80.0),
+        ("Str 5-6", true, 125.0),
+        ("Turn 7", false, 106.0),
+        ("Turn 8", false, 98.9),
+        ("Str 10-11", true, 104.2),
+        ("Str 12-13", true, 141.9),
+        ("Str 13-14", true, 64.9),
+        ("Turn 15", false, 65.1),
+        ("Str 16-17", true, 103.4),
+    ] {
+        let section = sectors.iter().find(|s| s.name == name).unwrap();
+        let event = events
+            .iter()
+            .find(|e| e.section == section.semantics.id)
+            .unwrap();
+        let value = match event.kind {
+            AnnotationKind::MaximumSpeed(v) if maximum => v,
+            AnnotationKind::MinimumSpeed(v) if !maximum => v,
+            _ => panic!("wrong event type for {name}"),
+        };
+        assert_eq!(
+            format!("{:.1}", value / 0.44704),
+            format!("{mph:.1}"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires the local May 8 S1 log; not distributed with the repository"]
 fn vir_distance_sections_match_i2_reference() {
     let ld = LdFile::open(FILE).unwrap();

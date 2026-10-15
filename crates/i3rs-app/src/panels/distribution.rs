@@ -32,8 +32,8 @@ impl ColorBands {
             ..self
         }
     }
-    // Underflow, N normal bands, overflow, missing color. Last normal band
-    // includes the upper endpoint; samples outside the range remain visible.
+    // Underflow, N normal bands, overflow, missing color. Non-centered bands
+    // are [lower, upper), except the last includes the outer upper endpoint.
     pub fn len(self) -> usize {
         self.valid().count + 3
     }
@@ -124,10 +124,13 @@ mod tests {
         let values = [f64::NAN, -1.0, 0.0, 9.9, 10.0, 99.9, 100.0, 100.1];
         let indices: Vec<_> = values.into_iter().map(|v| b.index(v)).collect();
         assert_eq!(indices, [12, 0, 1, 1, 2, 10, 10, 11]);
+        assert_eq!(b.label(11), "> 100.0");
         let b = ColorBands::default();
         assert_eq!(
             [0., 4.99, 5., 95., 100.].map(|v| b.index(v)),
             [1, 1, 2, 11, 11]
         );
+        assert_eq!(b.index(105.0), 11);
+        assert_eq!(b.index(105.1), 12);
     }
 }

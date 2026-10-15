@@ -46,6 +46,9 @@ pub struct PlottedChannel {
     pub display_scale: f64,
     pub display_offset: f64,
     pub display_unit: Option<String>,
+    pub math_id: Option<u64>,
+    pub math_display_signature: Option<(String, Option<String>)>,
+    pub recording_display_base: Option<(f64, f64, Option<String>)>,
     /// How the display (Y) range is determined for this channel.
     pub scale_mode: ScaleMode,
     /// Fixed lower bound (in display units) used when `scale_mode` is `Manual`.
@@ -61,6 +64,7 @@ pub struct PlottedChannel {
 }
 
 /// Info about a plotted channel, registered by graph panels each frame for the readout panel.
+#[derive(Clone)]
 pub struct PlottedChannelInfo {
     pub channel_id: ChannelId,
     pub name: String,
@@ -71,6 +75,7 @@ pub struct PlottedChannelInfo {
     pub data: Arc<[f64]>,
     pub display_scale: f64,
     pub display_offset: f64,
+    pub interpolation: i3rs_core::channels::Interpolation,
     /// Enum/state labels parsed from the .ld file (value → label).
     pub enum_labels: Arc<HashMap<i64, String>>,
 }
@@ -88,6 +93,19 @@ impl PlottedChannelInfo {
 
     pub fn transform_value(&self, value: f64) -> f64 {
         value * self.display_scale + self.display_offset
+    }
+
+    /// Export the same values, units and precision used by the readout.
+    pub fn export_channel(&self) -> i3rs_core::ExportChannel<'_> {
+        i3rs_core::ExportChannel {
+            name: &self.name,
+            unit: &self.unit,
+            data: &self.data,
+            freq: self.freq,
+            dec_places: self.dec_places,
+            display_scale: self.display_scale,
+            display_offset: self.display_offset,
+        }
     }
 
     /// Statistics of `data` in display units (a negative scale swaps min and max).
@@ -109,6 +127,8 @@ pub struct MathChannelDef {
     pub id: u64,
     pub name: String,
     pub expression: String,
+    pub options: i3rs_core::channels::MathOptions,
+    pub evaluation_key: Option<String>,
     pub unit: String,
     pub dec_places: i16,
     pub freq: u16,
@@ -137,6 +157,8 @@ impl MathChannelDef {
             id,
             name,
             expression,
+            options: Default::default(),
+            evaluation_key: None,
             unit,
             dec_places,
             freq: 0,
@@ -402,6 +424,14 @@ pub struct SharedState {
     pub file_name: String,
 
     // Lap data
+    pub recording_analyses:
+        std::collections::BTreeMap<String, i3rs_core::ranges::RecordingAnalysis>,
+    pub correction_gps_speed: Option<(Arc<[f64]>, u16)>,
+    pub correction_speed: Option<(Arc<[f64]>, u16)>,
+    pub correction_distance: Option<(Arc<[f64]>, u16)>,
+    pub correction_error: Option<String>,
+    pub correction_revision: u64,
+    pub show_recording_editor: bool,
     pub laps: Vec<Lap>,
     pub ldx: Option<LdxFile>,
     pub selected_lap: Option<usize>,
@@ -432,6 +462,12 @@ pub struct SharedState {
 
     // Channel aliases: maps alias name → canonical channel name
     pub channel_aliases: HashMap<String, String>,
+    pub channel_settings: i3rs_core::channels::ChannelSettings,
+    pub analysis_messages: crate::channel_analysis::AnalysisMessages,
+    pub channel_errors: RefCell<HashMap<usize, String>>,
+    pub values_all_channels: bool,
+    pub values_filter: String,
+    pub show_channel_status: bool,
 
     // Global channel display preferences keyed by canonicalized channel name.
     pub channel_preferences: HashMap<String, ChannelPreference>,
@@ -464,6 +500,13 @@ impl SharedState {
     pub fn new() -> Self {
         Self {
             session_id: 0,
+            recording_analyses: Default::default(),
+            correction_gps_speed: None,
+            correction_speed: None,
+            correction_distance: None,
+            correction_error: None,
+            correction_revision: 0,
+            show_recording_editor: false,
             ld_file: None,
             ld_path: None,
             file_name: String::new(),
@@ -484,6 +527,12 @@ impl SharedState {
             pending_toggle_channel: None,
             math_channels: Vec::new(),
             channel_aliases: HashMap::new(),
+            channel_settings: Default::default(),
+            analysis_messages: Default::default(),
+            channel_errors: RefCell::new(HashMap::new()),
+            values_all_channels: false,
+            values_filter: String::new(),
+            show_channel_status: false,
             channel_preferences: HashMap::new(),
             channel_preferences_dirty: false,
             sectors: Vec::new(),
@@ -509,9 +558,29 @@ impl SharedState {
         self.distance_axis_cache = None;
     }
 
+    pub fn invalidate_correction_caches(&mut self) {
+        self.correction_revision += 1;
+        self.correction_gps_speed = None;
+        self.correction_speed = None;
+        self.correction_distance = None;
+        self.correction_error = None;
+        self.invalidate_derived_caches();
+        self.track_data_cache.borrow_mut().take();
+        *self.pending_track_data_build.borrow_mut() = false;
+        *self.requested_track_data_build.borrow_mut() = false;
+        *self.resolved_track_data_build.borrow_mut() = false;
+        self.request_track_data_build();
+    }
+
     pub fn invalidate_session_caches(&mut self) {
+        self.correction_gps_speed = None;
+        self.correction_speed = None;
+        self.correction_distance = None;
+        self.correction_error = None;
+        self.correction_revision += 1;
         self.invalidate_derived_caches();
         self.decoded_channel_cache.borrow_mut().clear();
+        self.channel_errors.borrow_mut().clear();
         self.pending_channel_decodes.borrow_mut().clear();
         self.requested_channel_decodes.borrow_mut().clear();
         self.pending_math_evaluations.borrow_mut().clear();
@@ -597,6 +666,10 @@ impl SharedState {
         was_requested
     }
 
+    pub fn corrections_settled(&self) -> bool {
+        *self.resolved_track_data_build.borrow()
+    }
+
     pub fn is_track_data_build_pending(&self) -> bool {
         *self.pending_track_data_build.borrow()
     }
@@ -641,6 +714,10 @@ impl SharedState {
     /// Select a lap (or the whole session) and zoom every panel to it.
     pub fn select_lap(&mut self, lap: Option<usize>) {
         self.selected_lap = lap;
+        let key = self.recording_key().to_string();
+        if let Some(model) = self.recording_analyses.get_mut(&key) {
+            model.selected_range = lap.and_then(|i| model.ranges.get(i)).map(|r| r.id.clone());
+        }
         self.zoom_from_timeline = true;
         self.zoom_range = lap
             .and_then(|index| self.laps.get(index))
@@ -700,6 +777,9 @@ impl SharedState {
     }
 
     pub fn request_physical_channel_decode(&self, channel_idx: usize) {
+        if self.channel_errors.borrow().contains_key(&channel_idx) {
+            return;
+        }
         if self
             .decoded_channel_cache
             .borrow()
@@ -751,6 +831,38 @@ impl SharedState {
 #[cfg(test)]
 mod tests {
     use super::SharedState;
+
+    #[test]
+    fn readout_and_csv_share_display_conversion_and_metadata() {
+        let mut shared = SharedState::new();
+        let mut definition =
+            shared.create_math_channel_def("Temperature".into(), "0".into(), "C".into(), 1);
+        definition.freq = 1;
+        definition.dec_places = 1;
+        definition.data = Some(std::sync::Arc::from([0.0, 100.0, f64::NAN]));
+        shared.math_channels.push(definition);
+        let mut plotted =
+            crate::panels::utils::create_plotted_channel(super::ChannelId::Math(0), &shared, 0)
+                .unwrap();
+        let preset = crate::panels::utils::display_presets_for_unit("C")[0];
+        plotted.display_scale = preset.scale;
+        plotted.display_offset = preset.offset;
+        plotted.display_unit = Some(preset.unit.into());
+        let info = crate::panels::utils::build_plotted_channel_info(&plotted, &shared);
+        let path = std::env::temp_dir().join("i3rs_gui_export_display.csv");
+        i3rs_core::export_csv(&path, &[info.export_channel()], None).unwrap();
+        let csv = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(csv.lines().next(), Some("Time (s),Temperature (°F)"));
+        for (row, raw) in csv.lines().skip(1).zip(info.data.iter()) {
+            let cell = row.split(',').nth(1).unwrap();
+            if raw.is_finite() {
+                assert_eq!(cell, format!("{:.1}", info.transform_value(*raw)));
+            } else {
+                assert!(cell.is_empty());
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn playback_respects_range_speed_and_hover_and_stops_at_end() {

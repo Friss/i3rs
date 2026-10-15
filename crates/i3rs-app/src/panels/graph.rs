@@ -2778,6 +2778,9 @@ impl GraphPanel {
                             display_scale: pc.display_scale,
                             display_offset: pc.display_offset,
                             display_unit: pc.display_unit.clone(),
+                            math_id: None,
+                            recording_display_base: None,
+                            math_display_signature: None,
                             scale_mode: pc.scale_mode,
                             manual_min: pc.manual_min,
                             manual_max: pc.manual_max,
@@ -4071,6 +4074,47 @@ fn default_overlay_lap_index(laps: &[Lap]) -> Option<usize> {
 }
 
 fn derive_distance_axis_cache(shared: &SharedState) -> (Option<DistanceAxisCache>, bool) {
+    if shared.current_corrections() != i3rs_core::corrections::CorrectionSettings::default() {
+        let settings = shared.current_corrections();
+        if settings.distance_enabled
+            && settings.distance_source == i3rs_core::corrections::DistanceSource::Automatic
+        {
+            let (distance, waiting) = find_distance_channel(shared);
+            if let Some(mut cache) = distance {
+                if settings.stretch_enabled
+                    && let Some(length) = settings.track_length_m
+                {
+                    let mut samples = cache.data.to_vec();
+                    i3rs_core::corrections::stretch_distance(
+                        &mut samples,
+                        cache.freq,
+                        &shared.competition_laps(),
+                        length,
+                        settings.stretch_tolerance,
+                    );
+                    cache.data = Arc::from(samples);
+                }
+                return (Some(cache), false);
+            }
+            if waiting {
+                return (None, true);
+            }
+        }
+        if let Some((data, freq)) = &shared.correction_distance {
+            return (
+                Some(DistanceAxisCache {
+                    data: Arc::clone(data),
+                    freq: *freq,
+                }),
+                false,
+            );
+        }
+        if !shared.current_corrections().distance_enabled || shared.correction_error.is_some() {
+            return (None, false);
+        }
+        shared.request_track_data_build();
+        return (None, true);
+    }
     let (distance_cache, waiting_on_distance) = find_distance_channel(shared);
     if let Some(cache) = distance_cache {
         return (Some(cache), false);
@@ -4871,6 +4915,9 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            math_id: None,
+            recording_display_base: None,
+            math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
             manual_min: 0.0,
             manual_max: 1.0,

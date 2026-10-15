@@ -1,5 +1,8 @@
 //! Shared library entry points for the native and web i3rs app.
 
+mod channel_analysis;
+mod recording_analysis;
+
 mod app;
 mod background_jobs;
 mod default_layouts;

@@ -134,6 +134,7 @@ pub struct App {
     theme_choice: ThemeChoice,
     show_channel_preferences: bool,
     show_session_details: bool,
+    recording_editor: crate::panels::recording_editor::RecordingEditor,
     compare_session_path: Option<PathBuf>,
     session_summary_cache: HashMap<PathBuf, SessionSummary>,
     load_error: Option<String>,
@@ -184,6 +185,7 @@ impl App {
             theme_choice: preferences.theme,
             show_channel_preferences: false,
             show_session_details: false,
+            recording_editor: Default::default(),
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,
@@ -241,6 +243,7 @@ impl App {
                             color_channel_name,
                             section_times_only: tm.section_times_only,
                             show_annotations: tm.show_annotations,
+                            annotation_settings: tm.annotation_settings.clone(),
                         },
                     ));
                 }
@@ -269,10 +272,14 @@ impl App {
     }
 
     fn restore_workspace_when_ready(&mut self, workspace: crate::workspace::WorkspaceFile) {
+        if let Some(load) = &mut self.pending_session_load {
+            load.workspace_snapshot = Some(workspace);
+            return;
+        }
+        crate::workspace::restore_track_sections(&workspace, &mut self.shared);
         if self.shared.are_math_channels_settled() {
             self.apply_workspace_snapshot(workspace);
         } else {
-            crate::workspace::restore_track_sections(&workspace, &mut self.shared);
             self.pending_workspace_restore = Some(workspace);
         }
     }
@@ -310,6 +317,7 @@ impl App {
         loaded: LoadedSession,
         workspace_snapshot: Option<crate::workspace::WorkspaceFile>,
     ) {
+        self.shared.remember_recording_analysis();
         self.load_error = None;
         self.pending_session_load = None;
         self.pending_workspace_restore = None;
@@ -328,6 +336,20 @@ impl App {
         self.shared.playback_active = false;
         self.shared.zoom_range = Some((0.0, loaded.data_duration));
         self.shared.invalidate_session_caches();
+        let detected = self.shared.laps.clone();
+        if let Some(analysis) = loaded.analysis {
+            self.shared
+                .recording_analyses
+                .entry(analysis.recording.clone())
+                .or_insert(analysis);
+        }
+        if let Some(warning) = loaded.analysis_warning {
+            self.shared.message(warning);
+        }
+        self.shared.activate_recording_analysis(&detected);
+        if let Some(selected) = self.shared.selected_lap {
+            self.shared.select_lap(Some(selected));
+        }
 
         // Clear all panels' channels and caches across all worksheets
         for ws in &mut self.worksheets {
@@ -505,6 +527,7 @@ impl App {
                             self.install_loaded_session(loaded, pending.workspace_snapshot);
                         }
                         Err(err) => {
+                            self.shared.message(format!("Failed to open file: {err}"));
                             self.load_error = Some(format!("Failed to open file: {err}"));
                         }
                     }
@@ -534,23 +557,39 @@ impl App {
                         }
                         Err(err) => {
                             self.shared.cancel_physical_channel_decode(channel_idx);
+                            self.shared
+                                .channel_errors
+                                .borrow_mut()
+                                .insert(channel_idx, err.clone());
+                            self.shared.message(err.clone());
+                            math_editor::reevaluate_math_channels_waiting_on_inputs(
+                                &mut self.shared,
+                            );
                             self.load_error = Some(format!("Failed to decode channel: {err}"));
                         }
                     }
                 }
                 JobResult::BuildTrackData {
                     session_id,
-                    track_data,
+                    correction_key,
+                    result,
                 } => {
                     if self.shared.session_id != session_id {
                         continue;
                     }
-                    self.shared.store_track_data(track_data);
+                    if !self
+                        .shared
+                        .apply_correction_result(&correction_key, *result)
+                    {
+                        continue;
+                    }
+                    math_editor::reevaluate_math_channels_waiting_on_inputs(&mut self.shared);
                 }
                 JobResult::EvaluateMathChannel {
                     session_id,
                     math_id,
                     expression,
+                    evaluation_key,
                     result,
                 } => {
                     if self.shared.session_id != session_id {
@@ -561,6 +600,7 @@ impl App {
                         &mut self.shared,
                         math_id,
                         &expression,
+                        &evaluation_key,
                         result,
                     ) {
                         self.shared.invalidate_derived_caches();
@@ -569,6 +609,8 @@ impl App {
                                 &mut self.shared,
                             );
                         }
+                    } else if let Some(idx) = self.shared.math_channel_index_by_id(math_id) {
+                        math_editor::queue_math_channel_evaluation(&mut self.shared, idx);
                     }
                     self.maybe_apply_pending_workspace_restore();
                 }
@@ -617,10 +659,18 @@ impl App {
         let mut requested = requested;
         requested.sort_by_key(|math_id| order_pos.get(math_id).copied().unwrap_or(usize::MAX));
 
+        let mut source_failed = false;
         for math_id in requested {
             let Some(job) = math_editor::build_math_evaluation_job(&mut self.shared, math_id)
             else {
                 self.shared.cancel_math_channel_evaluation(math_id);
+                source_failed |= self
+                    .shared
+                    .math_channel_index_by_id(math_id)
+                    .is_some_and(|idx| {
+                        self.shared.math_channels[idx].evaluation_state
+                            == crate::state::MathEvaluationState::Error
+                    });
                 continue;
             };
 
@@ -633,6 +683,8 @@ impl App {
                     session_id: self.shared.session_id,
                     math_id: job.math_id,
                     expression: job.expression,
+                    evaluation_key: job.evaluation_key,
+                    options: job.options,
                     aliases: job.aliases,
                     channel_data: job.channel_data,
                 },
@@ -641,6 +693,10 @@ impl App {
                 self.shared.cancel_math_channel_evaluation(math_id);
                 self.load_error = Some(err);
             }
+        }
+        if source_failed {
+            math_editor::reevaluate_math_channels_waiting_on_inputs(&mut self.shared);
+            ctx.request_repaint();
         }
     }
 
@@ -660,6 +716,9 @@ impl App {
             JobRequest::BuildTrackData {
                 request_id,
                 session_id: self.shared.session_id,
+                correction_key: self.shared.correction_key(),
+                settings: self.shared.current_corrections(),
+                laps: self.shared.competition_laps(),
                 ld,
             },
             ctx,
@@ -670,6 +729,7 @@ impl App {
     }
 
     fn clear_loaded_session(&mut self) {
+        self.shared.remember_recording_analysis();
         self.pending_workspace_restore = None;
         self.shared.ld_file = None;
         self.shared.ld_path = None;
@@ -781,17 +841,22 @@ impl App {
         #[cfg(target_arch = "wasm32")]
         {
             if let Err(e) = crate::preferences::save_preferences(&preferences) {
-                eprintln!("Failed to save preferences: {}", e);
+                self.shared
+                    .message(format!("Failed to save preferences: {}", e));
             }
             return;
         }
 
         #[cfg(not(target_arch = "wasm32"))]
-        std::thread::spawn(move || {
-            if let Err(e) = crate::preferences::save_preferences(&preferences) {
-                eprintln!("Failed to save preferences: {}", e);
-            }
-        });
+        {
+            let messages = self.shared.analysis_messages.clone();
+            let session_id = self.shared.session_id;
+            std::thread::spawn(move || {
+                if let Err(e) = crate::preferences::save_preferences(&preferences) {
+                    messages.record(session_id, format!("Failed to save preferences: {e}"));
+                }
+            });
+        }
     }
 
     fn save_project(&mut self) {
@@ -847,9 +912,13 @@ impl App {
                         })
                         .collect();
                 }
-                Err(e) => eprintln!("Failed to save project: {}", e),
+                Err(e) => self
+                    .shared
+                    .message(format!("Failed to save project: {}", e)),
             },
-            Err(e) => eprintln!("Failed to serialize project: {}", e),
+            Err(e) => self
+                .shared
+                .message(format!("Failed to serialize project: {}", e)),
         }
     }
 
@@ -889,10 +958,10 @@ impl App {
                         if active_session.exists() {
                             self.open_file(active_session);
                         } else {
-                            eprintln!(
+                            self.shared.message(format!(
                                 "Project session file not found: {}",
                                 active_session.display()
-                            );
+                            ));
                             self.register_project_session(&active_session);
                         }
                     }
@@ -905,15 +974,11 @@ impl App {
                             .insert(alias_config.alias.clone(), alias_config.target.clone());
                     }
 
+                    self.shared.channel_settings = project.workspace.channel_settings.clone();
                     // Load math channels from project workspace.
                     self.shared.math_channels.clear();
                     for config in &project.workspace.math_channels {
-                        let math_channel = self.shared.create_math_channel_def(
-                            config.name.clone(),
-                            config.expression.clone(),
-                            config.unit.clone(),
-                            config.dec_places,
-                        );
+                        let math_channel = config.create_definition(&mut self.shared);
                         self.shared.math_channels.push(math_channel);
                     }
                     math_editor::evaluate_all_math_channels(&mut self.shared);
@@ -924,9 +989,13 @@ impl App {
                     self.pending_workspace_restore = None;
                     self.restore_workspace_when_ready(workspace);
                 }
-                Err(e) => eprintln!("Failed to parse project: {}", e),
+                Err(e) => self
+                    .shared
+                    .message(format!("Failed to parse project: {}", e)),
             },
-            Err(e) => eprintln!("Failed to read project file: {}", e),
+            Err(e) => self
+                .shared
+                .message(format!("Failed to read project file: {}", e)),
         }
     }
 
@@ -940,10 +1009,22 @@ impl App {
             file_name: self.shared.file_name.clone(),
             date: ld.session.date.clone(),
             time: ld.session.time.clone(),
-            driver: ld.session.driver.clone(),
-            vehicle_id: ld.session.vehicle_id.clone(),
-            venue: ld.session.venue.clone(),
-            event_name: ld.event.event_name.clone(),
+            driver: self
+                .shared
+                .current_analysis()
+                .map_or_else(|| ld.session.driver.clone(), |a| a.details.driver.clone()),
+            vehicle_id: self.shared.current_analysis().map_or_else(
+                || ld.session.vehicle_id.clone(),
+                |a| a.details.vehicle.clone(),
+            ),
+            venue: self
+                .shared
+                .current_analysis()
+                .map_or_else(|| ld.session.venue.clone(), |a| a.details.venue.clone()),
+            event_name: self
+                .shared
+                .current_analysis()
+                .map_or_else(|| ld.event.event_name.clone(), |a| a.details.event.clone()),
             session_name: ld.event.session.clone(),
             comment: if ld.event.comment.is_empty() {
                 ld.session.short_comment.clone()
@@ -1131,6 +1212,12 @@ impl App {
                     }
                     ui.label("Session labels and notes are stored in the project file.");
                 });
+                if ui
+                    .button("Edit log details, ranges and corrections")
+                    .clicked()
+                {
+                    self.shared.show_recording_editor = true;
+                }
                 ui.separator();
 
                 if let Some(current_path) = current_path.as_ref()
@@ -1301,17 +1388,19 @@ impl App {
         let add_scatter = KeyboardShortcut::new(command_shift, Key::X);
         let add_fft = KeyboardShortcut::new(command_shift, Key::F);
 
-        if ctx.input_mut(|i| i.consume_shortcut(&open_file)) {
-            self.start_open_session(ctx);
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&save_project)) {
-            self.save_project();
-        }
+        // egui allows extra Shift/Alt modifiers, so consume the more specific
+        // shortcuts first before their unshifted counterparts.
         if ctx.input_mut(|i| i.consume_shortcut(&load_project)) {
             self.load_project();
         }
         if ctx.input_mut(|i| i.consume_shortcut(&save_workspace)) {
             self.save_workspace();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&open_file)) {
+            self.start_open_session(ctx);
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&save_project)) {
+            self.save_project();
         }
         if ctx.input_mut(|i| i.consume_shortcut(&toggle_browser)) {
             self.show_channel_browser = !self.show_channel_browser;
@@ -1437,7 +1526,8 @@ impl App {
             && let Some(path) = crate::platform::save_workspace_file()
             && let Err(e) = std::fs::write(&path, json)
         {
-            eprintln!("Failed to save workspace: {}", e);
+            self.shared
+                .message(format!("Failed to save workspace: {}", e));
         }
     }
 
@@ -1463,15 +1553,11 @@ impl App {
                                 .insert(alias_config.alias.clone(), alias_config.target.clone());
                         }
 
+                        self.shared.channel_settings = workspace.channel_settings.clone();
                         // Load math channels from workspace
                         self.shared.math_channels.clear();
                         for config in &workspace.math_channels {
-                            let math_channel = self.shared.create_math_channel_def(
-                                config.name.clone(),
-                                config.expression.clone(),
-                                config.unit.clone(),
-                                config.dec_places,
-                            );
+                            let math_channel = config.create_definition(&mut self.shared);
                             self.shared.math_channels.push(math_channel);
                         }
                         math_editor::evaluate_all_math_channels(&mut self.shared);
@@ -1481,9 +1567,13 @@ impl App {
                         self.pending_workspace_restore = None;
                         self.restore_workspace_when_ready(workspace);
                     }
-                    Err(e) => eprintln!("Failed to parse workspace: {}", e),
+                    Err(e) => self
+                        .shared
+                        .message(format!("Failed to parse workspace: {}", e)),
                 },
-                Err(e) => eprintln!("Failed to read workspace file: {}", e),
+                Err(e) => self
+                    .shared
+                    .message(format!("Failed to read workspace file: {}", e)),
             }
         }
     }
@@ -1495,15 +1585,8 @@ impl App {
         }
 
         if let Some(path) = crate::platform::save_csv_file() {
-            let channels: Vec<ExportChannel<'_>> = registry
-                .iter()
-                .map(|info| ExportChannel {
-                    name: &info.name,
-                    data: &info.data,
-                    freq: info.freq,
-                    dec_places: info.dec_places,
-                })
-                .collect();
+            let channels: Vec<ExportChannel<'_>> =
+                registry.iter().map(|info| info.export_channel()).collect();
 
             if let Err(e) = export_csv(
                 &path,
@@ -1512,7 +1595,7 @@ impl App {
                     .zoom_range
                     .or_else(|| self.shared.data_duration.map(|end| (0.0, end))),
             ) {
-                eprintln!("Failed to export CSV: {}", e);
+                self.shared.message(format!("Failed to export CSV: {}", e));
             }
         }
     }
@@ -1659,6 +1742,14 @@ impl App {
                 ui.checkbox(&mut self.show_channel_browser, "Channel Browser");
                 ui.checkbox(&mut self.show_cursor_readout, "Cursor Readout");
                 ui.checkbox(&mut self.show_math_editor, "Math Editor");
+                ui.checkbox(
+                    &mut self.shared.show_channel_status,
+                    "Channel Status / Messages",
+                );
+                ui.checkbox(
+                    &mut self.shared.show_recording_editor,
+                    "Ranges / Corrections / Details",
+                );
                 if ui.button("Session Details").clicked() {
                     self.show_session_details = true;
                     ui.close();
@@ -1749,16 +1840,24 @@ impl App {
                 ui.separator();
                 ui.label(format!("{} {}", s.date, s.time));
                 ui.separator();
-                ui.label(&s.venue);
+                ui.label(
+                    self.shared
+                        .current_analysis()
+                        .map_or(s.venue.as_str(), |a| a.details.venue.as_str()),
+                );
                 ui.separator();
-                ui.label(&s.vehicle_id);
+                ui.label(
+                    self.shared
+                        .current_analysis()
+                        .map_or(s.vehicle_id.as_str(), |a| a.details.vehicle.as_str()),
+                );
                 ui.separator();
                 ui.label(i3rs_core::format_duration(ld.duration_secs()));
                 ui.separator();
                 ui.label(format!("{} channels", ld.channels.len()));
                 if !self.shared.laps.is_empty() {
                     ui.separator();
-                    ui.label(format!("{} laps", self.shared.laps.len()));
+                    ui.label(format!("{} ranges", self.shared.laps.len()));
                 }
                 if !self.shared.math_channels.is_empty() {
                     ui.separator();
@@ -1993,7 +2092,7 @@ impl eframe::App for App {
         // Math editor — collapsible left panel (after browser)
         if self.show_math_editor {
             egui::Panel::left("math_editor")
-                .default_size(300.0)
+                .default_size(460.0)
                 .resizable(true)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -2032,7 +2131,7 @@ impl eframe::App for App {
                         });
                     });
                     ui.separator();
-                    crate::panels::cursor_readout::show(ui, &self.shared);
+                    crate::panels::cursor_readout::show(ui, &mut self.shared);
                 });
         } else {
             egui::Panel::right("cursor_readout_collapsed")
@@ -2138,8 +2237,10 @@ impl eframe::App for App {
             }
         }
 
+        crate::panels::channel_status::show(ui.ctx(), &mut self.shared);
         self.show_channel_preferences_window(ui.ctx());
         self.show_session_details_window(ui.ctx());
+        self.recording_editor.show(ui.ctx(), &mut self.shared);
         self.submit_requested_channel_decodes(ui.ctx());
         self.submit_requested_math_channel_evaluations(ui.ctx());
         self.submit_requested_track_data_build(ui.ctx());
@@ -2189,6 +2290,7 @@ mod tests {
             theme_choice: ThemeChoice::System,
             show_channel_preferences: false,
             show_session_details: false,
+            recording_editor: Default::default(),
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,
@@ -2206,6 +2308,50 @@ mod tests {
             #[cfg(target_arch = "wasm32")]
             web_load_rx: crate::platform::web_load_channel().1,
         }
+    }
+
+    #[test]
+    fn project_analysis_restore_waits_for_the_requested_recording() {
+        let mut shared = SharedState::new();
+        let ld = LdFile::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/VIR_LAP.ld"
+        ))
+        .unwrap();
+        shared.data_duration = Some(ld.duration_secs());
+        let laps = detect_laps(&ld);
+        shared.ld_file = Some(Arc::new(ld));
+        shared.activate_recording_analysis(&laps);
+        let mut workspace = crate::workspace::save_workspace(&[], 0, &shared);
+        workspace
+            .recording_analyses
+            .get_mut(shared.recording_key())
+            .unwrap()
+            .corrections
+            .gps_enabled = false;
+        let mut app = test_app(shared, vec![]);
+        app.pending_session_load = Some(PendingSessionLoad {
+            request_id: 42,
+            file_label: "Requested recording".into(),
+            workspace_snapshot: None,
+        });
+        app.restore_workspace_when_ready(workspace);
+        assert!(
+            app.shared.current_corrections().gps_enabled,
+            "do not apply the incoming project's settings to the old recording"
+        );
+        let saved = app
+            .pending_session_load
+            .as_ref()
+            .unwrap()
+            .workspace_snapshot
+            .as_ref()
+            .unwrap();
+        assert!(
+            !saved.recording_analyses[app.shared.recording_key()]
+                .corrections
+                .gps_enabled
+        );
     }
 
     #[test]
@@ -2235,6 +2381,9 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            math_id: None,
+            recording_display_base: None,
+            math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
             manual_min: 1.0,
             manual_max: 1.0,
@@ -2262,6 +2411,9 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            math_id: None,
+            recording_display_base: None,
+            math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
             manual_min: 1.0,
             manual_max: 1.0,
@@ -2349,6 +2501,7 @@ mod tests {
         let mut shared = SharedState::new();
         shared.ld_path = Some("previous.ld".into());
         shared.sectors = vec![i3rs_core::Sector {
+            semantics: i3rs_core::track::SectionSemantics::default(),
             name: "Previous recording".into(),
             start_index: 50,
             end_index: 100,
@@ -2371,6 +2524,9 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             display_unit: None,
+            math_id: None,
+            recording_display_base: None,
+            math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
             manual_min: 1.0,
             manual_max: 1.0,

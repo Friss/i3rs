@@ -2,12 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::state::{ChannelStats, compute_channel_stats};
-#[cfg(not(target_arch = "wasm32"))]
-use i3rs_core::extract_gps_track;
-use i3rs_core::{
-    ChannelData, Lap, LdFile, LdxFile, TrackData, detect_laps, evaluate_expression_with_aliases,
-    find_ldx_for_ld,
-};
+use i3rs_core::{ChannelData, Lap, LdFile, LdxFile, detect_laps, find_ldx_for_ld};
 
 pub struct LoadedSession {
     pub file_name: String,
@@ -16,6 +11,8 @@ pub struct LoadedSession {
     pub ld: LdFile,
     pub laps: Vec<Lap>,
     pub data_duration: f64,
+    pub analysis: Option<i3rs_core::ranges::RecordingAnalysis>,
+    pub analysis_warning: Option<String>,
 }
 
 pub enum LoadSessionSource {
@@ -44,12 +41,17 @@ pub enum JobRequest {
         session_id: u64,
         math_id: u64,
         expression: String,
+        evaluation_key: String,
+        options: i3rs_core::math_engine::EvaluationOptions,
         aliases: std::collections::HashMap<String, String>,
         channel_data: std::collections::HashMap<String, ChannelData>,
     },
     BuildTrackData {
         request_id: u64,
         session_id: u64,
+        correction_key: String,
+        settings: i3rs_core::corrections::CorrectionSettings,
+        laps: Vec<Lap>,
         ld: Arc<LdFile>,
     },
 }
@@ -78,14 +80,43 @@ pub enum JobResult {
     },
     BuildTrackData {
         session_id: u64,
-        track_data: Option<TrackData>,
+        correction_key: String,
+        result: Box<Result<i3rs_core::corrections::CorrectedRecording, String>>,
     },
     EvaluateMathChannel {
         session_id: u64,
         math_id: u64,
         expression: String,
+        evaluation_key: String,
         result: Result<EvaluatedMathChannel, String>,
     },
+}
+
+fn read_analysis_sidecar(
+    path: &std::path::Path,
+    ld: &LdFile,
+) -> (Option<i3rs_core::ranges::RecordingAnalysis>, Option<String>) {
+    let path = path.with_extension("i3rs.json");
+    let json = match std::fs::read_to_string(&path) {
+        Ok(json) => json,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, None),
+        Err(e) => return (None, Some(format!("Analysis sidecar: {e}"))),
+    };
+    let result = serde_json::from_str::<i3rs_core::ranges::RecordingAnalysis>(&json)
+        .map_err(|e| e.to_string())
+        .and_then(|analysis| {
+            analysis.validate()?;
+            if analysis.recording != ld.recording_id()
+                || (analysis.duration - ld.duration_secs()).abs() > 1e-6
+            {
+                return Err("Sidecar belongs to another recording".into());
+            }
+            Ok(analysis)
+        });
+    match result {
+        Ok(a) => (Some(a), None),
+        Err(e) => (None, Some(format!("Analysis sidecar: {e}"))),
+    }
 }
 
 fn perform_load_session(source: LoadSessionSource) -> Result<LoadedSession, String> {
@@ -99,6 +130,9 @@ fn perform_load_session(source: LoadSessionSource) -> Result<LoadedSession, Stri
             let ldx = find_ldx_for_ld(&path);
             let ld = LdFile::open(&path)?;
             let data_duration = ld.duration_secs();
+            // Compute source identity in the load job, before UI metadata needs it.
+            ld.recording_id();
+            let (analysis, analysis_warning) = read_analysis_sidecar(&path, &ld);
             let ld = std::sync::Arc::new(ld);
             let laps = {
                 let _perf = crate::perf_metrics::scope("lap detection");
@@ -115,6 +149,8 @@ fn perform_load_session(source: LoadSessionSource) -> Result<LoadedSession, Stri
                 ld,
                 laps,
                 data_duration,
+                analysis,
+                analysis_warning,
             })
         }
         LoadSessionSource::Bytes {
@@ -124,6 +160,8 @@ fn perform_load_session(source: LoadSessionSource) -> Result<LoadedSession, Stri
         } => {
             let ld = LdFile::from_bytes(bytes)?;
             let data_duration = ld.duration_secs();
+            // Compute source identity in the load job, before UI metadata needs it.
+            ld.recording_id();
             let ld = std::sync::Arc::new(ld);
             let laps = {
                 let _perf = crate::perf_metrics::scope("lap detection");
@@ -140,6 +178,8 @@ fn perform_load_session(source: LoadSessionSource) -> Result<LoadedSession, Stri
                 ld,
                 laps,
                 data_duration,
+                analysis: None,
+                analysis_warning: None,
             })
         }
     }
@@ -165,20 +205,29 @@ fn perform_decode_physical_channel(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn perform_build_track_data(ld: Arc<LdFile>) -> Option<TrackData> {
+fn perform_build_track_data(
+    ld: Arc<LdFile>,
+    settings: i3rs_core::corrections::CorrectionSettings,
+    laps: Vec<Lap>,
+) -> Result<i3rs_core::corrections::CorrectedRecording, String> {
     let _perf = crate::perf_metrics::scope("track-map draw");
-    extract_gps_track(&ld)
+    i3rs_core::corrections::build_corrected_recording(&ld, &settings, &laps)
 }
 
 fn perform_evaluate_math_channel(
     expression: String,
     channel_data: std::collections::HashMap<String, ChannelData>,
     aliases: std::collections::HashMap<String, String>,
+    options: i3rs_core::math_engine::EvaluationOptions,
 ) -> Result<EvaluatedMathChannel, String> {
     let _perf = crate::perf_metrics::scope("math evaluation");
-    let (samples, freq) = evaluate_expression_with_aliases(&expression, &channel_data, &aliases)
-        .map_err(|err| err.to_string())?;
+    let (samples, freq) = i3rs_core::math_engine::evaluate_expression_with_options(
+        &expression,
+        &channel_data,
+        &aliases,
+        &options,
+    )
+    .map_err(|err| err.to_string())?;
     let stats = compute_channel_stats(&samples);
     Ok(EvaluatedMathChannel {
         samples,
@@ -193,20 +242,51 @@ async fn yield_to_browser() {
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn perform_build_track_data_cooperative(ld: Arc<LdFile>) -> Option<TrackData> {
-    let _perf = crate::perf_metrics::scope("track-map draw");
-    // The same phases as `extract_gps_track`, yielding to the browser between them.
-    let (lat_ch, lon_ch) = i3rs_core::track::gps_channels(&ld)?;
+async fn perform_build_track_data_cooperative(
+    ld: Arc<LdFile>,
+    settings: i3rs_core::corrections::CorrectionSettings,
+    laps: Vec<Lap>,
+) -> Result<i3rs_core::corrections::CorrectedRecording, String> {
+    if settings != i3rs_core::corrections::CorrectionSettings::default() {
+        yield_to_browser().await;
+        return perform_build_track_data(ld, settings, laps);
+    }
+    let mut track = None;
+    if let Some((a, b)) = i3rs_core::track::gps_channels(&ld) {
+        yield_to_browser().await;
+        let lat = ld.read_channel_data(a).ok_or("Latitude decode failed")?;
+        yield_to_browser().await;
+        let lon = ld.read_channel_data(b).ok_or("Longitude decode failed")?;
+        yield_to_browser().await;
+        track = i3rs_core::track::gps_track_from_samples(&lat, a.freq, &lon, b.freq);
+    }
     yield_to_browser().await;
-    let lat_data = ld.read_channel_data(lat_ch)?;
+    let speed = i3rs_core::distance::corrected_speed_from_ld(&ld);
     yield_to_browser().await;
-    let lon_data = ld.read_channel_data(lon_ch)?;
-    yield_to_browser().await;
-    let mut track =
-        i3rs_core::track::gps_track_from_samples(&lat_data, lat_ch.freq, &lon_data, lon_ch.freq)?;
-    yield_to_browser().await;
-    i3rs_core::track::attach_corrected_distance(&mut track, &ld);
-    Some(track)
+    let distance = speed.as_ref().and_then(|(v, f)| {
+        i3rs_core::distance::integrate_speed_series(v, *f, "m/s").map(|d| (d, *f))
+    });
+    if let Some(t) = &mut track {
+        t.corrected_speed = speed.clone();
+        t.distance = distance.clone();
+    }
+    let gps_speed = ld
+        .find_channel_by_name("GPS Speed")
+        .filter(|c| c.freq > 0)
+        .and_then(|c| {
+            let scale = i3rs_core::distance::speed_unit_to_mps(&c.unit)?;
+            Some((
+                ld.read_channel_data(c)?.iter().map(|v| v * scale).collect(),
+                c.freq,
+            ))
+        });
+    Ok(i3rs_core::corrections::CorrectedRecording {
+        gps_speed,
+        speed,
+        distance,
+        track,
+        messages: vec![],
+    })
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -236,26 +316,39 @@ async fn run_wasm_job(request: JobRequest) -> JobResult {
         JobRequest::BuildTrackData {
             request_id: _,
             session_id,
+            correction_key,
+            settings,
+            laps,
             ld,
-        } => JobResult::BuildTrackData {
-            session_id,
-            track_data: perform_build_track_data_cooperative(ld).await,
-        },
+        } => {
+            yield_to_browser().await;
+            let result = perform_build_track_data_cooperative(ld, settings, laps).await;
+            yield_to_browser().await;
+            JobResult::BuildTrackData {
+                session_id,
+                correction_key,
+                result: Box::new(result),
+            }
+        }
         JobRequest::EvaluateMathChannel {
             request_id: _,
             session_id,
             math_id,
             expression,
+            evaluation_key,
+            options,
             aliases,
             channel_data,
         } => {
             yield_to_browser().await;
-            let result = perform_evaluate_math_channel(expression.clone(), channel_data, aliases);
+            let result =
+                perform_evaluate_math_channel(expression.clone(), channel_data, aliases, options);
             yield_to_browser().await;
             JobResult::EvaluateMathChannel {
                 session_id,
                 math_id,
                 expression,
+                evaluation_key,
                 result,
             }
         }
@@ -295,23 +388,35 @@ impl BackgroundJobs {
                     JobRequest::BuildTrackData {
                         request_id: _,
                         session_id,
+                        correction_key,
+                        settings,
+                        laps,
                         ld,
                     } => JobResult::BuildTrackData {
                         session_id,
-                        track_data: perform_build_track_data(ld),
+                        correction_key,
+                        result: Box::new(perform_build_track_data(ld, settings, laps)),
                     },
                     JobRequest::EvaluateMathChannel {
                         request_id: _,
                         session_id,
                         math_id,
                         expression,
+                        evaluation_key,
+                        options,
                         aliases,
                         channel_data,
                     } => JobResult::EvaluateMathChannel {
                         session_id,
                         math_id,
                         expression: expression.clone(),
-                        result: perform_evaluate_math_channel(expression, channel_data, aliases),
+                        evaluation_key,
+                        result: perform_evaluate_math_channel(
+                            expression,
+                            channel_data,
+                            aliases,
+                            options,
+                        ),
                     },
                 };
 
@@ -385,4 +490,40 @@ pub fn load_session_from_bytes(
         bytes,
         ldx,
     })
+}
+
+#[cfg(test)]
+mod sidecar_tests {
+    use super::*;
+    #[test]
+    fn sidecar_loading_validates_identity_and_reports_invalid_json() {
+        let ld = LdFile::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/VIR_LAP.ld"
+        ))
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("i3r3-sidecar-{}.ld", std::process::id()));
+        let sidecar = path.with_extension("i3rs.json");
+        let mut analysis = i3rs_core::ranges::RecordingAnalysis::from_laps(
+            ld.recording_id().into(),
+            ld.duration_secs(),
+            &detect_laps(&ld),
+        );
+        analysis.details.driver = "Sidecar driver".into();
+        std::fs::write(&sidecar, serde_json::to_string(&analysis).unwrap()).unwrap();
+        let (a, w) = read_analysis_sidecar(&path, &ld);
+        assert!(w.is_none());
+        assert_eq!(a.unwrap().details.driver, "Sidecar driver");
+        analysis.recording = "wrong".into();
+        std::fs::write(&sidecar, serde_json::to_string(&analysis).unwrap()).unwrap();
+        let (a, w) = read_analysis_sidecar(&path, &ld);
+        assert!(a.is_none());
+        assert!(w.unwrap().contains("another recording"));
+        std::fs::write(&sidecar, "{").unwrap();
+        let (a, w) = read_analysis_sidecar(&path, &ld);
+        assert!(a.is_none());
+        assert!(w.is_some());
+        std::fs::remove_file(sidecar).unwrap();
+        assert!(read_analysis_sidecar(&path, &ld).0.is_none());
+    }
 }
