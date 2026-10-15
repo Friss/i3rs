@@ -473,7 +473,9 @@ pub fn build_corrected_recording(
     if s.speed_enabled && speed.is_none() {
         messages.push("No usable corrected-speed source".into());
     }
-    let quality = if let Some((name, min)) = &s.gps_quality {
+    let quality = if s.gps_enabled
+        && let Some((name, min)) = &s.gps_quality
+    {
         let c = ld
             .find_channel_by_name(name)
             .ok_or_else(|| format!("GPS validity source '{name}' is unavailable"))?;
@@ -662,6 +664,38 @@ mod tests {
         s.gps_enabled = false;
         let built = build_corrected_recording(&ld, &s, &[]).unwrap();
         assert!(built.speed.is_none() && built.distance.is_none() && built.track.is_none());
+    }
+    #[test]
+    fn disabled_gps_does_not_resolve_missing_quality_or_block_speed_and_distance() {
+        let ld = log();
+        let mut settings = CorrectionSettings {
+            gps_enabled: false,
+            ..Default::default()
+        };
+        let expected = build_corrected_recording(&ld, &settings, &[]).unwrap();
+        settings.gps_quality = Some(("Unavailable GPS quality".into(), 4.));
+        let actual = build_corrected_recording(&ld, &settings, &[]).unwrap();
+        for (actual, expected) in [
+            (actual.speed, expected.speed),
+            (actual.distance, expected.distance),
+        ] {
+            let (actual, freq) = actual.unwrap();
+            let (expected, expected_freq) = expected.unwrap();
+            assert_eq!(freq, expected_freq);
+            assert!(!actual.is_empty());
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        assert!(actual.track.is_none());
+        assert!(actual.gps_speed.is_none());
+
+        settings.gps_enabled = true;
+        let error = build_corrected_recording(&ld, &settings, &[])
+            .err()
+            .unwrap();
+        assert!(error.contains("Unavailable GPS quality"));
     }
     #[test]
     fn clamps_and_braking_correction_preserve_missing_segments() {

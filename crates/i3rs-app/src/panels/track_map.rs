@@ -371,33 +371,23 @@ impl TrackMapPanel {
             .unwrap_or(0);
 
         let fingerprint = (ld_ptr, self.color_channel_idx);
-        let track_stale = self.track_data.is_none()
-            || self
-                .cache_fingerprint
-                .map(|(p, _)| p != ld_ptr)
-                .unwrap_or(true);
+        let shared_track = shared.track_data_if_ready();
+        let track_stale = self.cache_fingerprint.is_none_or(|(p, _)| p != ld_ptr)
+            || match (&self.track_data, &shared_track) {
+                (Some(local), Some(current)) => !Arc::ptr_eq(local, current),
+                (None, None) => false,
+                _ => true,
+            };
 
         if track_stale {
-            if shared.ld_file.is_some() {
-                if let Some(track_data) = shared.track_data_if_ready() {
-                    self.track_data = Some(track_data);
-                } else {
-                    shared.request_track_data_build();
-                    self.track_data = None;
-                }
-            } else {
-                self.track_data = None;
-            }
+            self.track_data = shared_track;
             self.cached_colors = None;
             self.cached_color_range = None;
             self.cached_sector_times = None;
             self.clear_render_caches();
-        } else if self.track_data.is_none() {
-            if let Some(track_data) = shared.track_data_if_ready() {
-                self.track_data = Some(track_data);
-            } else if shared.ld_file.is_some() {
-                shared.request_track_data_build();
-            }
+        }
+        if self.track_data.is_none() && shared.ld_file.is_some() {
+            shared.request_track_data_build();
         }
 
         if self.cache_fingerprint != Some(fingerprint) {
@@ -1296,6 +1286,113 @@ mod tests {
 
     fn sample_panel() -> TrackMapPanel {
         TrackMapPanel::new(1, "Track")
+    }
+
+    #[test]
+    fn open_panels_refresh_when_corrected_track_is_replaced_or_unavailable() {
+        let mut shared = SharedState::new();
+        let ld = i3rs_core::LdFile::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/VIR_LAP.ld"
+        ))
+        .unwrap();
+        shared.ld_file = Some(Arc::new(ld));
+        let install = |shared: &mut SharedState, x, speed| {
+            let mut track = TrackData::from_normalized_parts(
+                vec![x, x + 1., x + 2.],
+                vec![0.; 3],
+                vec![0., 1., 2.],
+                1,
+            );
+            track.corrected_speed = Some((vec![speed; 3], 1));
+            track.distance = Some((vec![0., speed, 2. * speed], 1));
+            let key = shared.correction_key();
+            assert!(shared.apply_correction_result(
+                &key,
+                Ok(i3rs_core::corrections::CorrectedRecording {
+                    speed: track.corrected_speed.clone(),
+                    distance: track.distance.clone(),
+                    gps_speed: None,
+                    track: Some(track),
+                    messages: vec![],
+                })
+            ));
+        };
+        install(&mut shared, 0., 10.);
+        let mut panels = [sample_panel(), TrackMapPanel::new(2, "Other track")];
+        panels[1].is_popped_out = true;
+        for panel in &mut panels {
+            panel.ensure_track_data(&shared);
+            let track = panel.track_data.clone().unwrap();
+            panel.section_annotations(&track, &shared);
+            panel.cached_colors = Some(Arc::from(vec![[1, 2, 3, 255]; 3]));
+            panel.cached_sector_times = Some(CachedSectorReport {
+                sectors: vec![],
+                laps: vec![],
+                times: vec![],
+            });
+            // An unchanged frame must retain the expensive caches.
+            panel.ensure_track_data(&shared);
+            assert!(panel.cached_colors.is_some());
+            assert!(panel.cached_sector_times.is_some());
+            assert!(panel.annotation_cache.is_some());
+        }
+
+        // Install a result for the same .ld without recreating either panel.
+        install(&mut shared, 100., 20.);
+        let current = shared.track_data_if_ready().unwrap();
+        for panel in &mut panels {
+            panel.ensure_track_data(&shared);
+            let track = panel.track_data.as_ref().unwrap();
+            assert!(Arc::ptr_eq(track, &current));
+            assert_eq!(track.x[0], 100.);
+            assert_eq!(track.corrected_speed.as_ref().unwrap().0[0], 20.);
+            assert_eq!(track.distance.as_ref().unwrap().0[2], 40.);
+            assert!(panel.cached_colors.is_none());
+            assert!(panel.cached_sector_times.is_none());
+            assert!(panel.annotation_cache.is_none());
+        }
+
+        shared.invalidate_correction_caches();
+        for panel in &mut panels {
+            panel.ensure_track_data(&shared);
+            assert!(panel.track_data.is_none());
+        }
+        assert!(shared.take_requested_track_data_build());
+
+        install(&mut shared, 200., 30.);
+        for panel in &mut panels {
+            panel.ensure_track_data(&shared);
+            assert_eq!(panel.track_data.as_ref().unwrap().x[0], 200.);
+        }
+        let key = shared.correction_key();
+        assert!(shared.apply_correction_result(&key, Err("GPS source unavailable".into())));
+        for panel in &mut panels {
+            panel.ensure_track_data(&shared);
+            assert!(panel.track_data.is_none());
+        }
+        assert!(!shared.take_requested_track_data_build());
+
+        install(&mut shared, 300., 40.);
+        for panel in &mut panels {
+            panel.ensure_track_data(&shared);
+        }
+        let key = shared.correction_key();
+        assert!(shared.apply_correction_result(
+            &key,
+            Ok(i3rs_core::corrections::CorrectedRecording {
+                gps_speed: None,
+                speed: None,
+                distance: None,
+                track: None,
+                messages: vec![],
+            })
+        ));
+        for panel in &mut panels {
+            panel.ensure_track_data(&shared);
+            assert!(panel.track_data.is_none());
+        }
+        assert!(!shared.take_requested_track_data_build());
     }
 
     #[test]
