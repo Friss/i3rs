@@ -74,6 +74,16 @@ impl WebHandle {
     }
 
     #[wasm_bindgen]
+    pub fn configure_vir_sample(&self) -> Result<bool, wasm_bindgen::JsValue> {
+        let mut app = self
+            .runner
+            .app_mut::<crate::App>()
+            .ok_or_else(|| wasm_bindgen::JsValue::from_str("app has not started yet"))?;
+        app.configure_vir_sample()
+            .map_err(|error| wasm_bindgen::JsValue::from_str(&error))
+    }
+
+    #[wasm_bindgen]
     pub fn session_summary_json(&self) -> Option<String> {
         let app = self.runner.app_mut::<crate::App>()?;
         let summary = app.loaded_session_summary()?;
@@ -166,6 +176,18 @@ pub fn bootstrap() -> Result<(), wasm_bindgen::JsValue> {
                 load.as_ref().unchecked_ref(),
             );
             load.forget();
+
+            let sample_handle = handle.clone();
+            let configure_sample =
+                Closure::<dyn FnMut() -> Result<bool, JsValue>>::new(move || {
+                    sample_handle.configure_vir_sample()
+                });
+            let _ = js_sys::Reflect::set(
+                window.as_ref(),
+                &JsValue::from_str("i3rsConfigureVirSample"),
+                configure_sample.as_ref().unchecked_ref(),
+            );
+            configure_sample.forget();
 
             let info_handle = handle.clone();
             let session_info = Closure::<dyn FnMut() -> JsValue>::new(move || {

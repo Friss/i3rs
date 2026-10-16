@@ -1,0 +1,15 @@
+{
+  "name": "i3rs-website",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "bash build.sh",
+    "assemble": "python3 assemble.py",
+    "check": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy --keep-vars"
+  },
+  "devDependencies": {
+    "wrangler": "4.151.1"
+  }
+}

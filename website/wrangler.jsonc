@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "i3rs-boxbox-dev",
+  "main": "src/index.js",
+  "account_id": "c440c3584c546bcb6ca3766d9cd58c1e",
+  "compatibility_date": "2026-06-09",
+  "routes": [
+    {
+      "pattern": "i3rs.boxbox.dev",
+      "custom_domain": true
+    }
+  ],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "run_worker_first": true
+  },
+  "observability": {
+    "enabled": true
+  }
+}

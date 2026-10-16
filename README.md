@@ -85,6 +85,9 @@ trunk build --release
 
 The generated bundle is written to `crates/i3rs-app/dist/`.
 The release workflow also publishes this bundle as a GitHub release asset named `i3rs-web.tar.gz`.
+The production website at [i3rs.boxbox.dev](https://i3rs.boxbox.dev) builds and
+deploys from `main` through Cloudflare Workers Builds. Its landing page and build
+scripts are in `website/`; see [website deployment](docs/website-deployment.md).
 
 ### CLI
 
