@@ -294,6 +294,8 @@ pub struct ReportPanelConfig {
     pub id: u64,
     pub title: String,
     #[serde(default)]
+    pub settings: crate::panels::report::ReportSettings,
+    #[serde(default)]
     pub channels: Vec<AnalysisChannelConfig>,
 }
 
@@ -792,6 +794,7 @@ pub fn save_workspace(
                     PanelTab::Report(r) => PanelConfig::Report(ReportPanelConfig {
                         id: r.id,
                         title: r.title.clone(),
+                        settings: r.settings.clone(),
                         channels: r
                             .channels
                             .iter()
@@ -1329,6 +1332,7 @@ pub fn load_workspace(
                     PanelConfig::CursorReadout => PanelTab::CursorReadout,
                     PanelConfig::Report(rc) => {
                         let mut report = crate::panels::report::ReportPanel::new(rc.id, &rc.title);
+                        report.settings = rc.settings.clone();
                         report.channels = rc
                             .channels
                             .iter()

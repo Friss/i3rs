@@ -690,7 +690,10 @@ pub fn swap_external_main(
     Ok(target)
 }
 
-fn reference_interpolation(source: &SharedState, reference: &str) -> i3rs_core::Interpolation {
+pub(crate) fn reference_interpolation(
+    source: &SharedState,
+    reference: &str,
+) -> i3rs_core::Interpolation {
     use i3rs_core::Interpolation;
     match source.resolve_analysis_reference(reference) {
         ChannelResolution::Resolved {

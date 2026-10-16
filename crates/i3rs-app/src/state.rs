@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::panels::utils::{format_enum_value, sample_range, uses_discrete_values};
+use crate::panels::utils::{format_enum_value, uses_discrete_values};
 
 /// Identifies a channel: either a physical channel from the .ld file or a math channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -113,19 +113,6 @@ impl PlottedChannelInfo {
             display_offset: self.display_offset,
         }
     }
-
-    /// Statistics of `data` in display units (a negative scale swaps min and max).
-    fn display_stats(&self, data: &[f64]) -> ChannelStats {
-        let mut stats = compute_channel_stats(data);
-        stats.min = self.transform_value(stats.min);
-        stats.max = self.transform_value(stats.max);
-        if self.display_scale < 0.0 {
-            std::mem::swap(&mut stats.min, &mut stats.max);
-        }
-        stats.avg = self.transform_value(stats.avg);
-        stats.stddev *= self.display_scale.abs();
-        stats
-    }
 }
 
 /// A user-defined math channel.
@@ -183,7 +170,6 @@ pub struct ChannelStats {
     pub min: f64,
     pub max: f64,
     pub avg: f64,
-    pub stddev: f64,
 }
 
 pub struct DecodedChannel {
@@ -191,7 +177,7 @@ pub struct DecodedChannel {
     pub stats: ChannelStats,
 }
 
-/// Compute min, max, avg, stddev for a slice of finite f64 values.
+/// Compute the cached graph overview statistics for finite values.
 pub fn compute_channel_stats(data: &[f64]) -> ChannelStats {
     let mut min = f64::MAX;
     let mut max = f64::MIN;
@@ -216,21 +202,7 @@ pub fn compute_channel_stats(data: &[f64]) -> ChannelStats {
     }
 
     let avg = sum / count as f64;
-    let mut var_sum = 0.0;
-    for &v in data {
-        if v.is_finite() {
-            let diff = v - avg;
-            var_sum += diff * diff;
-        }
-    }
-    let stddev = (var_sum / count as f64).sqrt();
-
-    ChannelStats {
-        min,
-        max,
-        avg,
-        stddev,
-    }
+    ChannelStats { min, max, avg }
 }
 
 /// Graph display mode.
@@ -300,127 +272,6 @@ pub const CHANNEL_COLORS: &[egui::Color32] = &[
     egui::Color32::from_rgb(50, 255, 200),  // cyan
     egui::Color32::from_rgb(255, 100, 200), // pink
 ];
-
-/// Cached statistics for a single channel (session + per-lap).
-pub struct CachedChannelStats {
-    pub name: String,
-    pub color: egui::Color32,
-    pub dec_places: i16,
-    pub unit: String,
-    /// Full session stats.
-    pub session: ChannelStats,
-    /// Per-lap stats.
-    pub per_lap: Vec<(String, ChannelStats)>,
-}
-
-/// Cache for report panel statistics, invalidated when channels or laps change.
-pub struct ReportCache {
-    channels: Vec<ReportChannelKey>,
-    laps: Vec<(String, u64, u64)>,
-    pub stats: Vec<CachedChannelStats>,
-}
-
-/// Every channel property that affects the cached statistics or their display.
-#[derive(PartialEq)]
-struct ReportChannelKey {
-    name: String,
-    data_ptr: usize,
-    data_len: usize,
-    unit: String,
-    scale_bits: u64,
-    offset_bits: u64,
-    freq: u16,
-    dec_places: i16,
-    color: egui::Color32,
-}
-
-impl ReportChannelKey {
-    fn of(info: &PlottedChannelInfo) -> Self {
-        Self {
-            name: info.name.clone(),
-            data_ptr: info.data.as_ptr() as usize,
-            data_len: info.data.len(),
-            unit: info.unit.clone(),
-            scale_bits: info.display_scale.to_bits(),
-            offset_bits: info.display_offset.to_bits(),
-            freq: info.freq,
-            dec_places: info.dec_places,
-            color: info.color,
-        }
-    }
-
-    fn matches(&self, info: &PlottedChannelInfo) -> bool {
-        self.name == info.name
-            && self.data_ptr == info.data.as_ptr() as usize
-            && self.data_len == info.data.len()
-            && self.unit == info.unit
-            && self.scale_bits == info.display_scale.to_bits()
-            && self.offset_bits == info.display_offset.to_bits()
-            && self.freq == info.freq
-            && self.dec_places == info.dec_places
-            && self.color == info.color
-    }
-}
-
-fn lap_matches(cached: &(String, u64, u64), lap: &Lap) -> bool {
-    cached.0 == lap.name
-        && cached.1 == lap.start_time.to_bits()
-        && cached.2 == lap.end_time.to_bits()
-}
-
-impl ReportCache {
-    pub fn new() -> Self {
-        Self {
-            channels: Vec::new(),
-            laps: Vec::new(),
-            stats: Vec::new(),
-        }
-    }
-
-    /// Returns true if the cache is still valid for the current display state.
-    pub fn is_valid(&self, registry: &[PlottedChannelInfo], laps: &[Lap]) -> bool {
-        self.laps.len() == laps.len()
-            && self.channels.len() == registry.len()
-            && self.laps.iter().zip(laps).all(|(c, l)| lap_matches(c, l))
-            && self
-                .channels
-                .iter()
-                .zip(registry)
-                .all(|(k, i)| k.matches(i))
-    }
-
-    /// Rebuild the cache from current display state and laps.
-    pub fn rebuild(&mut self, registry: &[PlottedChannelInfo], laps: &[Lap]) {
-        self.channels = registry.iter().map(ReportChannelKey::of).collect();
-        self.laps = laps
-            .iter()
-            .map(|l| (l.name.clone(), l.start_time.to_bits(), l.end_time.to_bits()))
-            .collect();
-        self.stats.clear();
-
-        for info in registry {
-            let session = info.display_stats(&info.data);
-            let per_lap = laps
-                .iter()
-                .filter_map(|lap| {
-                    let range =
-                        sample_range(info.data.len(), info.freq, (lap.start_time, lap.end_time));
-                    (!range.is_empty())
-                        .then(|| (lap.name.clone(), info.display_stats(&info.data[range])))
-                })
-                .collect();
-
-            self.stats.push(CachedChannelStats {
-                name: info.name.clone(),
-                color: info.color,
-                dec_places: info.dec_places,
-                unit: info.unit.clone(),
-                session,
-                per_lap,
-            });
-        }
-    }
-}
 
 type AnalysisConstantCache = HashMap<usize, (u64, usize, Arc<[f64]>)>;
 
