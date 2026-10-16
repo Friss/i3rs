@@ -16,35 +16,6 @@ Every pull request runs:
 - `trunk build --release` for `crates/i3rs-app`
 - cross-platform workspace builds on Ubuntu, macOS, and Windows
 
-### CI build time
-
-The [October 16, 2026 PR run](https://github.com/Friss/i3rs/actions/runs/38937111274)
-took 8m14s. Its web job determined the finish time:
-
-| Work | Duration |
-| --- | --- |
-| Compile and install Trunk | 4m56s |
-| Build the release web bundle | 2m28s |
-| Entire Windows job (slowest native job) | 2m55s |
-
-Both workflows install the prebuilt Trunk 0.21.14 release using a commit-pinned
-`taiki-e/install-action`, with source-build fallback disabled. This keeps the
-same Trunk version as the measured run while removing its compilation step.
-Based on that run, PR verification should take roughly 3–4 minutes before any
-additional benefit from a warm web cache; confirm this with subsequent CI runs.
-The new matrix cache keys start cold, so allow them to warm before comparing
-end-to-end times.
-
-Matrix caches include the matrix name. Previously, native Ubuntu and web jobs
-used the same cache key, and the web job logged a failed save because the native
-job had already saved that key. Separate entries let both builds retain their
-dependencies. PR lint/tests and main verification share the `verify` cache key
-so new PRs can restore dependencies from the default branch. Outdated runs for
-the same PR are canceled when a newer commit starts verification.
-
-These changes preserve release-mode web builds, all three native platforms,
-linting, tests, the crates.io dry run, and performance benchmarks.
-
 ## Main Release Flow
 
 Every push to `main` runs the release workflow. It:
