@@ -2,7 +2,9 @@
 
 [i3rs.boxbox.dev](https://i3rs.boxbox.dev) is the `i3rs-boxbox-dev` Cloudflare Worker.
 Its landing page, images, Worker, and build settings live in `website/` in this
-repository. Workers Builds watches **Friss/i3rs → main** and runs:
+repository. The [Deploy Website workflow](../.github/workflows/deploy-website.yml)
+runs on every push to **main** and calls the `github-main` Cloudflare deploy hook.
+Workers Builds then runs:
 
 ```bash
 # Build command, from the repository root:
@@ -12,10 +14,11 @@ bash website/build.sh
 npm --prefix website run deploy
 ```
 
-The production trigger includes all paths and only the `main` branch. Preview
-deployments are disabled. Workers Builds supplies its existing deployment token;
-no Cloudflare credential belongs in this repository or in the browser bundle.
-Deployments do not depend on a desktop release tag or version bump.
+The production hook can build only the `main` branch; preview deployments are
+disabled. Its URL is stored as the encrypted GitHub repository secret
+`CLOUDFLARE_DEPLOY_HOOK`. Workers Builds supplies its existing deployment token.
+Never commit the hook URL or a Cloudflare API token, or include them in the browser
+bundle. Deployments do not depend on a desktop release tag or version bump.
 
 `website/build.sh` installs the tested Rust 1.97.1 toolchain and a checksum-verified
 Trunk 0.21.14 binary when needed, installs the locked Wrangler dependency, builds
@@ -41,11 +44,13 @@ setup before deployment.
 ## Verify or rebuild
 
 `https://i3rs.boxbox.dev/demo/build.json` identifies the deployed Git commit and
-build time. After a push to `main`, check the Worker's **Builds** tab in Cloudflare
-and compare that file with the commit you pushed. A failed build leaves the
+build time. After a push to `main`, the **Deploy Website** GitHub Actions run
+confirms that Cloudflare accepted the build request. Check the Worker's **Builds**
+tab in Cloudflare for completion, then compare that file with the commit you pushed. A failed build leaves the
 previous deployment serving traffic. Use **Retry build** in Cloudflare to rebuild
 the same commit; the build log includes the pinned tool versions and deployment
-result.
+result. You can also dispatch **Deploy Website** manually on `main` to rebuild
+without a new commit.
 
 For a local build, run the same build command above, then `npm --prefix website
 run dev`. The generated website is `website/dist/`; generated files
