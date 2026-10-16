@@ -1,0 +1,33 @@
+name: Deploy Website
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website-production-trigger
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Trigger Cloudflare production build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Queue the main-branch website build
+        env:
+          CLOUDFLARE_DEPLOY_HOOK: ${{ secrets.CLOUDFLARE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "${CLOUDFLARE_DEPLOY_HOOK:-}" ]; then
+            echo "::error::Set the repository's CLOUDFLARE_DEPLOY_HOOK secret."
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 30 \
+            --request POST --output "$RUNNER_TEMP/cloudflare-build.json" \
+            "$CLOUDFLARE_DEPLOY_HOOK"
+          echo "Queued the Cloudflare production build for main ($GITHUB_SHA)." >> "$GITHUB_STEP_SUMMARY"
