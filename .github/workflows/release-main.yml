@@ -29,6 +29,8 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: verify
 
       - name: Read versions
         id: version
@@ -209,6 +211,8 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          key: ${{ matrix.name }}
 
       - name: Install cargo-packager
         if: ${{ !matrix.web }}
@@ -221,7 +225,10 @@ jobs:
 
       - name: Install Trunk
         if: ${{ matrix.web }}
-        run: cargo install trunk --locked
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: trunk@0.21.14
+          fallback: none
 
       - name: Package application
         if: ${{ !matrix.web }}

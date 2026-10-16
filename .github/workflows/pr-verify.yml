@@ -3,6 +3,10 @@ name: PR Verify
 on:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -20,6 +24,9 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          # Reuse the dependency cache populated by Release Main's verify job.
+          shared-key: verify
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -91,10 +98,16 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          # Ubuntu native and web builds must not compete for one cache entry.
+          key: ${{ matrix.name }}
 
       - name: Install Trunk
         if: ${{ matrix.web }}
-        run: cargo install trunk --locked
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: trunk@0.21.14
+          fallback: none
 
       - name: Build workspace
         if: ${{ !matrix.web }}
