@@ -342,6 +342,10 @@ impl<'a> Tokenizer<'a> {
 // ---------------------------------------------------------------------------
 
 const BUILTIN_FUNCTIONS: &[&str] = &[
+    "time",
+    "regression_slope",
+    "regression_intercept",
+    "regression_r_squared",
     "smooth",
     "smooth_samples",
     "smooth_time",

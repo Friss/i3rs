@@ -57,6 +57,51 @@ pub struct DisplayTransformFingerprint {
 /// Resolve channel metadata (name, unit, freq, dec_places, enum_labels) from a ChannelId.
 pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> ChannelDisplayMeta {
     match id {
+        ChannelId::Analysis(index) => {
+            let reference = shared
+                .unresolved_references
+                .borrow()
+                .get(index)
+                .map(|r| r.0.clone())
+                .unwrap_or_default();
+            let (name, unit) = match shared.resolve_analysis_reference(&reference) {
+                i3rs_core::ChannelResolution::Resolved {
+                    key: i3rs_core::ChannelKey::Constant(i),
+                    ..
+                } => {
+                    let c = &shared.channel_settings.constants[i];
+                    (c.name.clone(), c.unit.clone())
+                }
+                i3rs_core::ChannelResolution::Resolved {
+                    key: i3rs_core::ChannelKey::Generated(name),
+                    ..
+                } => {
+                    let unit = if name.contains("Speed") { "m/s" } else { "m" };
+                    (name, unit.into())
+                }
+                _ => (format!("{reference} (unavailable)"), String::new()),
+            };
+            (
+                name,
+                unit,
+                shared.analysis_series(index).map_or(0, |(_, hz)| hz),
+                3,
+                Arc::clone(&EMPTY_ENUM_LABELS),
+            )
+        }
+        ChannelId::Unresolved(index) => {
+            let refs = shared.unresolved_references.borrow();
+            let name = refs
+                .get(index)
+                .map_or("Unavailable channel", |r| r.0.as_str());
+            (
+                format!("{name} (unavailable)"),
+                String::new(),
+                0,
+                0,
+                Arc::clone(&EMPTY_ENUM_LABELS),
+            )
+        }
         ChannelId::Physical(idx) => {
             if let Some(ld) = &shared.ld_file
                 && let Some(ch) = ld.channels.get(idx)
@@ -227,31 +272,60 @@ pub fn channel_picker(
     egui::ComboBox::from_id_salt(id)
         .selected_text(name)
         .width(170.0)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
             ui.text_edit_singleline(filter);
             let query = filter.to_lowercase();
-            ui.selectable_value(selected, None, "None");
+            if ui.selectable_value(selected, None, "None").clicked() {
+                ui.close();
+            }
             egui::ScrollArea::vertical()
                 .max_height(260.0)
                 .show(ui, |ui| {
                     if let Some(ld) = &shared.ld_file {
                         for ch in &ld.channels {
-                            if ch.name.to_lowercase().contains(&query) {
-                                ui.selectable_value(
-                                    selected,
-                                    Some(ChannelId::Physical(ch.index)),
-                                    &ch.name,
-                                );
+                            if ch.name.to_lowercase().contains(&query)
+                                && ui
+                                    .selectable_value(
+                                        selected,
+                                        Some(ChannelId::Physical(ch.index)),
+                                        &ch.name,
+                                    )
+                                    .clicked()
+                            {
+                                ui.close();
+                            }
+                        }
+                    }
+                    for candidate in shared.channel_catalog().iter().filter(|c| {
+                        matches!(
+                            c.key,
+                            i3rs_core::ChannelKey::Constant(_)
+                                | i3rs_core::ChannelKey::Generated(_)
+                        )
+                    }) {
+                        if candidate.name.to_lowercase().contains(&query) {
+                            let reference = format!("{}::{}", candidate.source, candidate.name);
+                            let id = shared.analysis_channel(&reference);
+                            if ui
+                                .selectable_value(selected, Some(id), &candidate.name)
+                                .clicked()
+                            {
+                                ui.close();
                             }
                         }
                     }
                     for (idx, ch) in shared.math_channels.iter().enumerate() {
-                        if ch.name.to_lowercase().contains(&query) {
-                            ui.selectable_value(
-                                selected,
-                                Some(ChannelId::Math(idx)),
-                                format!("{} (math)", ch.name),
-                            );
+                        if ch.name.to_lowercase().contains(&query)
+                            && ui
+                                .selectable_value(
+                                    selected,
+                                    Some(ChannelId::Math(idx)),
+                                    format!("{} (math)", ch.name),
+                                )
+                                .clicked()
+                        {
+                            ui.close();
                         }
                     }
                 });
@@ -267,10 +341,16 @@ pub fn sample_range(len: usize, freq: u16, range: (f64, f64)) -> std::ops::Range
 
 /// Load raw channel data from a ChannelId, returning the immutable shared sample buffer.
 pub fn load_channel_data(channel_id: ChannelId, shared: &SharedState) -> Option<Arc<[f64]>> {
-    if !shared.channel_enabled(channel_id) {
+    if !matches!(channel_id, ChannelId::Unresolved(_)) && !shared.channel_enabled(channel_id) {
         return None;
     }
     match channel_id {
+        ChannelId::Analysis(i) => Some(
+            shared
+                .analysis_series(i)
+                .map_or_else(|| Arc::clone(&EMPTY_SAMPLES), |(data, _)| data),
+        ),
+        ChannelId::Unresolved(_) => Some(Arc::clone(&EMPTY_SAMPLES)),
         ChannelId::Physical(idx) => {
             if let Some(decoded) = shared.decoded_physical_channel_if_ready(idx) {
                 Some(Arc::clone(&decoded.data))
@@ -281,7 +361,11 @@ pub fn load_channel_data(channel_id: ChannelId, shared: &SharedState) -> Option<
         }
         ChannelId::Math(idx) => {
             let mc = shared.math_channels.get(idx)?;
-            Some(Arc::clone(mc.data.as_ref()?))
+            Some(
+                mc.data
+                    .as_ref()
+                    .map_or_else(|| Arc::clone(&EMPTY_SAMPLES), Arc::clone),
+            )
         }
     }
 }
@@ -294,6 +378,8 @@ pub fn create_plotted_channel(
 ) -> Option<PlottedChannel> {
     let data = load_channel_data(channel_id, shared)?;
     let (cached_min, cached_max, cached_avg) = match channel_id {
+        ChannelId::Analysis(_) => basic_stats(&data),
+        ChannelId::Unresolved(_) => (0., 0., 0.),
         ChannelId::Physical(idx) => {
             if let Some(decoded) = shared.decoded_physical_channel_if_ready(idx) {
                 (decoded.stats.min, decoded.stats.max, decoded.stats.avg)
@@ -319,6 +405,12 @@ pub fn create_plotted_channel(
             ChannelId::Math(idx) => shared.math_channels.get(idx).map(|mc| mc.id),
             _ => None,
         },
+        requested_reference: if let ChannelId::Analysis(i) = channel_id {
+            shared.unresolved_references.borrow().get(i).cloned()
+        } else {
+            None
+        },
+        portable_source_unit: None,
         recording_display_base: None,
         math_display_signature: None,
         scale_mode: crate::state::ScaleMode::Auto,
@@ -386,13 +478,86 @@ pub fn apply_math_display_defaults(channel: &mut PlottedChannel, shared: &Shared
             ));
         }
     }
+    if channel
+        .math_display_signature
+        .as_ref()
+        .is_some_and(|(unit, _)| unit != &signature.0)
+    {
+        channel.portable_source_unit = Some(signature.0.clone());
+    }
     channel.math_display_signature = Some(signature);
 }
 
+pub fn reconcile_source_unit(channel: &mut PlottedChannel, shared: &SharedState) -> bool {
+    if matches!(channel.channel_id, ChannelId::Unresolved(_)) {
+        return true;
+    }
+    let unit = resolve_channel_meta(channel.channel_id, shared).1;
+    if let Some(previous) = &channel.portable_source_unit
+        && !unit.is_empty()
+        && !previous.is_empty()
+        && unit != *previous
+    {
+        match i3rs_core::channels::unit_transform(&unit, previous) {
+            Ok((scale, offset)) => {
+                if channel.display_unit.is_none() {
+                    channel.display_unit = Some(previous.clone());
+                }
+                channel.display_offset += offset * channel.display_scale;
+                channel.display_scale *= scale;
+            }
+            Err(error) => {
+                shared.message(error);
+                channel.data = Arc::clone(&EMPTY_SAMPLES);
+                return false;
+            }
+        }
+    }
+    channel.portable_source_unit = Some(unit);
+    true
+}
+
 pub fn refresh_plotted_channel(channel: &mut PlottedChannel, shared: &SharedState) -> bool {
+    if let Some((reference, false)) = &channel.requested_reference {
+        let id = shared
+            .resolve_slot(reference, false)
+            .unwrap_or_else(|| shared.unresolved_channel(reference, false));
+        if id != channel.channel_id {
+            if channel.portable_source_unit.is_none()
+                && !matches!(channel.channel_id, ChannelId::Unresolved(_))
+            {
+                channel.portable_source_unit =
+                    Some(resolve_channel_meta(channel.channel_id, shared).1);
+            }
+            channel.channel_id = id;
+            channel.math_id = None;
+            channel.data = Arc::clone(&EMPTY_SAMPLES);
+            channel.recording_display_base = None;
+        }
+    }
+    if let ChannelId::Unresolved(index) = channel.channel_id {
+        let reference = shared.unresolved_references.borrow().get(index).cloned();
+        if let Some((name, math)) = reference
+            && let Some(id) = shared.resolve_slot(&name, math)
+        {
+            channel.channel_id = id;
+            channel.math_id = if let ChannelId::Math(i) = id {
+                shared.math_channels.get(i).map(|m| m.id)
+            } else {
+                None
+            };
+        } else {
+            return false;
+        }
+    }
     if let Some(id) = channel.math_id {
         let Some(idx) = shared.math_channel_index_by_id(id) else {
-            channel.channel_id = ChannelId::Math(usize::MAX);
+            if let Some((reference, kind)) = &channel.requested_reference {
+                channel.channel_id = shared.unresolved_channel(reference, *kind);
+                channel.math_id = None;
+            } else {
+                channel.channel_id = ChannelId::Math(usize::MAX);
+            }
             let changed = !channel.data.is_empty();
             channel.data = Arc::clone(&EMPTY_SAMPLES);
             return changed;
@@ -406,7 +571,25 @@ pub fn refresh_plotted_channel(channel: &mut PlottedChannel, shared: &SharedStat
     }
     apply_math_display_defaults(channel, shared);
     apply_recording_display_transform(channel, shared);
+    if !reconcile_source_unit(channel, shared) {
+        return false;
+    }
     match channel.channel_id {
+        ChannelId::Analysis(i) => {
+            let data = shared
+                .analysis_series(i)
+                .map_or_else(|| Arc::clone(&EMPTY_SAMPLES), |(data, _)| data);
+            let changed = !Arc::ptr_eq(&data, &channel.data);
+            if changed {
+                let (min, max, avg) = basic_stats(&data);
+                channel.cached_min = min;
+                channel.cached_max = max;
+                channel.cached_avg = avg;
+                channel.data = data;
+            }
+            changed
+        }
+        ChannelId::Unresolved(_) => false,
         ChannelId::Physical(idx) => {
             if let Some(decoded) = shared.decoded_physical_channel_if_ready(idx) {
                 let changed = channel.data.as_ptr() != decoded.data.as_ptr()
@@ -469,6 +652,26 @@ pub fn build_plotted_channel_info(
         display_scale: channel.display_scale,
         display_offset: channel.display_offset,
         interpolation: match channel.channel_id {
+            ChannelId::Analysis(i) => {
+                let reference = shared
+                    .unresolved_references
+                    .borrow()
+                    .get(i)
+                    .map(|r| r.0.clone())
+                    .unwrap_or_default();
+                if matches!(
+                    shared.resolve_analysis_reference(&reference),
+                    i3rs_core::ChannelResolution::Resolved {
+                        key: i3rs_core::ChannelKey::Generated(_),
+                        ..
+                    }
+                ) {
+                    i3rs_core::Interpolation::Linear
+                } else {
+                    i3rs_core::Interpolation::Previous
+                }
+            }
+            ChannelId::Unresolved(_) => Default::default(),
             ChannelId::Physical(idx) => shared
                 .ld_file
                 .as_ref()
@@ -739,26 +942,39 @@ pub fn segmented_channel_button(
     fill: Option<egui::Color32>,
     clear_tooltip: &str,
 ) -> (egui::Response, bool) {
-    let output = ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-
-        let mut main_button = egui::Button::new(label);
-        if let Some(fill) = fill {
-            main_button = main_button.fill(fill);
-        }
-        let main_response = ui.add(main_button);
-
-        let button_size = egui::vec2(main_response.rect.height(), main_response.rect.height());
-        let mut clear_button = egui::Button::new(egui::RichText::new("X").small());
-        if let Some(fill) = fill {
-            clear_button = clear_button.fill(fill);
-        }
-        let clear_response = ui
-            .add_sized([button_size.x, button_size.y], clear_button)
-            .on_hover_text(clear_tooltip);
-
-        (main_response, clear_response)
-    });
+    let height = ui.spacing().interact_size.y;
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            egui::TextStyle::Button.resolve(ui.style()),
+            ui.visuals().text_color(),
+        )
+        .size()
+        .x;
+    let main_width = (text_width + 2. * ui.spacing().button_padding.x)
+        .min(240.)
+        .min((ui.max_rect().width() - height).max(40.));
+    let output = ui.allocate_ui_with_layout(
+        egui::vec2(main_width + height, height),
+        egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(false),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 0.;
+            let mut main_button = egui::Button::new(label).truncate();
+            let mut clear_button = egui::Button::new(egui::RichText::new("X").small());
+            if let Some(fill) = fill {
+                main_button = main_button.fill(fill);
+                clear_button = clear_button.fill(fill);
+            }
+            let main_response = ui
+                .add_sized([main_width, height], main_button)
+                .on_hover_text(label);
+            let clear_response = ui
+                .add_sized([height, height], clear_button)
+                .on_hover_text(clear_tooltip);
+            (main_response, clear_response)
+        },
+    );
 
     let (main_response, clear_response) = output.inner;
     let divider_stroke = ui.visuals().widgets.noninteractive.bg_stroke;
@@ -800,6 +1016,8 @@ mod tests {
             display_offset: 5.0,
             display_unit: Some("psi".into()),
             math_id: None,
+            requested_reference: None,
+            portable_source_unit: None,
             recording_display_base: None,
             math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
@@ -830,6 +1048,8 @@ mod tests {
             display_offset: 0.0,
             display_unit: None,
             math_id: None,
+            requested_reference: None,
+            portable_source_unit: None,
             recording_display_base: None,
             math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
@@ -865,6 +1085,8 @@ mod tests {
             display_offset: 0.0,
             display_unit: Some("psi".into()),
             math_id: None,
+            requested_reference: None,
+            portable_source_unit: None,
             recording_display_base: None,
             math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Manual,
@@ -879,5 +1101,99 @@ mod tests {
 
         assert!((channel.manual_min - 0.0).abs() < 1e-9);
         assert!((channel.manual_max - 1000.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod portable_unit_tests {
+    use super::*;
+    #[test]
+    fn math_result_unit_change_does_not_apply_the_conversion_twice() {
+        let mut shared = SharedState::new();
+        let mut m = shared.create_math_channel_def("Temperature".into(), "0".into(), "C".into(), 1);
+        m.options.display_unit = Some("F".into());
+        m.data = Some(Arc::from(vec![0.]));
+        m.freq = 1;
+        shared.math_channels.push(m);
+        let mut pc = create_plotted_channel(ChannelId::Math(0), &shared, 0).unwrap();
+        refresh_plotted_channel(&mut pc, &shared);
+        assert!((pc.display_scale - 1.8).abs() < 1e-9);
+        shared.math_channels[0].unit = "F".into();
+        shared.math_channels[0].data = Some(Arc::from(vec![32.]));
+        refresh_plotted_channel(&mut pc, &shared);
+        assert_eq!((pc.display_scale, pc.display_offset), (1., 0.));
+        assert_eq!(pc.data[0], 32.);
+    }
+}
+
+fn basic_stats(data: &[f64]) -> (f64, f64, f64) {
+    let (mut low, mut high, mut sum, mut count) = (f64::INFINITY, f64::NEG_INFINITY, 0., 0usize);
+    for &value in data.iter().filter(|v| v.is_finite()) {
+        low = low.min(value);
+        high = high.max(value);
+        sum += value;
+        count += 1;
+    }
+    if count == 0 {
+        (0., 0., 0.)
+    } else {
+        (low, high, sum / count as f64)
+    }
+}
+
+#[cfg(test)]
+mod generated_slot_tests {
+    use super::*;
+    #[test]
+    fn generated_channels_and_scoped_constants_rebind_and_reuse_native_buffers() {
+        let mut shared = SharedState::new();
+        shared.data_duration = Some(3.);
+        shared.correction_speed = Some((Arc::from(vec![1., 2., 3., 4., 5., 6.]), 2));
+        let id = shared.resolve_slot("MoTeC::Corr Speed", false).unwrap();
+        let mut pc = create_plotted_channel(id, &shared, 0).unwrap();
+        assert!(matches!(id, ChannelId::Analysis(_)));
+        assert_eq!(resolve_channel_meta(id, &shared).2, 2);
+        assert_eq!(pc.data.len(), 6);
+        assert_eq!((pc.cached_min, pc.cached_max), (1., 6.));
+        assert!(!refresh_plotted_channel(&mut pc, &shared));
+        shared
+            .channel_settings
+            .constants
+            .push(i3rs_core::channels::SetupConstant {
+                name: "Mass".into(),
+                value: 1000.,
+                unit: "kg".into(),
+                recording: shared.recording_key().into(),
+                comment: String::new(),
+            });
+        let id = shared.resolve_slot("Mass", false).unwrap();
+        let mut c = create_plotted_channel(id, &shared, 0).unwrap();
+        let before = c.data.clone();
+        assert_eq!(&*c.data, &[1000.; 3]);
+        assert!(!refresh_plotted_channel(&mut c, &shared));
+        assert!(Arc::ptr_eq(&before, &c.data));
+        shared.channel_settings.constants[0].value = 1100.;
+        assert!(refresh_plotted_channel(&mut c, &shared));
+        assert_eq!(&*c.data, &[1100.; 3]);
+        let dock = egui_dock::DockState::new(vec![crate::panels::PanelTab::Graph({
+            let mut g = crate::panels::graph::GraphPanel::new(1, "Generated");
+            g.plotted_channels.push(pc);
+            g.plotted_channels.push(c);
+            g
+        })]);
+        let workspace = crate::workspace::save_workspace(&[("Sheet".into(), &dock)], 0, &shared);
+        let loaded = crate::workspace::load_workspace(&workspace, &mut shared);
+        let (_, crate::panels::PanelTab::Graph(graph)) =
+            loaded[0].1.iter_all_tabs().next().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(graph.plotted_channels.len(), 2);
+        assert!(
+            graph
+                .plotted_channels
+                .iter()
+                .all(|p| matches!(p.channel_id, ChannelId::Analysis(_)))
+        );
     }
 }

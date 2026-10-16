@@ -2,6 +2,151 @@
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+/// A component's own selection predicate, independent of expression truth rules.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComponentFilter {
+    pub gate: String,
+    pub trusted_only: bool,
+}
+
+#[derive(Clone)]
+pub struct PreparedFilter {
+    pub constant: Option<f64>,
+    pub trusted_ranges: Option<Vec<(f64, f64)>>,
+    pub gate: Option<crate::state::PlottedChannelInfo>,
+    pub available: bool,
+    pub key: String,
+}
+impl PreparedFilter {
+    pub fn includes(&self, time: f64) -> bool {
+        self.available
+            && self.constant.is_none_or(i3rs_core::component_gate_includes)
+            && self
+                .trusted_ranges
+                .as_ref()
+                .is_none_or(|ranges| ranges.iter().any(|(a, b)| time >= *a && time < *b))
+            && self.gate.as_ref().is_none_or(|g| {
+                i3rs_core::channels::sample_with_policy(&g.data, g.freq, time, g.interpolation)
+                    .is_some_and(i3rs_core::component_gate_includes)
+            })
+    }
+}
+impl ComponentFilter {
+    pub fn controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Gate channel (> 0):");
+            ui.add(egui::TextEdit::singleline(&mut self.gate).desired_width(160.));
+            ui.checkbox(&mut self.trusted_only, "Trusted ranges only");
+        });
+    }
+    pub fn prepare(&self, ui: &mut egui::Ui, shared: &crate::state::SharedState) -> PreparedFilter {
+        let mut constant = None;
+        let mut generated = None;
+        let gate = if self.gate.trim().is_empty() {
+            None
+        } else {
+            let id = match shared.resolve_analysis_reference(self.gate.trim()) {
+                i3rs_core::ChannelResolution::Resolved {
+                    key: i3rs_core::ChannelKey::Physical(i),
+                    ..
+                } => Some(crate::state::ChannelId::Physical(i)),
+                i3rs_core::ChannelResolution::Resolved {
+                    key: i3rs_core::ChannelKey::Derived(id),
+                    ..
+                } => shared
+                    .math_channel_index_by_id(id)
+                    .map(crate::state::ChannelId::Math),
+                i3rs_core::ChannelResolution::Resolved {
+                    key: i3rs_core::ChannelKey::Constant(idx),
+                    ..
+                } => {
+                    constant = Some(shared.channel_settings.constants[idx].value);
+                    None
+                }
+                i3rs_core::ChannelResolution::Resolved {
+                    key: i3rs_core::ChannelKey::Generated(name),
+                    ..
+                } => {
+                    shared.request_track_data_build();
+                    generated = match name.as_str() {
+                        "Corr Speed" => shared.correction_speed.clone(),
+                        "Corr GPS Speed" => shared.correction_gps_speed.clone(),
+                        _ => shared.correction_distance.clone(),
+                    };
+                    None
+                }
+                _ => None,
+            };
+            id.and_then(|id| super::utils::create_plotted_channel(id, shared, 0))
+                .map(|pc| super::utils::build_plotted_channel_info(&pc, shared))
+                .or_else(|| {
+                    generated.map(|(data, freq)| crate::state::PlottedChannelInfo {
+                        channel_id: crate::state::ChannelId::Physical(usize::MAX),
+                        name: self.gate.clone(),
+                        unit: String::new(),
+                        freq,
+                        dec_places: 3,
+                        color: egui::Color32::GRAY,
+                        data,
+                        display_scale: 1.,
+                        display_offset: 0.,
+                        interpolation: i3rs_core::Interpolation::Linear,
+                        enum_labels: Default::default(),
+                    })
+                })
+        };
+        let trusted_ranges = self.trusted_only.then(|| {
+            shared
+                .current_analysis()
+                .into_iter()
+                .flat_map(|a| &a.ranges)
+                .filter(|r| r.trust == i3rs_core::ranges::Trust::Trusted)
+                .map(|r| (r.start, r.end))
+                .collect::<Vec<_>>()
+        });
+        let trusted = trusted_ranges
+            .as_ref()
+            .is_none_or(|ranges| !ranges.is_empty());
+        let ready = self.gate.trim().is_empty()
+            || constant.is_some_and(f64::is_finite)
+            || gate.as_ref().is_some_and(|g| !g.data.is_empty());
+        if !ready {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!(
+                    "Gate '{}' unavailable or loading; no samples included",
+                    self.gate
+                ),
+            );
+        }
+        if !trusted {
+            ui.weak("Selected range is not trusted; no samples included");
+        }
+        let key = format!(
+            "{}:{:?}:{:?}:{}:{:?}",
+            self.gate,
+            trusted_ranges,
+            constant,
+            ready,
+            gate.as_ref().map(|g| (
+                g.data.as_ptr() as usize,
+                g.freq,
+                g.display_scale.to_bits(),
+                g.display_offset.to_bits(),
+                g.interpolation
+            ))
+        );
+        PreparedFilter {
+            gate,
+            constant,
+            trusted_ranges,
+            available: ready && trusted,
+            key,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ColorBands {
     pub min: f64,
@@ -132,5 +277,97 @@ mod tests {
         );
         assert_eq!(b.index(105.0), 11);
         assert_eq!(b.index(105.1), 12);
+    }
+}
+
+#[cfg(test)]
+mod population_tests {
+    use super::*;
+    #[test]
+    fn gates_use_result_values_and_trust_is_half_open() {
+        let info = crate::state::PlottedChannelInfo {
+            channel_id: crate::state::ChannelId::Math(0),
+            name: "gate".into(),
+            unit: String::new(),
+            freq: 1,
+            dec_places: 0,
+            color: egui::Color32::WHITE,
+            data: std::sync::Arc::from(vec![-1., 0., 0.5, f64::NAN, 1.]),
+            display_scale: -1.,
+            display_offset: 0.,
+            interpolation: i3rs_core::Interpolation::Previous,
+            enum_labels: Default::default(),
+        };
+        let filter = PreparedFilter {
+            gate: Some(info),
+            constant: None,
+            trusted_ranges: Some(vec![(0., 3.)]),
+            available: true,
+            key: String::new(),
+        };
+        assert_eq!(
+            [0., 1., 2., 3., 4.].map(|t| filter.includes(t)),
+            [false, false, true, false, false]
+        );
+    }
+    #[test]
+    fn negative_constants_and_unavailable_gates_exclude_all_samples() {
+        let mut filter = PreparedFilter {
+            gate: None,
+            constant: Some(-1.),
+            trusted_ranges: None,
+            available: true,
+            key: String::new(),
+        };
+        assert!(!filter.includes(1.));
+        filter.constant = Some(1.);
+        assert!(filter.includes(1.));
+        filter.available = false;
+        assert!(!filter.includes(1.));
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BandPresentation {
+    pub hidden: Vec<usize>,
+    pub colors: std::collections::BTreeMap<usize, [u8; 3]>,
+}
+impl BandPresentation {
+    pub fn visible(&self, index: usize) -> bool {
+        !self.hidden.contains(&index)
+    }
+    pub fn color(&self, bands: ColorBands, index: usize) -> egui::Color32 {
+        self.colors.get(&index).map_or_else(
+            || bands.color(index),
+            |c| egui::Color32::from_rgb(c[0], c[1], c[2]),
+        )
+    }
+    pub fn controls(&mut self, ui: &mut egui::Ui, bands: ColorBands) {
+        ui.collapsing("Band visibility / colours (totals unchanged)", |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(160.)
+                .show(ui, |ui| {
+                    for index in 0..bands.len() {
+                        ui.horizontal(|ui| {
+                            let mut visible = self.visible(index);
+                            if ui.checkbox(&mut visible, bands.label(index)).changed() {
+                                self.hidden.retain(|i| *i != index);
+                                if !visible {
+                                    self.hidden.push(index);
+                                }
+                            }
+                            let c = self.color(bands, index);
+                            let mut color = [c.r(), c.g(), c.b()];
+                            if ui.color_edit_button_srgb(&mut color).changed() {
+                                self.colors.insert(index, color);
+                            }
+                        });
+                    }
+                });
+            if ui.button("Reset band presentation").clicked() {
+                *self = Default::default();
+            }
+        });
     }
 }

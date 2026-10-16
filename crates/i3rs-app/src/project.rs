@@ -102,6 +102,13 @@ pub fn collect_session_paths(workspace: &WorkspaceFile) -> Vec<PathBuf> {
         push_unique_path(&mut paths, PathBuf::from(path));
     }
 
+    if let Some(comparisons) = &workspace.comparisons {
+        for overlay in &comparisons.overlays {
+            if let Some(path) = &overlay.file_path {
+                push_unique_path(&mut paths, PathBuf::from(path));
+            }
+        }
+    }
     for worksheet in &workspace.worksheets {
         for panel in &worksheet.panels {
             if let PanelConfig::Graph(graph) = panel {
@@ -122,6 +129,13 @@ fn relativize_workspace_paths(workspace: &mut WorkspaceFile, base_dir: &Path) {
         *path = relativize_path(Path::new(path), base_dir);
     }
 
+    if let Some(comparisons) = &mut workspace.comparisons {
+        for overlay in &mut comparisons.overlays {
+            if let Some(path) = &mut overlay.file_path {
+                *path = relativize_path(Path::new(path), base_dir);
+            }
+        }
+    }
     for worksheet in &mut workspace.worksheets {
         for panel in &mut worksheet.panels {
             if let PanelConfig::Graph(graph) = panel {
@@ -140,6 +154,13 @@ fn resolve_workspace_paths(workspace: &mut WorkspaceFile, base_dir: &Path) {
         *path = resolve_path_string(path, base_dir);
     }
 
+    if let Some(comparisons) = &mut workspace.comparisons {
+        for overlay in &mut comparisons.overlays {
+            if let Some(path) = &mut overlay.file_path {
+                *path = resolve_path_string(path, base_dir);
+            }
+        }
+    }
     for worksheet in &mut workspace.worksheets {
         for panel in &mut worksheet.panels {
             if let PanelConfig::Graph(graph) = panel {
@@ -194,9 +215,16 @@ mod tests {
 
     fn sample_workspace() -> WorkspaceFile {
         WorkspaceFile {
+            version: 2,
+            comparisons: None,
             worksheets: vec![WorksheetConfig {
+                dock: None,
+                window: Default::default(),
                 name: "Analysis".into(),
                 panels: vec![PanelConfig::Graph(GraphPanelConfig {
+                    channels: Vec::new(),
+                    view: Default::default(),
+                    unresolved_channels: vec![],
                     full_resolution: false,
                     id: 1,
                     title: "Graph 1".into(),
@@ -208,12 +236,18 @@ mod tests {
                     reference_lap: None,
                     overlays: vec![
                         GraphOverlayConfig {
+                            gps_align: false,
+                            visible: true,
+                            color: None,
                             file_path: Some("/tmp/weekend/session-02.ld".into()),
                             lap_index: 1,
                             manual_offset: 0.0,
                             stretch_to_reference: false,
                         },
                         GraphOverlayConfig {
+                            gps_align: false,
+                            visible: true,
+                            color: None,
                             file_path: Some("/tmp/weekend/session-02.ld".into()),
                             lap_index: 2,
                             manual_offset: 0.0,

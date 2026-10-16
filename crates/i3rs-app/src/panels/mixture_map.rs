@@ -11,13 +11,14 @@ use crate::state::{ChannelId, PlottedChannel, SharedState};
 
 use super::utils::{
     DisplayTransformFingerprint, build_plotted_channel_info, create_plotted_channel,
-    display_transform_fingerprint, interp_at_time, refresh_plotted_channel,
-    resolve_plotted_channel_display_meta, segmented_channel_button,
-    show_plotted_channel_display_menu,
+    display_transform_fingerprint, refresh_plotted_channel, resolve_plotted_channel_display_meta,
+    segmented_channel_button, show_plotted_channel_display_menu,
 };
 
 #[derive(PartialEq, Eq)]
 struct HeatmapFingerprint {
+    filter: String,
+    policies: [i3rs_core::Interpolation; 3],
     x_data_ptr: usize,
     y_data_ptr: usize,
     value_data_ptr: usize,
@@ -37,6 +38,11 @@ struct HeatmapCache {
 }
 
 pub struct MixtureMapPanel {
+    pub band_presentation: super::distribution::BandPresentation,
+    pub show_trends: bool,
+    pub trend_width: f64,
+    pub filter: super::distribution::ComponentFilter,
+    pub gear_filter: i3rs_core::distribution::GearFilter,
     pub id: u64,
     pub title: String,
     /// X-axis channel.
@@ -58,6 +64,11 @@ pub struct MixtureMapPanel {
 impl MixtureMapPanel {
     pub fn new(id: u64, title: impl Into<String>) -> Self {
         Self {
+            band_presentation: Default::default(),
+            show_trends: false,
+            trend_width: 100.,
+            filter: Default::default(),
+            gear_filter: Default::default(),
             id,
             title: title.into(),
             x_channel: None,
@@ -195,6 +206,34 @@ impl MixtureMapPanel {
         });
         ui.separator();
 
+        self.band_presentation.controls(ui, self.color_bands);
+        self.filter.controls(ui);
+        let filter = self.filter.prepare(ui, shared);
+        ui.collapsing("Gear shift exclusion", |ui| {
+            ui.checkbox(
+                &mut self.gear_filter.enabled,
+                "Exclude high RPM rates (X must be RPM)",
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Rising rpm/s");
+                ui.add(
+                    egui::DragValue::new(&mut self.gear_filter.rising_rate).range(0.0..=100000.0),
+                );
+                ui.label("Falling rpm/s");
+                ui.add(
+                    egui::DragValue::new(&mut self.gear_filter.falling_rate).range(-100000.0..=0.0),
+                );
+                ui.label("Hold s");
+                ui.add(
+                    egui::DragValue::new(&mut self.gear_filter.exclusion_seconds).range(0.0..=5.0),
+                );
+                ui.label("RPM average s");
+                ui.add(
+                    egui::DragValue::new(&mut self.gear_filter.rpm_filter_seconds).range(0.0..=5.0),
+                );
+            });
+        });
+
         // Register channels for readout
         for pc in self
             .x_channel
@@ -222,6 +261,14 @@ impl MixtureMapPanel {
             resolve_plotted_channel_display_meta(y_ch, shared);
         let (v_name, v_unit, v_freq, v_dec_places, _) =
             resolve_plotted_channel_display_meta(v_ch, shared);
+        if self.gear_filter.enabled
+            && !matches!(x_unit.to_lowercase().as_str(), "rpm" | "r/min" | "1/min")
+        {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Gear filtering requires an RPM X channel; no samples included",
+            );
+        }
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Y sensor delay (s):");
@@ -238,10 +285,14 @@ impl MixtureMapPanel {
                 self.minimum_y = None;
             }
             if y_name.to_ascii_lowercase().contains("lambda") {
-                ui.weak("Gear-change filtering is not applied");
+                ui.weak(if self.gear_filter.enabled {
+                    "RPM-rate shift exclusion is applied before binning"
+                } else {
+                    "RPM-rate shift exclusion is disabled"
+                });
             }
         });
-        let target_freq = x_freq.min(y_freq).min(v_freq);
+        let target_freq = x_freq;
         if target_freq == 0 {
             ui.label("Channel frequency is 0");
             return;
@@ -268,8 +319,14 @@ impl MixtureMapPanel {
             v_ch.display_offset,
         );
 
-        let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
+        let zoom_key = Some((t0.to_bits(), t1.to_bits()));
         let fingerprint = HeatmapFingerprint {
+            filter: format!("{}:{:?}", filter.key, self.gear_filter),
+            policies: [
+                build_plotted_channel_info(x_ch, shared).interpolation,
+                build_plotted_channel_info(y_ch, shared).interpolation,
+                build_plotted_channel_info(v_ch, shared).interpolation,
+            ],
             x_data_ptr: x_ch.data.as_ptr() as usize,
             y_data_ptr: y_ch.data.as_ptr() as usize,
             value_data_ptr: v_ch.data.as_ptr() as usize,
@@ -289,7 +346,14 @@ impl MixtureMapPanel {
             .is_none_or(|c| c.fingerprint != fingerprint)
         {
             let y_axis = axis_config(&y_name, &y_unit, y_dec_places);
-            let heatmap = compute_heatmap(
+            let rpm: Vec<_> = x_ch
+                .data
+                .iter()
+                .map(|v| v * x_ch.display_scale + x_ch.display_offset)
+                .collect();
+            let mask = i3rs_core::distribution::gear_filter_mask(&rpm, x_freq, self.gear_filter);
+            let rpm_unit = matches!(x_unit.to_lowercase().as_str(), "rpm" | "r/min" | "1/min");
+            let heatmap = compute_heatmap_filtered_with_policies(
                 x_series,
                 y_series,
                 v_series,
@@ -299,11 +363,72 @@ impl MixtureMapPanel {
                 y_axis.fixed_range,
                 self.sensor_delay,
                 self.minimum_y,
+                [
+                    build_plotted_channel_info(x_ch, shared).interpolation,
+                    build_plotted_channel_info(y_ch, shared).interpolation,
+                    build_plotted_channel_info(v_ch, shared).interpolation,
+                ],
+                |t| {
+                    filter.includes(t)
+                        && (!self.gear_filter.enabled
+                            || (rpm_unit
+                                && mask
+                                    .get((t * x_freq as f64).round() as usize)
+                                    .copied()
+                                    .unwrap_or(false)))
+                },
             );
             self.cache = Some(Box::new(HeatmapCache {
                 fingerprint,
                 heatmap,
             }));
+        }
+        let overlays =
+            crate::comparison::overlay_populations(shared, &[x_ch, y_ch, v_ch], &self.filter);
+        let mut overlay_maps = Vec::new();
+        for overlay in overlays {
+            let x = &overlay.channels[0];
+            let y = &overlay.channels[1];
+            let v = &overlay.channels[2];
+            let rpm: Vec<_> = x.data.iter().map(|n| x.transform_value(*n)).collect();
+            let mask = i3rs_core::distribution::gear_filter_mask(&rpm, x.freq, self.gear_filter);
+            let map = compute_heatmap_filtered_with_policies(
+                (&x.data, x.freq, x.display_scale, x.display_offset),
+                (&y.data, y.freq, y.display_scale, y.display_offset),
+                (&v.data, v.freq, v.display_scale, v.display_offset),
+                x.freq,
+                overlay.range,
+                self.bins,
+                axis_config(&y.name, &y.unit, y.dec_places).fixed_range,
+                self.sensor_delay,
+                self.minimum_y,
+                [x.interpolation, y.interpolation, v.interpolation],
+                |t| {
+                    overlay.filter.includes(t)
+                        && (!self.gear_filter.enabled
+                            || (matches!(
+                                x.unit.to_lowercase().as_str(),
+                                "rpm" | "r/min" | "1/min"
+                            ) && mask
+                                .get((t * x.freq as f64).round() as usize)
+                                .copied()
+                                .unwrap_or(false)))
+                },
+            );
+            ui.colored_label(
+                overlay.color,
+                format!("{} · {} samples", overlay.label, map.triples.len()),
+            );
+            overlay_maps.push((map, overlay.color, overlay.label, overlay.range));
+        }
+        if shared
+            .comparisons
+            .sessions
+            .iter()
+            .any(|s| !s.requests.is_empty())
+        {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
         }
         let heatmap = &self.cache.as_ref().unwrap().heatmap;
 
@@ -319,6 +444,51 @@ impl MixtureMapPanel {
             ));
             if self.scatter_mode {
                 self.color_bands.controls(ui);
+            }
+        });
+        ui.collapsing("Load band trends / averages", |ui| {
+            ui.checkbox(&mut self.show_trends, "Show band means by X interval");
+            ui.horizontal(|ui| {
+                ui.label(format!("Interval width ({x_unit})"));
+                ui.add(egui::DragValue::new(&mut self.trend_width).range(0.000001..=1e9));
+            });
+            if self.show_trends {
+                let mut csv = String::new();
+                for (band, rows) in band_trends(heatmap, self.color_bands, self.trend_width)
+                    .iter()
+                    .enumerate()
+                {
+                    csv.push_str(&i3rs_core::distribution::x_interval_csv(
+                        &format!(
+                            "{} · {} · {} {}",
+                            shared.file_name,
+                            y_name,
+                            v_name,
+                            self.color_bands.label(band)
+                        ),
+                        &x_unit,
+                        &y_unit,
+                        (t0, t1),
+                        rows,
+                        csv.is_empty(),
+                    ));
+                }
+                for (map, _, label, range) in &overlay_maps {
+                    for (band, rows) in band_trends(map, self.color_bands, self.trend_width)
+                        .iter()
+                        .enumerate()
+                    {
+                        csv.push_str(&i3rs_core::distribution::x_interval_csv(
+                            &format!("{} · {} · {}", label, y_name, self.color_bands.label(band)),
+                            &x_unit,
+                            &y_unit,
+                            *range,
+                            rows,
+                            false,
+                        ));
+                    }
+                }
+                super::calculations::export_buttons(ui, &csv);
             }
         });
         let available = ui.available_rect_before_wrap();
@@ -359,7 +529,13 @@ impl MixtureMapPanel {
                 if y < heatmap.y_min || y > heatmap.y_max {
                     continue;
                 }
-                painter.circle_filled(to_screen(x, y), 1.75, self.color_bands.color(band));
+                if self.band_presentation.visible(band) {
+                    painter.circle_filled(
+                        to_screen(x, y),
+                        1.75,
+                        self.band_presentation.color(self.color_bands, band),
+                    );
+                }
             }
         } else {
             for yi in 0..self.bins {
@@ -386,6 +562,57 @@ impl MixtureMapPanel {
                     );
                     painter.rect_filled(cell_rect, 0.0, color);
                 }
+            }
+        }
+        for (map, color, _, _) in &overlay_maps {
+            for &(x, y, value, _) in &map.triples {
+                if self
+                    .band_presentation
+                    .visible(self.color_bands.index(value))
+                    && x >= heatmap.x_min
+                    && x <= heatmap.x_max
+                    && y >= heatmap.y_min
+                    && y <= heatmap.y_max
+                {
+                    painter.circle_stroke(to_screen(x, y), 2.0, egui::Stroke::new(1., *color));
+                }
+            }
+        }
+        if self.scatter_mode && self.show_trends {
+            let clipped = painter.with_clip_rect(plot_rect);
+            let draw_trends = |map: &Heatmap| {
+                for (band, rows) in band_trends(map, self.color_bands, self.trend_width)
+                    .iter()
+                    .enumerate()
+                {
+                    if !self.band_presentation.visible(band) {
+                        continue;
+                    }
+                    let color = self.band_presentation.color(self.color_bands, band);
+                    let points: Vec<_> = rows
+                        .iter()
+                        .map(|r| to_screen((r.lower + r.upper) / 2., r.mean_y))
+                        .collect();
+                    for pair in points.windows(2) {
+                        clipped.line_segment([pair[0], pair[1]], egui::Stroke::new(1.5, color));
+                    }
+                    for point in points {
+                        clipped.add(egui::Shape::convex_polygon(
+                            vec![
+                                point + egui::vec2(0., -4.),
+                                point + egui::vec2(4., 0.),
+                                point + egui::vec2(0., 4.),
+                                point + egui::vec2(-4., 0.),
+                            ],
+                            color,
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                }
+            };
+            draw_trends(heatmap);
+            for (map, _, _, _) in &overlay_maps {
+                draw_trends(map);
             }
         }
         painter.rect_stroke(
@@ -533,7 +760,15 @@ impl MixtureMapPanel {
         }
 
         if let Some(cursor_time) = shared.cursor_time
-            && let Some((x_val, y_val, _)) = mixture_sample(
+            && {
+                let index = heatmap.triples.partition_point(|p| p.3 < cursor_time);
+                [index.checked_sub(1), Some(index)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|i| heatmap.triples.get(i))
+                    .any(|p| (p.3 - cursor_time).abs() <= 0.5 / x_freq.max(1) as f64)
+            }
+            && let Some((x_val, y_val, _)) = mixture_sample_with_policies(
                 x_series,
                 y_series,
                 v_series,
@@ -541,6 +776,11 @@ impl MixtureMapPanel {
                 (t0, t1),
                 self.sensor_delay,
                 self.minimum_y,
+                [
+                    build_plotted_channel_info(x_ch, shared).interpolation,
+                    build_plotted_channel_info(y_ch, shared).interpolation,
+                    build_plotted_channel_info(v_ch, shared).interpolation,
+                ],
             )
             && (heatmap.x_min..=heatmap.x_max).contains(&x_val)
             && (heatmap.y_min..=heatmap.y_max).contains(&y_val)
@@ -590,7 +830,10 @@ pub(crate) fn normalized_sensor_delay(delay: f64) -> f64 {
 /// A channel's samples, frequency, display scale and display offset.
 type Series<'a> = (&'a [f64], u16, f64, f64);
 
-/// The graph and cursor use the same delayed, transformed, filtered sample.
+/// Selection is in lambda time: X/load at t pair with lambda at t + delay.
+/// Therefore an interior selection can use RPM/load preceding its start.
+/// Never extrapolate before the recording or beyond any recorded channel.
+#[cfg(test)]
 fn mixture_sample(
     x: Series,
     y: Series,
@@ -600,26 +843,48 @@ fn mixture_sample(
     sensor_delay: f64,
     minimum_y: Option<f64>,
 ) -> Option<(f64, f64, f64)> {
+    mixture_sample_with_policies(
+        x,
+        y,
+        value,
+        time,
+        range,
+        sensor_delay,
+        minimum_y,
+        [i3rs_core::Interpolation::Linear; 3],
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn mixture_sample_with_policies(
+    x: Series,
+    y: Series,
+    value: Series,
+    time: f64,
+    range: (f64, f64),
+    sensor_delay: f64,
+    minimum_y: Option<f64>,
+    policies: [i3rs_core::Interpolation; 3],
+) -> Option<(f64, f64, f64)> {
     let delay = normalized_sensor_delay(sensor_delay);
     if !time.is_finite()
         || !range.0.is_finite()
         || !range.1.is_finite()
-        || time < range.0.max(0.0)
+        || time < (range.0 - delay).max(0.0)
         || time >= range.1 - delay
     {
         return None;
     }
-    let sample = |(data, freq, scale, offset): Series, t: f64| {
+    let sample = |(data, freq, scale, offset): Series, t: f64, policy| {
         if freq == 0 || t >= data.len() as f64 / freq as f64 {
             return None;
         }
-        let v = interp_at_time(data, freq, t)? * scale + offset;
+        let v = i3rs_core::channels::sample_with_policy(data, freq, t, policy)? * scale + offset;
         v.is_finite().then_some(v)
     };
     let (x, y, value) = (
-        sample(x, time)?,
-        sample(y, time + delay)?,
-        sample(value, time)?,
+        sample(x, time, policies[0])?,
+        sample(y, time + delay, policies[1])?,
+        sample(value, time, policies[2])?,
     );
     if minimum_y.is_some_and(|min| y < min) {
         return None;
@@ -627,8 +892,36 @@ fn mixture_sample(
     Some((x, y, value))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn compute_heatmap(
+    x: Series,
+    y: Series,
+    value: Series,
+    target_freq: u16,
+    range: (f64, f64),
+    bins: usize,
+    y_fixed_range: Option<(f64, f64)>,
+    sensor_delay: f64,
+    minimum_y: Option<f64>,
+) -> Heatmap {
+    compute_heatmap_filtered(
+        x,
+        y,
+        value,
+        target_freq,
+        range,
+        bins,
+        y_fixed_range,
+        sensor_delay,
+        minimum_y,
+        |_| true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn compute_heatmap_filtered(
     x: Series,
     y: Series,
     value: Series,
@@ -638,6 +931,35 @@ fn compute_heatmap(
     y_fixed_range: Option<(f64, f64)>,
     sensor_delay: f64,
     minimum_y: Option<f64>,
+    includes: impl Fn(f64) -> bool,
+) -> Heatmap {
+    compute_heatmap_filtered_with_policies(
+        x,
+        y,
+        value,
+        target_freq,
+        (t0, t1),
+        bins,
+        y_fixed_range,
+        sensor_delay,
+        minimum_y,
+        [i3rs_core::Interpolation::Linear; 3],
+        includes,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn compute_heatmap_filtered_with_policies(
+    x: Series,
+    y: Series,
+    value: Series,
+    target_freq: u16,
+    (t0, t1): (f64, f64),
+    bins: usize,
+    y_fixed_range: Option<(f64, f64)>,
+    sensor_delay: f64,
+    minimum_y: Option<f64>,
+    policies: [i3rs_core::Interpolation; 3],
+    includes: impl Fn(f64) -> bool,
 ) -> Heatmap {
     let ((x_data, x_freq, ..), (y_data, y_freq, ..), (v_data, v_freq, ..)) = (x, y, value);
     let mut cells: Vec<HeatmapCell> = (0..bins * bins)
@@ -650,7 +972,7 @@ fn compute_heatmap(
         .collect();
 
     let sensor_delay = normalized_sensor_delay(sensor_delay);
-    let start = (t0.max(0.) * target_freq as f64).ceil() as usize;
+    let start = ((t0 - sensor_delay).max(0.) * target_freq as f64).ceil() as usize;
     let duration = (x_data.len() as f64 / x_freq.max(1) as f64)
         .min(v_data.len() as f64 / v_freq.max(1) as f64)
         .min(y_data.len() as f64 / y_freq.max(1) as f64 - sensor_delay);
@@ -673,7 +995,19 @@ fn compute_heatmap(
     // Count every valid sample; display aggregation must not alter statistics.
     for i in start..end {
         let t = i as f64 / target_freq as f64;
-        if let Some((x, y, v)) = mixture_sample(x, y, value, t, (t0, t1), sensor_delay, minimum_y) {
+        if !includes(t) {
+            continue;
+        }
+        if let Some((x, y, v)) = mixture_sample_with_policies(
+            x,
+            y,
+            value,
+            t,
+            (t0, t1),
+            sensor_delay,
+            minimum_y,
+            policies,
+        ) {
             if x < x_min {
                 x_min = x;
             }
@@ -876,7 +1210,8 @@ mod tests {
         }
         assert_eq!(cursor(1.0, (0.0, 4.0)), Some((1000.0, 16.0, 10.0)));
         assert_eq!(cursor(0.0, (0.0, 4.0)), None); // below transformed Y threshold
-        assert_eq!(cursor(1.0, (2.0, 4.0)), None); // before selection
+        assert_eq!(cursor(1.0, (2.0, 4.0)), Some((1000.0, 16.0, 10.0))); // lambda timestamp is inside selection
+        assert_eq!(cursor(0.5, (2.0, 4.0)), None); // before delayed selection
         assert_eq!(cursor(3.0, (0.0, 4.0)), None); // delayed Y outside selection
         assert_eq!(cursor(4.0, (0.0, 10.0)), None); // outside recorded data
         assert_eq!(cursor(f64::NAN, (0.0, 4.0)), None);
@@ -955,5 +1290,182 @@ mod tests {
             ]
         );
         assert!(map.cells.iter().all(|c| c.count == 0));
+    }
+}
+
+#[cfg(test)]
+mod shift_reference_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires local May 8 reference recording"]
+    fn matches_live_i2_shift_laps_at_two_filter_times() {
+        let ld = i3rs_core::LdFile::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../S1_#28299_20260508_174455_02.ld"
+        ))
+        .unwrap();
+        let laps = i3rs_core::detect_laps(&ld);
+        let read = |name| {
+            let c = ld.find_channel_by_name(name).unwrap();
+            (ld.read_channel_data(c).unwrap(), c.freq)
+        };
+        let (rpm, hz) = read("Engine Speed");
+        let (load, lf) = read("Throttle Position");
+        for (lap, seconds, expected) in [
+            (3, 0., vec![733, 452, 122, 56, 56, 24, 25, 14, 18, 39, 1143]),
+            (
+                3,
+                0.25,
+                vec![686, 442, 116, 54, 56, 23, 25, 14, 17, 38, 1141],
+            ),
+            (
+                3,
+                0.5,
+                vec![702, 441, 115, 54, 56, 23, 25, 14, 17, 38, 1137],
+            ),
+            (
+                4,
+                0.25,
+                vec![747, 180, 91, 100, 28, 11, 15, 11, 14, 22, 1237],
+            ),
+        ] {
+            let mask = i3rs_core::distribution::gear_filter_mask(
+                &rpm,
+                hz,
+                i3rs_core::distribution::GearFilter {
+                    enabled: seconds > 0.,
+                    rpm_filter_seconds: seconds,
+                    ..Default::default()
+                },
+            );
+            for bank in ["Exhaust Lambda Bank 1", "Exhaust Lambda Bank 2"] {
+                let (lambda, yf) = read(bank);
+                let l = &laps[lap];
+                let map = compute_heatmap_filtered(
+                    (&rpm, hz, 1., 0.),
+                    (&lambda, yf, 1., 0.),
+                    (&load, lf, 1., 0.),
+                    hz,
+                    (l.start_time, l.end_time),
+                    32,
+                    Some((0.7, 1.2)),
+                    0.15,
+                    Some(0.5),
+                    |t| {
+                        mask.get((t * hz as f64).round() as usize)
+                            .copied()
+                            .unwrap_or(false)
+                    },
+                );
+                let mut counts = vec![0; ColorBands::default().len()];
+                for &(_, _, v, _) in &map.triples {
+                    counts[ColorBands::default().index(v)] += 1;
+                }
+                assert_eq!(
+                    &counts[1..12],
+                    expected.as_slice(),
+                    "{bank} lap {lap} filter {seconds}"
+                );
+                assert_eq!(map.triples.len(), expected.iter().sum::<usize>());
+            }
+        }
+    }
+    #[test]
+    fn lambda_time_selection_uses_available_prior_rpm_without_extrapolation() {
+        let x = [1000.; 5];
+        let y = [1., 2., 3., 4., 5.];
+        let load = [0.; 5];
+        let map = compute_heatmap(
+            (&x, 1, 1., 0.),
+            (&y, 1, 1., 0.),
+            (&load, 1, 1., 0.),
+            1,
+            (1., 3.),
+            5,
+            None,
+            1.,
+            None,
+        );
+        assert_eq!(map.triples, [(1000., 2., 0., 0.), (1000., 3., 0., 1.)]);
+    }
+}
+
+#[cfg(test)]
+mod rate_policy_tests {
+    use super::*;
+    #[test]
+    fn mixed_rate_state_load_is_held_and_missing_lambda_leaves_population() {
+        let x = [1000.; 8];
+        let y = [1., f64::NAN, 1., 1.];
+        let load = [0., 100.];
+        let map = compute_heatmap_filtered_with_policies(
+            (&x, 4, 1., 0.),
+            (&y, 2, 1., 0.),
+            (&load, 1, 1., 0.),
+            4,
+            (0., 2.),
+            2,
+            None,
+            0.,
+            None,
+            [
+                i3rs_core::Interpolation::Linear,
+                i3rs_core::Interpolation::Linear,
+                i3rs_core::Interpolation::Previous,
+            ],
+            |_| true,
+        );
+        assert_eq!(map.triples.len(), 5);
+        assert!(map.triples.iter().filter(|p| p.3 < 1.).all(|p| p.2 == 0.));
+        assert!(
+            map.triples
+                .iter()
+                .filter(|p| p.3 >= 1.)
+                .all(|p| p.2 == 100.)
+        );
+    }
+}
+
+fn band_trends(
+    map: &Heatmap,
+    bands: ColorBands,
+    width: f64,
+) -> Vec<Vec<i3rs_core::distribution::XIntervalAverage>> {
+    let mut groups = vec![Vec::new(); bands.len()];
+    for &(x, y, load, _) in &map.triples {
+        groups[bands.index(load)].push((x, y));
+    }
+    groups
+        .into_iter()
+        .map(|pairs| i3rs_core::distribution::x_interval_averages(pairs, width, 0.))
+        .collect()
+}
+
+#[cfg(test)]
+mod band_trend_tests {
+    use super::*;
+    #[test]
+    fn load_band_x_means_retain_each_filtered_native_sample() {
+        let x = [50., 99., 100., 199., 200.];
+        let y = [1., 3., 5., 7., 9.];
+        let load = [0., 0., 100., 100., 100.];
+        let map = compute_heatmap(
+            (&x, 1, 1., 0.),
+            (&y, 1, 1., 0.),
+            (&load, 1, 1., 0.),
+            1,
+            (0., 5.),
+            5,
+            None,
+            0.,
+            None,
+        );
+        let trends = band_trends(&map, ColorBands::default(), 100.);
+        assert_eq!((trends[1][0].count, trends[1][0].mean_y), (2, 2.));
+        assert_eq!((trends[11][0].count, trends[11][0].mean_y), (2, 6.));
+        assert_eq!(
+            trends.iter().flatten().map(|r| r.count).sum::<usize>(),
+            map.triples.len()
+        );
     }
 }

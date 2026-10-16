@@ -75,6 +75,42 @@ pub fn show_standalone(ui: &mut egui::Ui, shared: &mut SharedState) {
                     }
                 }
 
+                let generated: Vec<_> = shared
+                    .channel_catalog()
+                    .into_iter()
+                    .filter(|c| {
+                        matches!(
+                            c.key,
+                            i3rs_core::ChannelKey::Constant(_)
+                                | i3rs_core::ChannelKey::Generated(_)
+                        )
+                    })
+                    .collect();
+                if !generated.is_empty() {
+                    ui.separator();
+                    ui.strong("Generated / recording constants");
+                }
+                for channel in generated {
+                    if !channel.name.to_lowercase().contains(&filter_lower) {
+                        continue;
+                    }
+                    let reference = format!("{}::{}", channel.source, channel.name);
+                    let id = shared.analysis_channel(&reference);
+                    let response = ui.add_enabled(
+                        shared.channel_enabled(id),
+                        egui::Button::selectable(
+                            false,
+                            format!("{} · {}", channel.name, channel.source),
+                        )
+                        .sense(egui::Sense::click_and_drag()),
+                    );
+                    if response.dragged() {
+                        drag_start = Some(id);
+                    }
+                    if response.clicked() {
+                        toggle_id = Some(id);
+                    }
+                }
                 // Math channels
                 if !shared.math_channels.is_empty() {
                     ui.separator();

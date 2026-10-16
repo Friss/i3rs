@@ -35,6 +35,8 @@ fn build_freq_map(channels: &[&PlottedChannel], shared: &SharedState) -> HashMap
         .iter()
         .map(|pc| {
             let freq = match pc.channel_id {
+                ChannelId::Analysis(_) => resolve_channel_meta(pc.channel_id, shared).2,
+                ChannelId::Unresolved(_) => 0,
                 ChannelId::Physical(idx) => shared
                     .ld_file
                     .as_ref()
@@ -259,6 +261,10 @@ pub enum OverlaySource {
 
 #[derive(Clone, Copy)]
 pub struct LapOverlay {
+    pub alignment_valid: bool,
+    pub gps_align: bool,
+    pub visible: bool,
+    pub color: Option<egui::Color32>,
     pub source: OverlaySource,
     pub lap_idx: usize,
     pub manual_offset: f64,
@@ -271,6 +277,9 @@ pub struct OverlayChannelCacheEntry {
 }
 
 pub struct OverlaySession {
+    pub settings_key: String,
+    pub requests: HashMap<String, std::sync::mpsc::Receiver<crate::comparison::ResolvedSeries>>,
+    pub failures: HashMap<String, String>,
     pub path: PathBuf,
     pub file_name: String,
     pub ld_file: Arc<LdFile>,
@@ -444,6 +453,10 @@ enum ManageChannelsAction {
 
 /// A single graph panel with its own set of plotted channels.
 pub struct GraphPanel {
+    visible_markers: Vec<(f64, String, egui::Color32)>,
+    pub unresolved_gauges: Vec<crate::workspace::SavedGauge>,
+    pub view: crate::comparison::GraphView,
+    pub unresolved_channels: Vec<crate::workspace::GraphChannelSlot>,
     pub full_resolution: bool,
     pub id: u64,
     pub title: String,
@@ -494,11 +507,15 @@ impl GraphPanel {
 
     pub fn new(id: u64, title: impl Into<String>) -> Self {
         Self {
+            visible_markers: Vec::new(),
             id,
             title: title.into(),
             plotted_channels: Vec::new(),
             embedded_gauges: Vec::new(),
             colors: CHANNEL_COLORS.to_vec(),
+            view: Default::default(),
+            unresolved_channels: Vec::new(),
+            unresolved_gauges: Vec::new(),
             full_resolution: false,
             graph_mode: GraphMode::Tiled,
             x_axis_mode: GraphXAxis::Time,
@@ -588,12 +605,15 @@ impl GraphPanel {
         if let Some(pc) = create_plotted_channel(channel_id, shared, color_idx) {
             let (name, _, _, _) = resolve_channel_meta(channel_id, shared);
             self.embedded_gauges.push(GaugeChannel {
+                last_unit: None,
+                settings: Default::default(),
                 channel: pc,
                 style: default_style_for_name(&name),
             });
         }
     }
 
+    #[allow(dead_code)] // Retained for callers that build custom worksheet templates.
     pub fn add_embedded_gauge_with_style(
         &mut self,
         channel_id: ChannelId,
@@ -628,6 +648,9 @@ impl GraphPanel {
             .unwrap_or_else(|| path.to_string_lossy().to_string());
         let session_idx = self.overlay_sessions.len();
         self.overlay_sessions.push(OverlaySession {
+            settings_key: String::new(),
+            requests: HashMap::new(),
+            failures: HashMap::new(),
             path,
             file_name,
             ld_file: ld_file.clone(),
@@ -659,6 +682,146 @@ impl GraphPanel {
 
     /// Render the graph panel UI.
     pub fn ui(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
+        // Session data and comparison selections have one owner across worksheets.
+        std::mem::swap(&mut self.reference_lap, &mut shared.comparisons.main_lap);
+        std::mem::swap(&mut self.lap_overlays, &mut shared.comparisons.overlays);
+        std::mem::swap(&mut self.overlay_sessions, &mut shared.comparisons.sessions);
+        self.unresolved_gauges.retain(|slot| {
+            if let Some(channel) = crate::workspace::load_analysis_channel(&slot.channel, shared) {
+                self.embedded_gauges.push(GaugeChannel {
+                    last_unit: None,
+                    channel,
+                    settings: slot.settings,
+                    style: crate::workspace::gauge_style_from_string(&slot.style),
+                });
+                false
+            } else {
+                true
+            }
+        });
+        for slot in &self.unresolved_gauges {
+            ui.weak(format!("Gauge unavailable: {}", slot.channel.name));
+        }
+        if !shared.comparisons.unresolved_overlays.is_empty()
+            && ui.button("Retry unavailable overlay files").clicked()
+        {
+            let pending = std::mem::take(&mut shared.comparisons.unresolved_overlays);
+            for slot in pending {
+                if let Some(path) = &slot.file_path
+                    && let Some(i) = self.load_external_overlay_path(path.into())
+                {
+                    self.lap_overlays.push(LapOverlay {
+                        alignment_valid: false,
+                        gps_align: slot.gps_align,
+                        visible: slot.visible,
+                        color: slot
+                            .color
+                            .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2])),
+                        source: OverlaySource::External(i),
+                        lap_idx: slot.lap_index,
+                        manual_offset: slot.manual_offset,
+                        stretch_to_reference: slot.stretch_to_reference,
+                    });
+                } else {
+                    shared.comparisons.unresolved_overlays.push(slot);
+                }
+            }
+        }
+        shared.comparisons.unresolved_overlays.retain(|o| {
+            ui.horizontal(|ui| {
+                ui.weak(format!(
+                    "Overlay unavailable: {}",
+                    o.file_path.as_deref().unwrap_or("unknown")
+                ));
+                !ui.small_button("Remove overlay slot").clicked()
+            })
+            .inner
+        });
+        self.unresolved_channels.retain(|slot| {
+            if let Some(mut pc) = crate::workspace::load_analysis_channel(&slot.channel, shared) {
+                pc.tile_group = slot.tile_group;
+                self.plotted_channels.push(pc);
+                false
+            } else {
+                true
+            }
+        });
+        if !self.unresolved_channels.is_empty() {
+            ui.collapsing(
+                format!(
+                    "{} unavailable channel slots",
+                    self.unresolved_channels.len()
+                ),
+                |ui| {
+                    self.unresolved_channels.retain(|slot| {
+                        ui.horizontal(|ui| {
+                            ui.label(&slot.channel.name);
+                            !ui.small_button("Remove slot").clicked()
+                        })
+                        .inner
+                    });
+                },
+            );
+        }
+        let previous_main = self.reference_lap;
+        let local_cursor = self.view.local_cursor;
+        let local_view = self.view.mode != crate::comparison::ViewMode::Linked;
+        let global_zoom = shared.zoom_range;
+        let global_cursor = shared.cursor_time;
+        let global_zoom_request = shared.zoom_from_timeline;
+        let global_playback = shared.playback_active;
+        let global_selection = shared.selected_lap;
+        self.view.linked_window = global_zoom;
+        let rendered_mode = self.view.mode;
+        if local_view {
+            let cursor = if local_cursor {
+                self.view.cursor
+            } else {
+                global_cursor
+            };
+            shared.zoom_range =
+                self.view
+                    .range(global_zoom, cursor, shared.data_duration.unwrap_or(0.));
+            shared.zoom_from_timeline = self.view.mode != crate::comparison::ViewMode::Independent
+                || self.view.last_mode != Some(self.view.mode);
+            if self.view.local_range.is_some() {
+                self.needs_zoom_reset = false;
+            }
+        } else if self.view.last_mode != Some(crate::comparison::ViewMode::Linked) {
+            shared.zoom_from_timeline = true;
+        }
+        if local_cursor {
+            shared.cursor_time = self.view.cursor;
+            shared.playback_active = false;
+        }
+        self.ui_inner(ui, shared);
+        if self.overlay_sessions.iter().any(|s| !s.requests.is_empty()) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(30));
+        }
+        if local_view {
+            self.view.local_range = shared.zoom_range;
+            shared.zoom_range = global_zoom;
+            shared.zoom_from_timeline = global_zoom_request;
+        }
+        if local_cursor {
+            self.view.cursor = shared.cursor_time;
+            shared.cursor_time = global_cursor;
+            shared.playback_active = global_playback;
+        }
+        self.view.last_mode = Some(rendered_mode);
+        if self.reference_lap != previous_main {
+            shared.reference_lap = self.reference_lap;
+            shared.select_lap(self.reference_lap);
+        } else {
+            shared.selected_lap = global_selection;
+        }
+        std::mem::swap(&mut self.reference_lap, &mut shared.comparisons.main_lap);
+        std::mem::swap(&mut self.lap_overlays, &mut shared.comparisons.overlays);
+        std::mem::swap(&mut self.overlay_sessions, &mut shared.comparisons.sessions);
+    }
+
+    fn ui_inner(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
         let _perf = crate::perf_metrics::scope("graph draw");
 
         // Handle pending channel toggle from browser
@@ -674,7 +837,7 @@ impl GraphPanel {
             refresh_plotted_channel(channel, shared);
         }
         for gauge in &mut self.embedded_gauges {
-            refresh_plotted_channel(&mut gauge.channel, shared);
+            gauge.refresh(shared);
         }
 
         if self.plotted_channels.is_empty() {
@@ -695,6 +858,30 @@ impl GraphPanel {
 
         self.retain_valid_overlay_state(shared);
         self.show_toolbar(ui, shared);
+        for session in &mut self.overlay_sessions {
+            if let Some(analysis) = shared
+                .recording_analyses
+                .get(session.ld_file.recording_id())
+            {
+                session.laps = analysis.laps();
+            }
+            if self.x_axis_mode == GraphXAxis::Distance || self.view.show_time_variance {
+                session.distance_axis_cache =
+                    resolve_recording_channel(session, shared, "MoTeC::Corr Dist", "m")
+                        .map(|(data, freq)| DistanceAxisCache { data, freq });
+            }
+        }
+        if self.view.show_time_variance {
+            self.show_time_variance(ui, shared);
+        }
+        for session in &self.overlay_sessions {
+            for error in session.failures.values() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!("{}: {error}", session.file_name),
+                );
+            }
+        }
         if !self.embedded_gauges.is_empty() {
             ui.add_space(4.0);
             let available_height = ui.available_height();
@@ -740,7 +927,7 @@ impl GraphPanel {
             ui.add_space(4.0);
         }
 
-        if self.reference_lap.is_some() {
+        if self.reference_lap.is_some() && self.view.mode != crate::comparison::ViewMode::Overview {
             match self.graph_mode {
                 GraphMode::Overlay => {
                     self.show_lap_overlay_graph(ui, shared, needs_zoom_reset, &x_axis)
@@ -759,6 +946,71 @@ impl GraphPanel {
         }
 
         self.show_manage_channels_window(ui.ctx(), shared);
+    }
+
+    fn show_time_variance(&self, ui: &mut egui::Ui, shared: &mut SharedState) {
+        let Some(main) = self.reference_lap.and_then(|i| shared.laps.get(i)).cloned() else {
+            ui.weak("Select a Main range and overlays for time variance");
+            return;
+        };
+        let (main_axis, warning) = Self::resolve_x_axis(shared, GraphXAxis::Distance);
+        if warning.is_some() || !matches!(main_axis, ActiveGraphXAxis::Distance { .. }) {
+            ui.weak("Time variance is waiting for a distance source");
+            return;
+        }
+        let duration = shared.data_duration.unwrap_or(main.end_time);
+        let mut curves = Vec::new();
+        for (i, overlay) in self
+            .lap_overlays
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.visible && (!o.gps_align || o.alignment_valid))
+        {
+            let source = match overlay.source {
+                OverlaySource::MainSession => shared
+                    .laps
+                    .get(overlay.lap_idx)
+                    .map(|lap| (lap, main_axis.clone(), duration)),
+                OverlaySource::External(idx) => self.overlay_sessions.get(idx).and_then(|s| {
+                    Some((
+                        s.laps.get(overlay.lap_idx)?,
+                        ActiveGraphXAxis::Distance {
+                            data: s.distance_axis_cache.as_ref()?.data.clone(),
+                            freq: s.distance_axis_cache.as_ref()?.freq,
+                        },
+                        s.ld_file.duration_secs(),
+                    ))
+                }),
+            };
+            if let Some((lap, axis, source_duration)) = source {
+                let points = time_variance_curve(
+                    &main_axis,
+                    &main,
+                    duration,
+                    &axis,
+                    lap,
+                    source_duration,
+                    overlay,
+                );
+                curves.push((
+                    format!("Overlay {} − Main (s)", i + 1),
+                    points,
+                    overlay
+                        .color
+                        .unwrap_or(CHANNEL_COLORS[i % CHANNEL_COLORS.len()]),
+                ));
+            }
+        }
+        Plot::new(("time_variance", self.id))
+            .height(110.)
+            .x_axis_label("Lap distance (m)")
+            .y_axis_label("Overlay − Main (s)")
+            .show(ui, |plot| {
+                plot.hline(egui_plot::HLine::new("Equal time", 0.).color(egui::Color32::GRAY));
+                for (name, points, color) in curves {
+                    plot.line(Line::new(name, points).color(color));
+                }
+            });
     }
 
     fn retain_valid_overlay_state(&mut self, shared: &SharedState) {
@@ -786,7 +1038,28 @@ impl GraphPanel {
     fn show_toolbar(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
         let mut new_reference = self.reference_lap;
         ui.horizontal_wrapped(|ui| {
-            ui.label("Reference lap:");
+            egui::ComboBox::from_id_salt(("view_policy", self.id))
+                .selected_text(format!("{:?}", self.view.mode))
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        crate::comparison::ViewMode::Linked,
+                        crate::comparison::ViewMode::Overview,
+                        crate::comparison::ViewMode::Independent,
+                        crate::comparison::ViewMode::FollowCursor,
+                    ] {
+                        ui.selectable_value(&mut self.view.mode, mode, format!("{mode:?}"));
+                    }
+                });
+            ui.checkbox(&mut self.view.local_cursor, "Local cursor");
+            ui.checkbox(&mut self.view.show_time_variance, "Time variance");
+            if self.view.mode == crate::comparison::ViewMode::FollowCursor {
+                ui.add(
+                    egui::DragValue::new(&mut self.view.detail_seconds)
+                        .range(0.1..=600.)
+                        .suffix(" s detail"),
+                );
+            }
+            ui.label("Main range:");
             egui::ComboBox::from_id_salt(format!("graph_ref_lap_{}", self.id))
                 .selected_text(match new_reference {
                     Some(idx) if idx < shared.laps.len() => shared.laps[idx].name.clone(),
@@ -818,6 +1091,10 @@ impl GraphPanel {
                 })
             {
                 self.lap_overlays.push(LapOverlay {
+                    alignment_valid: false,
+                    gps_align: false,
+                    visible: true,
+                    color: None,
                     source: OverlaySource::MainSession,
                     lap_idx: selected_lap,
                     manual_offset: 0.0,
@@ -900,75 +1177,291 @@ impl GraphPanel {
             self.needs_zoom_reset = true;
         }
 
+        ui.menu_button("Range / events", |ui| {
+            let duration = shared.data_duration.unwrap_or(0.);
+            let current = shared.zoom_range.unwrap_or((0., duration));
+            let mut set = None;
+            ui.horizontal(|ui| {
+                if ui.button("Zoom in").clicked() {
+                    let mid = (current.0 + current.1) / 2.;
+                    let half = (current.1 - current.0) / 4.;
+                    set = Some((mid - half, mid + half));
+                }
+                if ui.button("Zoom out").clicked() {
+                    let mid = (current.0 + current.1) / 2.;
+                    let half = current.1 - current.0;
+                    set = Some(((mid - half).max(0.), (mid + half).min(duration)));
+                }
+                if ui.button("Pan left").clicked() {
+                    let width = current.1 - current.0;
+                    let a = (current.0 - width / 4.).max(0.);
+                    set = Some((a, (a + width).min(duration)));
+                }
+                if ui.button("Pan right").clicked() {
+                    let width = current.1 - current.0;
+                    let b = (current.1 + width / 4.).min(duration);
+                    set = Some(((b - width).max(0.), b));
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Full outing").clicked() {
+                    set = Some((0., duration));
+                }
+                if ui.button("Selected range").clicked()
+                    && let Some(lap) = shared.selected_lap.and_then(|i| shared.laps.get(i))
+                {
+                    set = Some((lap.start_time, lap.end_time));
+                }
+                if ui.button("A/B interval").clicked()
+                    && let Some((a, b)) = shared.cursor_time.zip(shared.measurement_cursor)
+                {
+                    set = Some((a.min(b), a.max(b)));
+                }
+                if ui.button("Save view").clicked() {
+                    self.view.saved_range = Some(current);
+                }
+                if ui
+                    .add_enabled(
+                        self.view.saved_range.is_some(),
+                        egui::Button::new("Restore view"),
+                    )
+                    .clicked()
+                {
+                    set = self.view.saved_range;
+                }
+            });
+            let (mut start, mut end) = current;
+            ui.horizontal(|ui| {
+                ui.label("Seconds");
+                ui.add(egui::DragValue::new(&mut start).speed(0.1));
+                ui.add(egui::DragValue::new(&mut end).speed(0.1));
+                if ui.button("Apply range").clicked() {
+                    set = Some((start, end));
+                }
+            });
+            if let Some((a, b)) = set.filter(|(a, b)| a.is_finite() && b.is_finite() && b > a) {
+                shared.zoom_range = Some((a.max(0.), b.min(duration)));
+                self.needs_zoom_reset = false;
+            }
+            ui.separator();
+            ui.checkbox(
+                &mut self.view.show_annotations,
+                "Recording annotations / beacons",
+            );
+            ui.checkbox(
+                &mut self.view.show_events,
+                "Logged event / error transitions",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Event channel");
+                ui.text_edit_singleline(&mut self.view.event_channel);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Error channel");
+                ui.text_edit_singleline(&mut self.view.error_channel);
+            });
+            if ui.button("Edit recording annotations…").clicked() {
+                shared.show_recording_editor = true;
+                ui.close();
+            }
+        });
+        self.visible_markers.clear();
+        if self.view.show_annotations
+            && let Some(analysis) = shared.current_analysis()
+        {
+            for marker in &analysis.markers {
+                self.visible_markers.push((
+                    marker.time,
+                    marker.name.clone(),
+                    egui::Color32::LIGHT_BLUE,
+                ));
+            }
+        }
+        if self.view.show_events {
+            for (reference, color, errors) in [
+                (&self.view.event_channel, egui::Color32::LIGHT_GREEN, false),
+                (&self.view.error_channel, egui::Color32::LIGHT_RED, true),
+            ] {
+                if reference.trim().is_empty() {
+                    continue;
+                }
+                if let Some(id) = shared.resolve_slot(reference, false)
+                    && let Some(pc) = create_plotted_channel(id, shared, 0)
+                {
+                    let info = crate::panels::utils::build_plotted_channel_info(&pc, shared);
+                    if info.data.is_empty() {
+                        ui.weak(format!("{reference}: loading"));
+                    }
+                    let range = shared.analysis_range();
+                    let w = i3rs_core::sample_window_for_time(
+                        info.freq,
+                        info.data.len(),
+                        range.0,
+                        range.1,
+                    );
+                    for i in w.start_sample..w.end_sample {
+                        let value = info.data[i];
+                        if !value.is_finite()
+                            || (i > 0 && value == info.data[i - 1])
+                            || (errors && value == 0.)
+                        {
+                            continue;
+                        }
+                        self.visible_markers.push((
+                            i as f64 / info.freq.max(1) as f64,
+                            format!(
+                                "{}: {}",
+                                info.name,
+                                info.format_value(value)
+                                    .unwrap_or_else(|| value.to_string())
+                            ),
+                            color,
+                        ));
+                    }
+                } else {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!("Event channel unavailable: {reference}"),
+                    );
+                }
+            }
+        }
+        for index in 0..self.lap_overlays.len() {
+            if !self.lap_overlays[index].gps_align {
+                continue;
+            }
+            match gps_alignment_offset(
+                shared,
+                &mut self.overlay_sessions,
+                &self.lap_overlays[index],
+                self.reference_lap,
+            ) {
+                Ok(Some(offset)) => {
+                    self.lap_overlays[index].manual_offset = offset;
+                    self.lap_overlays[index].alignment_valid = true;
+                }
+                Ok(None) => {
+                    self.lap_overlays[index].alignment_valid = false;
+                    ui.weak("GPS clock alignment loading");
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(30));
+                }
+                Err(error) => {
+                    self.lap_overlays[index].alignment_valid = false;
+                    ui.colored_label(egui::Color32::YELLOW, error);
+                }
+            }
+        }
         if !self.lap_overlays.is_empty() {
             ui.add_space(4.0);
-            egui::Grid::new(format!("graph_overlay_rows_{}", self.id))
-                .num_columns(5)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    ui.strong("Overlay");
-                    ui.strong("Lap");
-                    ui.strong("Offset");
-                    ui.strong("Stretch");
-                    ui.strong("");
-                    ui.end_row();
+            ui.vertical(|ui| {
+                let mut remove_idx = None;
+                let mut swap_idx = None;
+                for idx in 0..self.lap_overlays.len() {
+                    let source_label = {
+                        let overlay = &self.lap_overlays[idx];
+                        self.overlay_source_label(overlay)
+                    };
+                    let lap_options: Vec<String> = {
+                        let overlay = &self.lap_overlays[idx];
+                        self.overlay_laps_for_source(shared, overlay)
+                            .iter()
+                            .map(|lap| {
+                                format!(
+                                    "{} ({})",
+                                    lap.name,
+                                    i3rs_core::format_duration(lap.duration())
+                                )
+                            })
+                            .collect()
+                    };
+                    let overlay = &mut self.lap_overlays[idx];
 
-                    let mut remove_idx = None;
-                    for idx in 0..self.lap_overlays.len() {
-                        let source_label = {
-                            let overlay = &self.lap_overlays[idx];
-                            self.overlay_source_label(overlay)
-                        };
-                        let lap_options: Vec<String> = {
-                            let overlay = &self.lap_overlays[idx];
-                            self.overlay_laps_for_source(shared, overlay)
-                                .iter()
-                                .map(|lap| {
-                                    format!(
-                                        "{} ({})",
-                                        lap.name,
-                                        i3rs_core::format_duration(lap.duration())
-                                    )
-                                })
-                                .collect()
-                        };
-                        let overlay = &mut self.lap_overlays[idx];
+                    ui.push_id(("overlay-row", self.id, idx), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut overlay.visible, source_label);
+                            let mut color = overlay
+                                .color
+                                .unwrap_or(CHANNEL_COLORS[idx % CHANNEL_COLORS.len()]);
+                            if ui.color_edit_button_srgba(&mut color).changed() {
+                                overlay.color = Some(color);
+                            }
 
-                        ui.label(source_label);
+                            let lap_label = lap_options
+                                .get(overlay.lap_idx)
+                                .cloned()
+                                .unwrap_or_else(|| "Unknown".into());
+                            egui::ComboBox::from_id_salt(format!(
+                                "graph_overlay_lap_{}_{}",
+                                self.id, idx
+                            ))
+                            .selected_text(lap_label)
+                            .show_ui(ui, |ui| {
+                                for (lap_idx, label) in lap_options.iter().enumerate() {
+                                    ui.selectable_value(&mut overlay.lap_idx, lap_idx, label);
+                                }
+                            });
 
-                        let lap_label = lap_options
-                            .get(overlay.lap_idx)
-                            .cloned()
-                            .unwrap_or_else(|| "Unknown".into());
-                        egui::ComboBox::from_id_salt(format!(
-                            "graph_overlay_lap_{}_{}",
-                            self.id, idx
-                        ))
-                        .selected_text(lap_label)
-                        .show_ui(ui, |ui| {
-                            for (lap_idx, label) in lap_options.iter().enumerate() {
-                                ui.selectable_value(&mut overlay.lap_idx, lap_idx, label);
+                            ui.label("Offset:");
+                            ui.add(
+                                egui::DragValue::new(&mut overlay.manual_offset)
+                                    .speed(0.01)
+                                    .range(-86400.0..=86400.0)
+                                    .suffix(" s"),
+                            );
+                            ui.checkbox(&mut overlay.stretch_to_reference, "Stretch");
+                            if ui.checkbox(&mut overlay.gps_align, "GPS clock").changed() {
+                                overlay.alignment_valid = false;
+                            }
+                            if ui.small_button("−10ms").clicked() {
+                                overlay.manual_offset -= 0.01;
+                                overlay.gps_align = false;
+                            }
+                            if ui.small_button("+10ms").clicked() {
+                                overlay.manual_offset += 0.01;
+                                overlay.gps_align = false;
+                            }
+                            if ui.small_button("Zero offset").clicked() {
+                                overlay.manual_offset = 0.;
+                                overlay.gps_align = false;
+                            }
+                            if ui.small_button("Offset A−B").clicked()
+                                && let Some((a, b)) =
+                                    shared.cursor_time.zip(shared.measurement_cursor)
+                            {
+                                overlay.manual_offset = a - b;
+                                overlay.gps_align = false;
+                            }
+                            if ui.small_button("Swap with Main").clicked() {
+                                swap_idx = Some(idx);
+                            }
+                            if ui.small_button("x").clicked() {
+                                remove_idx = Some(idx);
                             }
                         });
+                    });
+                }
 
-                        ui.add(
-                            egui::DragValue::new(&mut overlay.manual_offset)
-                                .speed(0.01)
-                                .range(-30.0..=30.0)
-                                .suffix(" s"),
-                        );
-                        ui.checkbox(&mut overlay.stretch_to_reference, "");
-                        if ui.small_button("x").clicked() {
-                            remove_idx = Some(idx);
-                        }
-                        ui.end_row();
-                    }
-
-                    if let Some(idx) = remove_idx {
-                        self.lap_overlays.remove(idx);
+                if let Some(idx) = swap_idx
+                    && let Some(main) = self.reference_lap
+                {
+                    if matches!(self.lap_overlays[idx].source, OverlaySource::External(_)) {
+                        shared.comparisons.pending_swap = Some(idx);
+                    } else {
+                        let new_main = self.lap_overlays[idx].lap_idx;
+                        self.lap_overlays[idx].lap_idx = main;
+                        self.lap_overlays[idx].manual_offset =
+                            -self.lap_overlays[idx].manual_offset;
+                        self.reference_lap = Some(new_main);
+                        self.needs_zoom_reset = true;
                         self.lap_render_cache.clear();
                     }
-                });
+                }
+                if let Some(idx) = remove_idx {
+                    self.lap_overlays.remove(idx);
+                    self.lap_render_cache.clear();
+                }
+            });
         }
 
         if !self.embedded_gauges.is_empty() {
@@ -1003,7 +1496,7 @@ impl GraphPanel {
         ui.separator();
     }
 
-    fn show_embedded_gauges(&mut self, ui: &mut egui::Ui, shared: &SharedState) {
+    fn show_embedded_gauges(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
         let spacing = 8.0_f32;
         let clip_rect = ui.clip_rect();
         let available_width = ui.available_width().min(clip_rect.width()).max(1.0);
@@ -1020,16 +1513,20 @@ impl GraphPanel {
             .spacing([spacing, spacing])
             .show(ui, |ui| {
                 for (idx, gauge) in self.embedded_gauges.iter_mut().enumerate() {
-                    let reading = GaugeReading::new(&gauge.channel, shared);
-
                     let (rect, response) = ui.allocate_exact_size(
                         egui::vec2(gauge_size, gauge_size),
                         egui::Sense::click(),
                     );
                     response.context_menu(|ui| {
+                        crate::panels::utils::show_plotted_channel_display_menu(
+                            ui,
+                            &mut gauge.channel,
+                            shared,
+                        );
                         ui.selectable_value(&mut gauge.style, GaugeStyle::Analog, "Analog");
                         ui.selectable_value(&mut gauge.style, GaugeStyle::Bar, "Bar");
                         ui.selectable_value(&mut gauge.style, GaugeStyle::Digital, "Digital");
+                        gauge.settings.controls(ui);
                         ui.selectable_value(
                             &mut gauge.style,
                             GaugeStyle::SteeringWheel,
@@ -1038,7 +1535,9 @@ impl GraphPanel {
                     });
 
                     let painter = ui.painter_at(rect);
-                    let ctx = reading.draw_context(gauge.channel.color);
+                    gauge.sync_units(shared);
+                    let reading = GaugeReading::new(&gauge.channel, shared);
+                    let ctx = reading.configured_context(gauge.channel.color, gauge.settings);
                     draw_gauge(&painter, rect, gauge.style, &ctx);
 
                     if (idx + 1) % cols == 0 {
@@ -1058,6 +1557,10 @@ impl GraphPanel {
                 .and_then(|session| default_overlay_lap_index(&session.laps))
                 .unwrap_or(0);
             self.lap_overlays.push(LapOverlay {
+                alignment_valid: false,
+                gps_align: false,
+                visible: true,
+                color: None,
                 source: OverlaySource::External(session_idx),
                 lap_idx: default_lap_idx,
                 manual_offset: 0.0,
@@ -1099,7 +1602,12 @@ impl GraphPanel {
         needs_zoom_reset: bool,
         x_axis: &ActiveGraphXAxis,
     ) {
-        let cursor_group = egui::Id::new("global_cursor_link");
+        let markers = self.visible_markers.clone();
+        let cursor_group = if self.view.local_cursor {
+            egui::Id::new(("local_cursor", self.id))
+        } else {
+            egui::Id::new("global_cursor_link")
+        };
         let data_duration = shared.data_duration.unwrap_or(f64::MAX);
         let full_x_range = x_axis.full_range(data_duration);
 
@@ -1122,6 +1630,9 @@ impl GraphPanel {
 
         let laps = shared.laps.as_slice();
         let show_markers = shared.show_lap_markers;
+        let overview_window = (self.view.mode == crate::comparison::ViewMode::Overview)
+            .then_some(self.view.linked_window)
+            .flatten();
         let cursor_time = shared.cursor_time;
         let plotted: Vec<&PlottedChannel> = self.plotted_channels.iter().collect();
         let channel_meta: Vec<ChannelDisplayMeta> = self
@@ -1163,6 +1674,28 @@ impl GraphPanel {
                 Self::draw_lap_markers(plot_ui, laps, x_axis);
             }
 
+            if let Some((a, b)) = overview_window {
+                for (name, t) in [("Selected start", a), ("Selected end", b)] {
+                    plot_ui.vline(
+                        egui_plot::VLine::new(name, x_axis.axis_value_at_time(t))
+                            .color(egui::Color32::LIGHT_BLUE),
+                    );
+                }
+            }
+            for (t, label, color) in &markers {
+                let t = *t;
+                plot_ui.vline(
+                    egui_plot::VLine::new(label, x_axis.axis_value_at_time(t))
+                        .color(*color)
+                        .style(egui_plot::LineStyle::dashed_dense()),
+                );
+            }
+            if let Some(t) = shared.measurement_cursor {
+                plot_ui.vline(
+                    egui_plot::VLine::new("B", x_axis.axis_value_at_time(t))
+                        .color(egui::Color32::YELLOW),
+                );
+            }
             if let Some(t) = cursor_time {
                 Self::draw_cursor_line(plot_ui, x_axis.axis_value_at_time(t));
             }
@@ -1225,9 +1758,17 @@ impl GraphPanel {
         needs_zoom_reset: bool,
         x_axis: &ActiveGraphXAxis,
     ) {
-        let cursor_group = egui::Id::new("global_cursor_link");
+        let markers = self.visible_markers.clone();
+        let cursor_group = if self.view.local_cursor {
+            egui::Id::new(("local_cursor", self.id))
+        } else {
+            egui::Id::new("global_cursor_link")
+        };
         let laps = shared.laps.as_slice();
         let show_markers = shared.show_lap_markers;
+        let overview_window = (self.view.mode == crate::comparison::ViewMode::Overview)
+            .then_some(self.view.linked_window)
+            .flatten();
         let cursor_time = shared.cursor_time;
         let zoom_from_timeline = shared.zoom_from_timeline;
         let zoom_range = shared.zoom_range;
@@ -1315,6 +1856,28 @@ impl GraphPanel {
                             Self::draw_lap_markers(plot_ui, laps, x_axis);
                         }
 
+                        if let Some((a, b)) = overview_window {
+                            for (name, t) in [("Selected start", a), ("Selected end", b)] {
+                                plot_ui.vline(
+                                    egui_plot::VLine::new(name, x_axis.axis_value_at_time(t))
+                                        .color(egui::Color32::LIGHT_BLUE),
+                                );
+                            }
+                        }
+                        for (t, label, color) in &markers {
+                            let t = *t;
+                            plot_ui.vline(
+                                egui_plot::VLine::new(label, x_axis.axis_value_at_time(t))
+                                    .color(*color)
+                                    .style(egui_plot::LineStyle::dashed_dense()),
+                            );
+                        }
+                        if let Some(t) = shared.measurement_cursor {
+                            plot_ui.vline(
+                                egui_plot::VLine::new("B", x_axis.axis_value_at_time(t))
+                                    .color(egui::Color32::YELLOW),
+                            );
+                        }
                         if let Some(t) = cursor_time {
                             Self::draw_cursor_line(plot_ui, x_axis.axis_value_at_time(t));
                         }
@@ -1417,6 +1980,7 @@ impl GraphPanel {
         needs_zoom_reset: bool,
         x_axis: &ActiveGraphXAxis,
     ) {
+        let markers = self.visible_markers.clone();
         let Some(reference_lap_idx) = self.reference_lap else {
             return;
         };
@@ -1543,6 +2107,20 @@ impl GraphPanel {
                 draw_cached_lap_series(plot_ui, lap_render_cache, &cache_key, color, width);
             }
 
+            for (t, label, color) in &markers {
+                let t = *t;
+                plot_ui.vline(
+                    egui_plot::VLine::new(label, viewport.axis_value_for_time(t))
+                        .color(*color)
+                        .style(egui_plot::LineStyle::dashed_dense()),
+                );
+            }
+            if let Some(t) = shared.measurement_cursor {
+                plot_ui.vline(
+                    egui_plot::VLine::new("B", viewport.axis_value_for_time(t))
+                        .color(egui::Color32::YELLOW),
+                );
+            }
             if let Some(cursor_time) = cursor_time {
                 Self::draw_cursor_line(plot_ui, viewport.axis_value_for_time(cursor_time));
             }
@@ -1608,6 +2186,7 @@ impl GraphPanel {
         needs_zoom_reset: bool,
         x_axis: &ActiveGraphXAxis,
     ) {
+        let markers = self.visible_markers.clone();
         let Some(reference_lap_idx) = self.reference_lap else {
             return;
         };
@@ -1745,6 +2324,20 @@ impl GraphPanel {
                         draw_cached_lap_series(plot_ui, lap_render_cache, &cache_key, color, width);
                     }
 
+                    for (t, label, color) in &markers {
+                        let t = *t;
+                        plot_ui.vline(
+                            egui_plot::VLine::new(label, viewport.axis_value_for_time(t))
+                                .color(*color)
+                                .style(egui_plot::LineStyle::dashed_dense()),
+                        );
+                    }
+                    if let Some(t) = shared.measurement_cursor {
+                        plot_ui.vline(
+                            egui_plot::VLine::new("B", viewport.axis_value_for_time(t))
+                                .color(egui::Color32::YELLOW),
+                        );
+                    }
                     if let Some(cursor_time) = cursor_time {
                         Self::draw_cursor_line(plot_ui, viewport.axis_value_for_time(cursor_time));
                     }
@@ -2769,6 +3362,8 @@ impl GraphPanel {
                 {
                     let style = default_style_for_name("");
                     self.embedded_gauges.push(GaugeChannel {
+                        last_unit: None,
+                        settings: Default::default(),
                         channel: PlottedChannel {
                             channel_id: pc.channel_id,
                             color: pc.color,
@@ -2779,6 +3374,8 @@ impl GraphPanel {
                             display_offset: pc.display_offset,
                             display_unit: pc.display_unit.clone(),
                             math_id: None,
+                            requested_reference: None,
+                            portable_source_unit: None,
                             recording_display_base: None,
                             math_display_signature: None,
                             scale_mode: pc.scale_mode,
@@ -3171,6 +3768,8 @@ impl GraphPanel {
 
         let (name, raw_unit, freq, dec_places) = resolve_channel_meta(channel_id, shared);
         let source_label = match channel_id {
+            ChannelId::Analysis(_) => "Analysis",
+            ChannelId::Unresolved(_) => "Unavailable",
             ChannelId::Physical(_) => "Logged",
             ChannelId::Math(_) => "Math",
         };
@@ -3512,12 +4111,26 @@ impl GraphPanel {
             .collect();
         math_entries.sort_by_key(|(_, label)| label.to_lowercase());
         entries.extend(math_entries);
+        for candidate in shared.channel_catalog().into_iter().filter(|c| {
+            matches!(
+                c.key,
+                i3rs_core::ChannelKey::Constant(_) | i3rs_core::ChannelKey::Generated(_)
+            )
+        }) {
+            let reference = format!("{}::{}", candidate.source, candidate.name);
+            entries.push((
+                shared.analysis_channel(&reference),
+                format!("{} · {}", candidate.name, candidate.source),
+            ));
+        }
 
         entries
     }
 
     fn channel_id_key(channel_id: ChannelId) -> (u8, usize) {
         match channel_id {
+            ChannelId::Analysis(idx) => (3, idx),
+            ChannelId::Unresolved(idx) => (2, idx),
             ChannelId::Physical(idx) => (0, idx),
             ChannelId::Math(idx) => (1, idx),
         }
@@ -3603,7 +4216,19 @@ impl GraphPanel {
             OverlaySource::External(session_idx) => {
                 let session = self.overlay_sessions.get_mut(session_idx)?;
                 let lap = session.laps.get(overlay.lap_idx)?.clone();
-                let (data, freq) = resolve_overlay_channel_data(session, &name)?;
+                let reference = match channel_id {
+                    ChannelId::Analysis(i) | ChannelId::Unresolved(i) => {
+                        shared.unresolved_references.borrow().get(i)?.0.clone()
+                    }
+                    ChannelId::Physical(idx) => shared.ld_file.as_ref()?.channels[idx].name.clone(),
+                    ChannelId::Math(idx) => {
+                        let mc = shared.math_channels.get(idx)?;
+                        format!("{}::{}", mc.options.source, mc.name)
+                    }
+                };
+                let _ = name;
+                let (_, unit, _, _) = resolve_channel_meta(channel_id, shared);
+                let (data, freq) = resolve_recording_channel(session, shared, &reference, &unit)?;
                 Some(ResolvedOverlayRenderData { data, freq, lap })
             }
         }
@@ -3627,6 +4252,9 @@ impl GraphPanel {
             let mut series = Vec::new();
             for overlay_idx in 0..self.lap_overlays.len() {
                 let overlay = self.lap_overlays[overlay_idx];
+                if !overlay.visible || (overlay.gps_align && !overlay.alignment_valid) {
+                    continue;
+                }
                 if let Some(rendered) =
                     self.resolve_overlay_render_data(shared, &overlay, channel_id)
                     && let Some(source_axis) =
@@ -3664,7 +4292,9 @@ impl GraphPanel {
                         axis: source_axis.axis,
                         scale,
                         offset: axis_offset,
-                        color: tint_color(base_color, overlay_idx + 1),
+                        color: overlay
+                            .color
+                            .unwrap_or_else(|| tint_color(base_color, overlay_idx + 1)),
                         width: 1.35,
                         overlay_idx,
                     });
@@ -4036,6 +4666,66 @@ fn overlay_axis_offset(
     }
 }
 
+fn time_variance_curve(
+    main_axis: &ActiveGraphXAxis,
+    main: &Lap,
+    main_duration: f64,
+    overlay_axis: &ActiveGraphXAxis,
+    lap: &Lap,
+    duration: f64,
+    overlay: &LapOverlay,
+) -> Vec<[f64; 2]> {
+    let ActiveGraphXAxis::Distance { data, freq } = overlay_axis else {
+        return Vec::new();
+    };
+    if *freq == 0 || !is_monotonic_non_decreasing(data) {
+        return Vec::new();
+    }
+    let origin = lap_axis_origin(overlay_axis, lap);
+    let raw_length = lap_axis_length(overlay_axis, lap, duration).unwrap_or(0.);
+    let main_length = lap_axis_length(main_axis, main, main_duration).unwrap_or(0.);
+    if raw_length <= 0. || main_length <= 0. {
+        return Vec::new();
+    }
+    let scale = if overlay.stretch_to_reference {
+        main_length / raw_length
+    } else {
+        1.
+    };
+    let offset = overlay_axis_offset(overlay_axis, lap, duration, overlay.manual_offset);
+    let main_origin = lap_axis_origin(main_axis, main);
+    let native_hz = match main_axis {
+        ActiveGraphXAxis::Distance { freq, .. } => *freq,
+        ActiveGraphXAxis::Time => *freq,
+    }
+    .max(1) as f64;
+    let start = (main.start_time * native_hz).floor() as usize + 1;
+    let end = (main.end_time * native_hz).ceil() as usize;
+    std::iter::once(main.start_time)
+        .chain(
+            (start..end)
+                .map(|i| i as f64 / native_hz)
+                .filter(|t| *t > main.start_time && *t < main.end_time),
+        )
+        .chain(std::iter::once(main.end_time))
+        .filter_map(|time| {
+            let distance = main_axis.axis_value_at_time(time) - main_origin;
+            let source_distance = (distance - offset) / scale;
+            if source_distance < 0. || source_distance > raw_length {
+                return None;
+            }
+            let overlay_time = time_from_valid_axis(data, *freq, source_distance + origin)?;
+            if overlay_time < lap.start_time || overlay_time > lap.end_time {
+                return None;
+            }
+            Some([
+                distance,
+                (overlay_time - lap.start_time) - (time - main.start_time),
+            ])
+        })
+        .collect()
+}
+
 fn tint_color(color: egui::Color32, offset: usize) -> egui::Color32 {
     let lighten = (offset as f32 * 0.12).min(0.45);
     let lerp =
@@ -4043,25 +4733,85 @@ fn tint_color(color: egui::Color32, offset: usize) -> egui::Color32 {
     egui::Color32::from_rgba_premultiplied(lerp(color.r()), lerp(color.g()), lerp(color.b()), 220)
 }
 
-fn resolve_overlay_channel_data(
+pub(crate) fn resolve_recording_channel(
     session: &mut OverlaySession,
-    requested_name: &str,
+    shared: &SharedState,
+    reference: &str,
+    target_unit: &str,
 ) -> Option<(Arc<[f64]>, u16)> {
-    let normalized_requested = normalized_name(requested_name);
-    if let Some(cached) = session.channel_cache.get(&normalized_requested) {
-        return Some((Arc::clone(&cached.data), cached.freq));
+    let settings_key =
+        serde_json::to_string(&(shared.math_evaluation_key(0), &shared.recording_analyses))
+            .expect("analysis settings");
+    if session.settings_key != settings_key {
+        session.settings_key = settings_key;
+        session.channel_cache.clear();
+        session.requests.clear();
+        session.failures.clear();
     }
-
-    let channel = session.ld_file.find_channel_by_name(requested_name)?;
-    let data = Arc::from(session.ld_file.read_channel_data(channel)?);
-    session.channel_cache.insert(
-        normalized_requested,
-        OverlayChannelCacheEntry {
-            data: Arc::clone(&data),
-            freq: channel.freq,
-        },
-    );
-    Some((data, channel.freq))
+    let key = format!("{reference}:{target_unit}");
+    if let Some(cached) = session.channel_cache.get(&key) {
+        return Some((cached.data.clone(), cached.freq));
+    }
+    if session.failures.contains_key(&key) {
+        return None;
+    }
+    if let Some(rx) = session.requests.get(&key) {
+        let received = match rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                "Overlay evaluation worker stopped before returning a result".into(),
+            )),
+        };
+        if let Some(result) = received {
+            session.requests.remove(&key);
+            match result {
+                Ok((data, freq)) => {
+                    session.channel_cache.insert(
+                        key,
+                        OverlayChannelCacheEntry {
+                            data: data.clone(),
+                            freq,
+                        },
+                    );
+                    return Some((data, freq));
+                }
+                Err(error) => {
+                    shared.message(format!(
+                        "Overlay {} · {}: {}",
+                        session.file_name, reference, error
+                    ));
+                    session.failures.insert(key, error);
+                }
+            }
+        }
+        return None;
+    }
+    let context = crate::comparison::recording_context(shared, session.ld_file.clone());
+    let reference = reference.to_owned();
+    let target_unit = target_unit.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    session.requests.insert(key, rx);
+    let work = move || {
+        let result = crate::comparison::evaluate_channel(&context, &reference).and_then(
+            |(mut samples, freq, unit)| {
+                let (scale, offset) = i3rs_core::channels::unit_transform(&unit, &target_unit)?;
+                for v in &mut samples {
+                    *v = *v * scale + offset;
+                }
+                Ok((Arc::from(samples), freq))
+            },
+        );
+        let _ = tx.send(result);
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(work);
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        gloo_timers::future::TimeoutFuture::new(0).await;
+        work();
+    });
+    None
 }
 
 fn default_overlay_lap_index(laps: &[Lap]) -> Option<usize> {
@@ -4305,6 +5055,10 @@ fn time_from_monotonic_axis(data: &[f64], freq: u16, axis_value: f64) -> Option<
         return None;
     }
 
+    time_from_valid_axis(data, freq, axis_value)
+}
+
+fn time_from_valid_axis(data: &[f64], freq: u16, axis_value: f64) -> Option<f64> {
     let first = data.first().copied()?;
     let last = data.last().copied()?;
     let clamped = axis_value.clamp(first.min(last), first.max(last));
@@ -4916,6 +5670,8 @@ mod tests {
             display_offset: 0.0,
             display_unit: None,
             math_id: None,
+            requested_reference: None,
+            portable_source_unit: None,
             recording_display_base: None,
             math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
@@ -5094,6 +5850,10 @@ mod tests {
             },
         );
         panel.lap_overlays.push(super::LapOverlay {
+            alignment_valid: false,
+            gps_align: false,
+            visible: true,
+            color: None,
             source: OverlaySource::MainSession,
             lap_idx: 0,
             manual_offset: 0.0,
@@ -5105,5 +5865,340 @@ mod tests {
         assert!(panel.render_cache.is_empty());
         assert!(panel.lap_render_cache.is_empty());
         assert!(panel.lap_overlays.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod comparison_contract_tests {
+    use super::*;
+    #[test]
+    fn overlay_controls_wrap_without_expanding_a_narrow_panel() {
+        let mut shared = SharedState::new();
+        shared.laps = vec![lap(0., 10.), lap(10., 20.)];
+        shared.selected_lap = Some(1);
+        let mut graph = GraphPanel::new(1, "Narrow");
+        graph.reference_lap = Some(0);
+        graph.lap_overlays.push(LapOverlay {
+            alignment_valid: false,
+            gps_align: false,
+            visible: true,
+            color: None,
+            source: OverlaySource::MainSession,
+            lap_idx: 1,
+            manual_offset: 0.,
+            stretch_to_reference: false,
+        });
+        let context = egui::Context::default();
+        for _ in 0..2 {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640., 800.),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let width = ui.available_width();
+                        graph.show_toolbar(ui, &mut shared);
+                        assert!(
+                            ui.min_rect().width() <= width + 1.,
+                            "toolbar width {} exceeds panel {width}",
+                            ui.min_rect().width()
+                        );
+                    });
+                },
+            );
+            output.textures_delta.clear();
+        }
+    }
+    fn lap(start: f64, end: f64) -> Lap {
+        Lap {
+            number: 1,
+            name: "Test".into(),
+            start_time: start,
+            end_time: end,
+        }
+    }
+    #[test]
+    fn variance_matches_distance_alignment_with_offset_and_stretch() {
+        let main_axis = ActiveGraphXAxis::Distance {
+            data: Arc::from((0..=20).map(|i| i as f64 * 10.).collect::<Vec<_>>()),
+            freq: 1,
+        };
+        let slow_axis = ActiveGraphXAxis::Distance {
+            data: Arc::from((0..=20).map(|i| i as f64 * 5.).collect::<Vec<_>>()),
+            freq: 1,
+        };
+        let main = lap(0., 10.);
+        let slow = lap(0., 20.);
+        let mut overlay = LapOverlay {
+            alignment_valid: false,
+            gps_align: false,
+            source: OverlaySource::MainSession,
+            lap_idx: 0,
+            visible: true,
+            color: None,
+            manual_offset: 0.,
+            stretch_to_reference: false,
+        };
+        let curve = time_variance_curve(&main_axis, &main, 20., &slow_axis, &slow, 20., &overlay);
+        assert_eq!(curve.first(), Some(&[0., 0.]));
+        assert_eq!(curve.last(), Some(&[100., 10.]));
+        overlay.manual_offset = 2.;
+        let shifted = time_variance_curve(&main_axis, &main, 20., &slow_axis, &slow, 20., &overlay);
+        assert_eq!(shifted.last(), Some(&[100., 8.]));
+        overlay.manual_offset = 0.;
+        overlay.stretch_to_reference = true;
+        let short = lap(0., 10.);
+        let stretched =
+            time_variance_curve(&main_axis, &main, 20., &slow_axis, &short, 20., &overlay);
+        assert!(stretched.iter().all(|p| p[1].abs() < 1e-10));
+    }
+}
+
+#[cfg(test)]
+mod shared_view_tests {
+    use super::*;
+    #[test]
+    fn graphs_share_comparisons_without_publishing_overview_zoom() {
+        let mut shared = SharedState::new();
+        let ld = Arc::new(
+            LdFile::open(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../test_data/VIR_LAP.ld"
+            ))
+            .unwrap(),
+        );
+        shared.data_duration = Some(ld.duration_secs());
+        shared.laps = detect_laps(&ld);
+        let idx = ld.find_channel_by_name("Engine Speed").unwrap().index;
+        let data = ld.read_channel_data(&ld.channels[idx]).unwrap();
+        shared.decoded_channel_cache.borrow_mut().insert(
+            idx,
+            Arc::new(crate::state::DecodedChannel {
+                stats: crate::state::compute_channel_stats(&data),
+                data: Arc::from(data),
+            }),
+        );
+        shared.ld_file = Some(ld);
+        shared.zoom_range = Some((10., 20.));
+        shared.comparisons.main_lap = Some(1);
+        shared.comparisons.overlays.push(LapOverlay {
+            alignment_valid: false,
+            gps_align: false,
+            source: OverlaySource::MainSession,
+            lap_idx: 0,
+            manual_offset: 0.,
+            stretch_to_reference: false,
+            visible: true,
+            color: None,
+        });
+        let mut graph = GraphPanel::new(1, "Overview");
+        graph.add_channel(ChannelId::Physical(idx), &shared);
+        graph.view.mode = crate::comparison::ViewMode::Overview;
+        let context = egui::Context::default();
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| graph.ui(ui, &mut shared));
+        });
+        output.textures_delta.clear();
+        assert_eq!(shared.zoom_range, Some((10., 20.)));
+        assert_eq!(shared.comparisons.main_lap, Some(1));
+        assert_eq!(shared.comparisons.overlays.len(), 1);
+        assert!(graph.lap_overlays.is_empty());
+        assert!(graph.reference_lap.is_none());
+    }
+}
+
+pub(crate) fn gps_alignment_offset(
+    shared: &SharedState,
+    sessions: &mut [OverlaySession],
+    overlay: &LapOverlay,
+    main: Option<usize>,
+) -> Result<Option<f64>, String> {
+    let main_lap = main
+        .and_then(|i| shared.laps.get(i))
+        .ok_or("Select a Main range for GPS alignment")?;
+    let reference = "GPS Time";
+    let id = shared
+        .resolve_slot(reference, false)
+        .ok_or("GPS Time unavailable in Main; configure a W02 alias to a seconds clock channel")?;
+    let pc = create_plotted_channel(id, shared, 0).ok_or("GPS Time unavailable in Main")?;
+    let info = crate::panels::utils::build_plotted_channel_info(&pc, shared);
+    let unit = crate::panels::utils::resolve_channel_meta(id, shared).1;
+    let (scale, offset) = i3rs_core::channels::unit_transform(&unit, "s")
+        .map_err(|_| "GPS Time must have time units (seconds or milliseconds)")?;
+    let Some(main_clock) = i3rs_core::sample_at_time(&info.data, info.freq, main_lap.start_time)
+        .map(|v| v * scale + offset)
+        .filter(|v| v.is_finite())
+    else {
+        return Ok(None);
+    };
+    let (source_clock, same_date) = match overlay.source {
+        OverlaySource::MainSession => {
+            let lap = shared
+                .laps
+                .get(overlay.lap_idx)
+                .ok_or("Overlay range unavailable")?;
+            (
+                i3rs_core::sample_at_time(&info.data, info.freq, lap.start_time)
+                    .map(|v| v * scale + offset),
+                true,
+            )
+        }
+        OverlaySource::External(i) => {
+            let session = sessions.get_mut(i).ok_or("Overlay recording unavailable")?;
+            let context = crate::comparison::recording_context(shared, session.ld_file.clone());
+            if matches!(
+                context.resolve_analysis_reference(reference),
+                i3rs_core::ChannelResolution::Unresolved { .. }
+            ) {
+                return Err(
+                    "GPS Time unavailable in Overlay; configure its recording alias".into(),
+                );
+            }
+            let same_date = shared.ld_file.as_ref().is_some_and(|ld| {
+                !ld.session.date.is_empty() && ld.session.date == session.ld_file.session.date
+            });
+            let lap = session
+                .laps
+                .get(overlay.lap_idx)
+                .ok_or("Overlay range unavailable")?
+                .clone();
+            let Some((data, hz)) = resolve_recording_channel(session, shared, reference, "s")
+            else {
+                if let Some(error) = session.failures.get("GPS Time:s") {
+                    return Err(error.clone());
+                }
+                return Ok(None);
+            };
+            (
+                i3rs_core::sample_at_time(&data, hz, lap.start_time),
+                same_date,
+            )
+        }
+    };
+    let Some(source_clock) = source_clock.filter(|v| v.is_finite()) else {
+        return Err("GPS clock has a missing value at the range start".into());
+    };
+    if main_clock < 86400. && source_clock < 86400. && !same_date {
+        return Err("Time-of-day GPS clocks require matching recording dates; use an epoch clock for different dates".into());
+    }
+    Ok(Some(source_clock - main_clock))
+}
+
+#[cfg(test)]
+mod gps_clock_tests {
+    use super::*;
+    #[test]
+    fn gps_clock_uses_raw_seconds_and_reports_missing_clocks() {
+        let mut shared = SharedState::new();
+        shared.data_duration = Some(20.);
+        shared.laps = vec![
+            Lap {
+                number: 0,
+                name: "Main".into(),
+                start_time: 0.,
+                end_time: 10.,
+            },
+            Lap {
+                number: 1,
+                name: "Overlay".into(),
+                start_time: 10.,
+                end_time: 20.,
+            },
+        ];
+        let overlay = LapOverlay {
+            alignment_valid: false,
+            gps_align: true,
+            visible: true,
+            color: None,
+            source: OverlaySource::MainSession,
+            lap_idx: 1,
+            manual_offset: 0.,
+            stretch_to_reference: false,
+        };
+        assert!(gps_alignment_offset(&shared, &mut [], &overlay, Some(0)).is_err());
+        let mut clock =
+            shared.create_math_channel_def("GPS Time".into(), "0".into(), "ms".into(), 0);
+        clock.freq = 1;
+        clock.data = Some(Arc::from(
+            (0..=20)
+                .map(|i| 100_000_000. + 1000. * i as f64)
+                .collect::<Vec<_>>(),
+        ));
+        shared.math_channels.push(clock);
+        assert_eq!(
+            gps_alignment_offset(&shared, &mut [], &overlay, Some(0)).unwrap(),
+            Some(10.)
+        );
+        shared.math_channels[0].unit = "rpm".into();
+        assert!(gps_alignment_offset(&shared, &mut [], &overlay, Some(0)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod live_variance_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires local May 8 reference recording"]
+    fn i2_lap_three_four_variance_reference() {
+        let ld = LdFile::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../S1_#28299_20260508_174455_02.ld"
+        ))
+        .unwrap();
+        let laps = detect_laps(&ld);
+        let corrected =
+            i3rs_core::corrections::build_corrected_recording(&ld, &Default::default(), &laps)
+                .unwrap();
+        let (data, freq) = corrected.distance.unwrap();
+        let axis = ActiveGraphXAxis::Distance {
+            data: Arc::from(data),
+            freq,
+        };
+        let overlay = LapOverlay {
+            alignment_valid: true,
+            gps_align: false,
+            visible: true,
+            color: None,
+            source: OverlaySource::MainSession,
+            lap_idx: 4,
+            manual_offset: 0.,
+            stretch_to_reference: false,
+        };
+        let curve = time_variance_curve(
+            &axis,
+            &laps[3],
+            ld.duration_secs(),
+            &axis,
+            &laps[4],
+            ld.duration_secs(),
+            &overlay,
+        );
+        // i2 Standard 1.1.4.457, Main Lap 3 / Overlay Lap 4, no offset or
+        // stretch. Distances are rounded to metres in the status bar. Allow one
+        // native 20 Hz distance interval (50 ms), not pixel/display precision.
+        for (distance, expected) in [
+            (975., -3.129),
+            (2626., -2.377),
+            (3909., -2.894),
+            (4276., -4.932),
+        ] {
+            let point = curve
+                .iter()
+                .min_by(|a, b| (a[0] - distance).abs().total_cmp(&(b[0] - distance).abs()))
+                .unwrap();
+            assert!(
+                (point[1] - expected).abs() < 0.050,
+                "at {distance} m: i3rs {} s, i2 {expected} s",
+                point[1]
+            );
+        }
+        let min = curve.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
+        let max = curve.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max);
+        assert!((min - -5.459).abs() < 0.050);
+        assert!((max - 0.015).abs() < 0.050);
     }
 }
