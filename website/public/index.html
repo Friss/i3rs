@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="i3rs is a Rust telemetry analysis app for MoTeC .ld logs, with a browser demo using the VIR_LAP sample."
+    />
+    <title>i3rs | Rust Motorsport Telemetry</title>
+    <link rel="icon" href="/demo/i3rs.ico" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/main.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header" aria-label="Primary">
+      <a class="brand-mark" href="#top" aria-label="i3rs home">i3rs</a>
+      <nav>
+        <a href="#download">Download</a>
+        <a href="#demo">Demo</a>
+        <a href="https://github.com/Friss/i3rs">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-media" aria-hidden="true">
+          <img src="/assets/track-hero-source.png" alt="" />
+        </div>
+        <div class="hero-shade" aria-hidden="true"></div>
+        <div class="hero-content reveal is-visible">
+          <p class="eyebrow">Motorsport telemetry</p>
+          <h1 id="hero-title">i3rs</h1>
+          <p class="hero-line">Open your race data, find the lap, get back on track.</p>
+          <div class="hero-actions" aria-label="Primary actions">
+            <a class="button primary" href="#download">Download</a>
+            <a class="button ghost" href="/demo/">Use app</a>
+          </div>
+        </div>
+        <a class="scroll-cue" href="#demo" aria-label="Skip to demo">
+          <span>VIR lap demo</span>
+        </a>
+      </section>
+
+      <section id="download" class="download-section" aria-labelledby="download-title">
+        <div class="section-kicker reveal">Desktop app</div>
+        <div class="download-heading reveal">
+          <h2 id="download-title">Get i3rs for your next session.</h2>
+          <p>Latest release: app-v0.7.0</p>
+        </div>
+        <div class="download-actions reveal" aria-label="Download links">
+          <a
+            class="button primary"
+            href="https://github.com/Friss/i3rs/releases/download/app-v0.7.0/i3rs-macos-app.zip"
+          >
+            Download for Mac
+          </a>
+          <a
+            class="button ghost"
+            href="https://github.com/Friss/i3rs/releases/download/app-v0.7.0/i3rs-app_0.7.0_x64_en-US.msi"
+          >
+            Download for Windows
+          </a>
+          <a class="button quiet" href="https://github.com/Friss/i3rs/releases/tag/app-v0.7.0">
+            All releases
+          </a>
+        </div>
+      </section>
+
+      <section id="demo" class="demo-section" aria-labelledby="demo-title">
+        <div class="section-kicker reveal">Live sample</div>
+        <div class="demo-heading reveal">
+          <h2 id="demo-title">Try the VIR lap.</h2>
+          <p>The sample loads automatically in the browser demo below.</p>
+        </div>
+        <div class="demo-toolbar reveal" aria-label="Demo controls">
+          <a class="button ghost" href="/demo/" target="_blank" rel="noreferrer">Open full screen</a>
+          <span id="demo-status" class="demo-status" role="status">Demo loads when in view</span>
+        </div>
+        <div class="demo-frame-shell reveal">
+          <iframe
+            id="i3rs-demo"
+            title="i3rs WebAssembly demo"
+            src="about:blank"
+            data-src="/demo/"
+            loading="lazy"
+            tabindex="-1"
+          ></iframe>
+        </div>
+      </section>
+
+      <section id="features" class="feature-section" aria-labelledby="features-title">
+        <div class="section-kicker reveal">What it opens up</div>
+        <h2 id="features-title" class="reveal">A calmer way through race data.</h2>
+        <div class="feature-list">
+          <article class="feature-row reveal">
+            <span>01</span>
+            <h3>Open the session</h3>
+            <p>Load MoTeC logs and see channels, laps, gauges, and graphs in one workspace.</p>
+          </article>
+          <article class="feature-row reveal">
+            <span>02</span>
+            <h3>Find the moment</h3>
+            <p>Move through the lap with synchronized timelines, cursors, and channel readouts.</p>
+          </article>
+          <article class="feature-row reveal">
+            <span>03</span>
+            <h3>Keep the setup</h3>
+            <p>Save the worksheet layout and come back to the same view next time.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="depth-section" aria-labelledby="depth-title">
+        <div class="depth-copy reveal">
+          <div class="section-kicker">Built in Rust</div>
+          <h2 id="depth-title">Native desktop speed, portable WebAssembly proof.</h2>
+          <p>
+            Under the hood, i3rs shares its parser and analysis core across desktop, CLI, and
+            browser builds. That is where the MoTeC file parsing, lap sidecars, and fast channel
+            rendering live.
+          </p>
+        </div>
+        <div class="terminal-panel reveal" aria-label="Build commands">
+          <pre><code>cargo build --release
+cd crates/i3rs-app
+trunk build --release</code></pre>
+        </div>
+      </section>
+
+      <section class="cta-section" aria-labelledby="cta-title">
+        <div class="cta-copy reveal">
+          <p class="section-kicker">MIT licensed</p>
+          <h2 id="cta-title">Download the app or inspect the source.</h2>
+          <div class="hero-actions">
+            <a class="button primary" href="#download">Get i3rs</a>
+            <a class="button ghost" href="https://github.com/Friss/i3rs">Go to GitHub</a>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

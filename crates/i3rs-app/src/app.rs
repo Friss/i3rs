@@ -1100,6 +1100,55 @@ impl App {
         })
     }
 
+    /// Prepare the bundled web sample after its background corrections finish.
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub fn configure_vir_sample(&mut self) -> Result<bool, String> {
+        if self.shared.file_name != "VIR_LAP.ld" {
+            return Err("Load the bundled VIR sample before configuring its track".into());
+        }
+        if let Some(error) = &self.shared.correction_error {
+            return Err(error.clone());
+        }
+        let Some(track) = self.shared.track_data_if_ready() else {
+            if self.shared.corrections_settled() {
+                return Err("The bundled sample has no usable GPS track".into());
+            }
+            self.shared.request_track_data_build();
+            self.egui_ctx.request_repaint();
+            return Ok(false);
+        };
+        let lap_index = self
+            .shared
+            .current_analysis()
+            .and_then(|analysis| {
+                analysis
+                    .ranges
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, range)| range.kind == i3rs_core::ranges::RangeKind::Lap)
+                    .max_by(|(_, a), (_, b)| (a.end - a.start).total_cmp(&(b.end - b.start)))
+                    .map(|(index, _)| index)
+            })
+            .ok_or("The bundled sample has no complete lap")?;
+        let sections = i3rs_core::track::sectors_from_distance_definition(
+            &track,
+            &self.shared.laps[lap_index],
+            &i3rs_core::track::vir_full_definition(),
+        )?;
+        self.shared.select_lap(Some(lap_index));
+        self.shared.sectors = sections;
+        for worksheet in &mut self.worksheets {
+            for (_, tab) in worksheet.dock_state.iter_all_tabs_mut() {
+                if let PanelTab::TrackMap(map) = tab {
+                    map.show_annotations = true;
+                    map.annotation_settings = Default::default();
+                }
+            }
+        }
+        self.egui_ctx.request_repaint();
+        Ok(true)
+    }
+
     fn session_summary_for_path(&mut self, path: &Path) -> Option<SessionSummary> {
         if self
             .shared
@@ -2601,6 +2650,67 @@ mod tests {
     fn startup_default_layout_is_detected() {
         let worksheet = worksheet_with_tabs(vec![PanelTab::Graph(GraphPanel::new(1, "Graph"))]);
         assert!(is_startup_default_layout(&[worksheet]));
+    }
+
+    #[test]
+    fn bundled_vir_sample_waits_for_corrections_then_prepares_complete_track_annotations() {
+        let mut app = test_app(
+            SharedState::new(),
+            vec![worksheet_with_tabs(vec![PanelTab::Graph(GraphPanel::new(
+                1, "Graph",
+            ))])],
+        );
+        app.open_bytes("VIR_LAP.ld".into(), std::fs::read(TEST_LD).unwrap(), None)
+            .unwrap();
+        assert!(app.shared.selected_lap.is_none());
+        assert!(app.shared.sectors.is_empty());
+        assert!(!app.configure_vir_sample().unwrap());
+        assert!(app.shared.take_requested_track_data_build());
+
+        let corrected = i3rs_core::corrections::build_corrected_recording(
+            app.shared.ld_file.as_ref().unwrap(),
+            &app.shared.current_corrections(),
+            &app.shared.competition_laps(),
+        );
+        let key = app.shared.correction_key();
+        assert!(app.shared.apply_correction_result(&key, corrected));
+        assert!(app.configure_vir_sample().unwrap());
+        let lap_index = app.shared.selected_lap.unwrap();
+        assert_eq!(
+            app.shared.current_analysis().unwrap().ranges[lap_index].kind,
+            i3rs_core::ranges::RangeKind::Lap
+        );
+        assert_eq!(app.shared.sectors.len(), 33);
+        let track = app.shared.track_data_if_ready().unwrap();
+        let ld = app.shared.ld_file.as_ref().unwrap();
+        let gear = ld.find_channel_by_name("Gear").unwrap();
+        let gear_data = ld.read_channel_data(gear).unwrap();
+        let events = i3rs_core::annotations::track_annotations(
+            &track,
+            &app.shared.laps[lap_index],
+            &app.shared.sectors,
+            Some((&gear_data, gear.freq)),
+            &Default::default(),
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| !event.section.is_empty())
+                .count(),
+            33
+        );
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            i3rs_core::annotations::AnnotationKind::GearChange { .. }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            i3rs_core::annotations::AnnotationKind::MinimumSpeed(_)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            i3rs_core::annotations::AnnotationKind::MaximumSpeed(_)
+        )));
     }
 
     #[test]

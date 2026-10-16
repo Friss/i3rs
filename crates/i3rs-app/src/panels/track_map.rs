@@ -221,6 +221,15 @@ impl TrackMapPanel {
             self.show_sector_report(ui, shared);
             return;
         }
+        if self.show_annotations {
+            if shared.selected_lap.is_none() {
+                ui.label("Select a lap in the lap browser to show track annotations.");
+            } else if shared.sectors.is_empty() {
+                ui.label(
+                    "Load or create track sections to show corner names and speed annotations.",
+                );
+            }
+        }
         self.ensure_color_map(shared);
 
         let track = Arc::clone(self.track_data.as_ref().unwrap());
@@ -289,8 +298,8 @@ impl TrackMapPanel {
             }
         });
 
-        // Place labels in two screen-space columns so dense named sections
-        // remain readable without changing the track's auto-fit bounds.
+        // Add columns when the panel is short rather than compressing labels
+        // into overlapping rows. Labels do not affect the track's auto-fit bounds.
         let frame = *response.transform.frame();
         let painter = ui.painter().with_clip_rect(frame);
         for right in [false, true] {
@@ -303,52 +312,36 @@ impl TrackMapPanel {
                 })
                 .collect();
             labels.sort_by(|a, b| a.0.y.total_cmp(&b.0.y));
-            let gap = 16.0_f32.min((frame.height() - 20.).max(0.) / labels.len().max(1) as f32);
-            let mut ys: Vec<f32> = Vec::new();
-            for (pos, _) in &labels {
-                ys.push(pos.y.max(ys.last().map_or(frame.top() + 10., |y| y + gap)));
-            }
-            if let Some(last) = ys.last_mut() {
-                *last = last.min(frame.bottom() - 10.);
-            }
-            for i in (0..ys.len().saturating_sub(1)).rev() {
-                ys[i] = ys[i].min(ys[i + 1] - gap);
-            }
-            for ((point, label), y) in labels.iter().zip(ys) {
-                let anchor = egui::pos2(
-                    if right {
-                        frame.right() - 8.
-                    } else {
-                        frame.left() + 8.
-                    },
-                    y,
-                );
-                let galley = painter.layout_no_wrap(
-                    label.to_string(),
-                    egui::FontId::proportional(9.),
-                    egui::Color32::LIGHT_GRAY,
-                );
-                let text_pos = egui::pos2(
-                    if right {
-                        anchor.x - galley.size().x
-                    } else {
-                        anchor.x
-                    },
-                    y - galley.size().y / 2.,
-                );
+            let galleys: Vec<_> = labels
+                .iter()
+                .map(|(_, label)| {
+                    painter.layout_no_wrap(
+                        label.to_string(),
+                        egui::FontId::proportional(11.),
+                        egui::Color32::LIGHT_GRAY,
+                    )
+                })
+                .collect();
+            let anchors: Vec<_> = labels.iter().map(|(point, _)| *point).collect();
+            let sizes: Vec<_> = galleys.iter().map(|galley| galley.size()).collect();
+            let rects = annotation_label_rects(frame, &anchors, &sizes, right);
+            for ((point, _), rect) in labels.iter().zip(&rects) {
                 let edge = egui::pos2(
                     if right {
-                        text_pos.x - 4.
+                        rect.left() - 4.
                     } else {
-                        text_pos.x + galley.size().x + 4.
+                        rect.right() + 4.
                     },
-                    y,
+                    rect.center().y,
                 );
                 painter.line_segment(
                     [*point, edge],
                     egui::Stroke::new(0.5, egui::Color32::from_gray(65)),
                 );
-                painter.galley(text_pos, galley, egui::Color32::LIGHT_GRAY);
+            }
+            for (rect, galley) in rects.into_iter().zip(galleys) {
+                painter.rect_filled(rect.expand(1.), 1., egui::Color32::from_black_alpha(220));
+                painter.galley(rect.min, galley, egui::Color32::LIGHT_GRAY);
             }
         }
 
@@ -1291,6 +1284,51 @@ fn selected_lap<'a>(shared: &'a SharedState, missing: &str) -> Result<&'a Lap, S
         .ok_or_else(|| missing.to_string())
 }
 
+fn annotation_label_rects(
+    frame: egui::Rect,
+    anchors: &[egui::Pos2],
+    sizes: &[egui::Vec2],
+    right: bool,
+) -> Vec<egui::Rect> {
+    let margin = 8.;
+    let row_height = sizes.iter().map(|size| size.y + 4.).fold(16., f32::max);
+    let column_width = sizes.iter().map(|size| size.x + 12.).fold(0., f32::max);
+    let rows = ((frame.height() - margin * 2.).max(0.) / row_height)
+        .floor()
+        .max(1.) as usize;
+    let mut rects = Vec::with_capacity(anchors.len());
+    for (column, points) in anchors.chunks(rows).enumerate() {
+        let mut ys = Vec::with_capacity(points.len());
+        for point in points {
+            ys.push(
+                point.y.max(
+                    ys.last()
+                        .map_or(frame.top() + margin + row_height / 2., |y| y + row_height),
+                ),
+            );
+        }
+        if let Some(last) = ys.last_mut() {
+            *last = last.min(frame.bottom() - margin - row_height / 2.);
+        }
+        for index in (0..ys.len().saturating_sub(1)).rev() {
+            ys[index] = ys[index].min(ys[index + 1] - row_height);
+        }
+        for (row, y) in ys.into_iter().enumerate() {
+            let size = sizes[column * rows + row];
+            let x = if right {
+                frame.right() - margin - column as f32 * column_width - size.x
+            } else {
+                frame.left() + margin + column as f32 * column_width
+            };
+            rects.push(egui::Rect::from_min_size(
+                egui::pos2(x, y - size.y / 2.),
+                size,
+            ));
+        }
+    }
+    rects
+}
+
 fn delta_color(delta: f64) -> egui::Color32 {
     if delta < -0.01 {
         egui::Color32::from_rgb(100, 255, 100) // green = faster
@@ -1307,6 +1345,25 @@ mod tests {
 
     fn sample_panel() -> TrackMapPanel {
         TrackMapPanel::new(1, "Track")
+    }
+
+    #[test]
+    fn dense_annotations_keep_every_label_readable_in_short_embedded_panels() {
+        for height in [180., 320., 700.] {
+            let frame = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200., height));
+            let anchors = vec![frame.center(); 55];
+            let sizes = vec![egui::vec2(90., 13.); anchors.len()];
+            for right in [false, true] {
+                let rects = annotation_label_rects(frame, &anchors, &sizes, right);
+                assert_eq!(rects.len(), anchors.len());
+                for (index, rect) in rects.iter().enumerate() {
+                    assert!(frame.contains_rect(*rect));
+                    for other in &rects[index + 1..] {
+                        assert!(!rect.expand(1.).intersects(other.expand(1.)));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

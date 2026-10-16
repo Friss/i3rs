@@ -228,6 +228,24 @@
         await waitForPaint();
         const parseStart = performance.now();
         window.i3rsLoadSession(fileName, ldBytes, ldxText ?? null);
+        if (source === "bundled-sample") {
+          setLoadState("loading", "Preparing VIR track sections and annotations...", {
+            fileName,
+            source,
+            phase: "annotations",
+          });
+          let configured = false;
+          for (let attempt = 0; attempt < 200; attempt += 1) {
+            if (window.i3rsConfigureVirSample()) {
+              configured = true;
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          if (!configured) {
+            throw new Error("Preparing the VIR track annotations timed out.");
+          }
+        }
         const parseDurationMs = Math.round(performance.now() - parseStart);
         let summary = null;
         if (typeof window.i3rsSessionSummary === "function") {
@@ -319,7 +337,7 @@
         }
       });
 
-      sampleButton.addEventListener("click", async () => {
+      const loadBundledSample = async () => {
         setBusy(true);
         try {
           setLoadState("loading", "Fetching bundled VIR_LAP sample...", {
@@ -343,7 +361,7 @@
             ldResponse.arrayBuffer(),
             ldxResponse.text(),
           ]);
-          await loadIntoApp("VIR_LAP.ld", new Uint8Array(ldBuffer), ldxText, "bundled-sample");
+          return await loadIntoApp("VIR_LAP.ld", new Uint8Array(ldBuffer), ldxText, "bundled-sample");
         } catch (err) {
           console.error(err);
           setLoadState("error", `Failed to load bundled sample: ${err}`, {
@@ -351,9 +369,14 @@
             source: "bundled-sample",
             phase: "error",
           });
+          throw err;
         } finally {
           setBusy(false);
         }
+      };
+      window.i3rsLoadBundledSample = loadBundledSample;
+      sampleButton.addEventListener("click", () => {
+        void loadBundledSample().catch(() => {});
       });
 
       waitForRuntime();
