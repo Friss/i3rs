@@ -3,6 +3,9 @@
 i3rs uses [`cargo-packager`](https://github.com/crabnebula-dev/cargo-packager) for desktop packaging.
 The repository config lives in [crates/i3rs-app/Packager.toml](../crates/i3rs-app/Packager.toml).
 
+For repeatable local GUI validation and saved macOS permissions, use the separate
+[stable development app](macos-development.md): `bash scripts/build-macos-dev.sh`.
+
 ## Supported Targets
 
 - macOS: `.app` bundle and `.dmg`
