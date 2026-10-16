@@ -531,144 +531,139 @@ fn draw_digital_gauge(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDraw
 }
 
 fn draw_steering_wheel(painter: &egui::Painter, rect: egui::Rect, ctx: &GaugeDrawContext) {
-    let GaugeDrawContext { name, value, .. } = *ctx;
-    let title_font_size = if name.len() > 26 { 10.0 } else { 12.0 };
-    let title_y = rect.min.y + 8.0;
-    let value_y = rect.max.y - 10.0;
-    let center = egui::pos2(rect.center().x, rect.center().y + 8.0);
-    let max_radius_y = ((value_y - 18.0) - (title_y + 18.0)).max(40.0) * 0.5;
-    let radius = rect.width().min(max_radius_y * 2.0).min(rect.height()) * 0.33;
-    let wheel_angle = value.map(|v| -(v as f32).to_radians()).unwrap_or(0.0);
-    let line_color = egui::Color32::from_rgb(246, 246, 248);
-    let shadow_color = egui::Color32::from_rgba_premultiplied(0, 0, 0, 120);
-    let wheel_fill = egui::Color32::from_rgba_premultiplied(255, 255, 255, 10);
-    let value_color = egui::Color32::from_rgb(255, 206, 92);
-    let value_shadow = egui::Color32::from_rgba_premultiplied(0, 0, 0, 150);
-    let rim_stroke = 6.0_f32;
-    let spoke_stroke = 5.0_f32;
+    let GaugeDrawContext {
+        name, unit, value, ..
+    } = *ctx;
+    let style = painter.ctx().global_style();
+    let visuals = &style.visuals;
+    let size = rect.width().min(rect.height());
+    let scale = (size / 200.0).clamp(0.4, 1.5);
+    let text_color = visuals.text_color();
+    let muted_color = visuals.weak_text_color();
+    let accent = if visuals.dark_mode {
+        egui::Color32::from_rgb(255, 204, 80)
+    } else {
+        egui::Color32::from_rgb(145, 85, 0)
+    };
+    let wheel_color = if value.is_some() {
+        visuals.strong_text_color()
+    } else {
+        muted_color
+    };
 
-    let rotate = |point: egui::Vec2| -> egui::Pos2 {
-        let rotated = egui::vec2(
-            point.x * wheel_angle.cos() - point.y * wheel_angle.sin(),
-            point.x * wheel_angle.sin() + point.y * wheel_angle.cos(),
-        );
-        center + rotated
-    };
-    let map_path = |points: &[(f32, f32)], offset: egui::Vec2| -> Vec<egui::Pos2> {
-        points
-            .iter()
-            .map(|&(x, y)| rotate(egui::vec2(x * radius, y * radius) + offset))
-            .collect()
-    };
-    let draw_path = |points: &[(f32, f32)]| {
-        painter.add(egui::Shape::line(
-            map_path(points, egui::vec2(1.0, 1.0)),
-            egui::Stroke::new(spoke_stroke + 1.0_f32, shadow_color),
+    // Reserve separate bands for the title, wheel and readout, even in small tiles.
+    let mut title = egui::text::LayoutJob::simple(
+        name.to_owned(),
+        egui::FontId::proportional((12.0 * scale).max(10.0)),
+        text_color,
+        (rect.width() - 12.0 * scale).max(1.0),
+    );
+    title.wrap.max_rows = 1;
+    title.wrap.break_anywhere = true;
+    let title = painter.layout_job(title);
+    let title_top = rect.top() + 5.0 * scale;
+    painter.galley(
+        egui::pos2(rect.center().x - title.size().x * 0.5, title_top),
+        title.clone(),
+        text_color,
+    );
+
+    let readout_bottom = rect.bottom() - 18.0 * scale;
+    let readout_size = (24.0 * scale).max(14.0);
+    let wheel_top = title_top + title.size().y + 12.0 * scale;
+    let wheel_bottom = readout_bottom - readout_size - 9.0 * scale;
+    let radius = ((wheel_bottom - wheel_top) * 0.5).min(rect.width() * 0.5 - 12.0 * scale);
+    if radius <= 0.0 {
+        return;
+    }
+    let center = egui::pos2(rect.center().x, (wheel_top + wheel_bottom) * 0.5);
+    let rim_width = (radius * 0.13).max(2.0);
+
+    // Preserve the existing positive/anticlockwise convention. Display-unit
+    // preferences can supply radians, so use the matching angle for rotation.
+    let radians = unit.trim().eq_ignore_ascii_case("rad");
+    let angle = value.map(|v| if radians { v } else { v.to_radians() });
+    let rotation = egui::emath::Rot2::from_angle(-angle.unwrap_or(0.0) as f32);
+    let rotate = |x: f32, y: f32| center + rotation * egui::vec2(x, y) * radius;
+
+    // A fixed index at twelve o'clock makes small changes from center visible.
+    painter.line_segment(
+        [
+            center - egui::vec2(0.0, radius + 9.0 * scale),
+            center - egui::vec2(0.0, radius + 5.0 * scale),
+        ],
+        egui::Stroke::new(2.0 * scale, muted_color),
+    );
+    painter.circle_filled(center, radius, visuals.faint_bg_color);
+
+    for spoke in [
+        [(-0.98, -0.10), (-0.98, 0.12), (-0.16, 0.18), (-0.16, -0.13)],
+        [(0.16, -0.13), (0.16, 0.18), (0.98, 0.12), (0.98, -0.10)],
+        [(-0.15, 0.12), (0.15, 0.12), (0.10, 0.98), (-0.10, 0.98)],
+    ] {
+        painter.add(egui::Shape::convex_polygon(
+            spoke.iter().map(|&(x, y)| rotate(x, y)).collect(),
+            wheel_color,
+            egui::Stroke::NONE,
         ));
+    }
+    painter.circle_stroke(center, radius, egui::Stroke::new(rim_width, wheel_color));
+    painter.circle_filled(center, radius * 0.24, visuals.panel_fill);
+    painter.circle_stroke(
+        center,
+        radius * 0.24,
+        egui::Stroke::new((radius * 0.035).max(1.0), wheel_color),
+    );
+
+    // The contrasting rim stripe turns with the wheel; text stays upright.
+    if value.is_some() {
+        let stripe = (0..=8)
+            .map(|i| {
+                let a = -std::f32::consts::FRAC_PI_2 + (i as f32 / 8.0 - 0.5) * 0.18;
+                rotate(a.cos(), a.sin())
+            })
+            .collect();
         painter.add(egui::Shape::line(
-            map_path(points, egui::Vec2::ZERO),
-            egui::Stroke::new(spoke_stroke, line_color),
+            stripe,
+            egui::Stroke::new(rim_width + 1.0, accent),
         ));
+    }
+
+    let value_text = match value {
+        Some(v) if radians => format!("{v:+.2} rad"),
+        Some(v) => format!("{v:+.1}°"),
+        None => "—".into(),
     };
-
-    painter.circle_filled(center, radius * 0.8, wheel_fill);
-    painter.circle_stroke(
-        center + egui::vec2(1.0, 1.0),
-        radius,
-        egui::Stroke::new(rim_stroke + 1.0_f32, shadow_color),
-    );
-    painter.circle_stroke(center, radius, egui::Stroke::new(rim_stroke, line_color));
-    painter.circle_stroke(
-        center + egui::vec2(1.0, 1.0),
-        radius * 0.83,
-        egui::Stroke::new(rim_stroke + 1.0_f32, shadow_color),
-    );
-    painter.circle_stroke(
-        center,
-        radius * 0.83,
-        egui::Stroke::new(rim_stroke, line_color),
-    );
-
-    let top_spoke = [
-        (-0.78, -0.20),
-        (-0.56, -0.18),
-        (-0.38, -0.17),
-        (-0.21, -0.18),
-        (-0.10, -0.25),
-        (0.0, -0.28),
-        (0.10, -0.25),
-        (0.21, -0.18),
-        (0.38, -0.17),
-        (0.56, -0.18),
-        (0.78, -0.20),
-    ];
-    let left_spoke = [
-        (-0.79, -0.02),
-        (-0.62, 0.03),
-        (-0.46, 0.08),
-        (-0.30, 0.14),
-        (-0.18, 0.22),
-        (-0.10, 0.34),
-        (-0.08, 0.52),
-        (-0.06, 0.79),
-    ];
-    let right_spoke = [
-        (0.79, -0.02),
-        (0.62, 0.03),
-        (0.46, 0.08),
-        (0.30, 0.14),
-        (0.18, 0.22),
-        (0.10, 0.34),
-        (0.08, 0.52),
-        (0.06, 0.79),
-    ];
-
-    draw_path(&top_spoke);
-    draw_path(&left_spoke);
-    draw_path(&right_spoke);
-
-    let hub_radius = radius * 0.16;
-    painter.circle_filled(
-        center,
-        hub_radius * 0.92,
-        egui::Color32::from_rgba_premultiplied(0, 0, 0, 120),
-    );
-    painter.circle_stroke(
-        center + egui::vec2(1.0, 1.0),
-        hub_radius,
-        egui::Stroke::new(rim_stroke + 1.0_f32, shadow_color),
-    );
-    painter.circle_stroke(
-        center,
-        hub_radius,
-        egui::Stroke::new(rim_stroke, line_color),
-    );
-
-    // Name
-    painter.text(
-        egui::pos2(rect.center().x, title_y),
-        egui::Align2::CENTER_TOP,
-        name,
-        egui::FontId::proportional(title_font_size),
-        egui::Color32::LIGHT_GRAY,
-    );
-
-    // Value text
-    let value_text = value
-        .map(|v| format!("{:.1}\u{00B0}", v))
-        .unwrap_or_else(|| "---".into());
-    painter.text(
-        egui::pos2(rect.center().x + 1.0, value_y + 1.0),
-        egui::Align2::CENTER_BOTTOM,
-        &value_text,
-        egui::FontId::monospace(13.5),
-        value_shadow,
-    );
-    painter.text(
-        egui::pos2(rect.center().x, value_y),
-        egui::Align2::CENTER_BOTTOM,
+    let value_color = if value.is_some() { accent } else { muted_color };
+    let mut readout = egui::text::LayoutJob::simple(
         value_text,
-        egui::FontId::monospace(13.5),
+        egui::FontId::monospace(readout_size),
         value_color,
+        (rect.width() - 8.0 * scale).max(1.0),
+    );
+    readout.wrap.max_rows = 1;
+    readout.wrap.break_anywhere = true;
+    let readout = painter.layout_job(readout);
+    painter.galley(
+        egui::pos2(
+            rect.center().x - readout.size().x * 0.5,
+            readout_bottom - readout.size().y,
+        ),
+        readout,
+        value_color,
+    );
+
+    let direction = match angle {
+        Some(a) if a.abs() < 0.05_f64.to_radians() => "Centered",
+        Some(a) if a > 0.0 => "Left",
+        Some(_) => "Right",
+        None => "No reading",
+    };
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 3.0 * scale),
+        egui::Align2::CENTER_BOTTOM,
+        direction,
+        egui::FontId::proportional((11.0 * scale).max(9.0)),
+        text_color,
     );
 }
