@@ -31,6 +31,9 @@ pollster = "1.0.1"
 log = "0.4.29"
 js-sys = "0.3.94"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tempfile = "3.27.0"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2.117"
 wasm-bindgen-futures = "0.4.67"

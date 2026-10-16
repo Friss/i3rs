@@ -368,12 +368,51 @@ fn write_preferences(path: &std::path::Path, preferences: &AppPreferences) -> Re
         .map_err(|e| format!("Failed to serialize preferences: {e}"))?;
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&temporary, json).map_err(|e| format!("Failed to write preferences: {e}"))?;
+    // Rust's Windows implementation uses MoveFileExW with MOVEFILE_REPLACE_EXISTING,
+    // so the same rename replaces an existing preferences file on all native targets.
     std::fs::rename(&temporary, path).map_err(|e| format!("Failed to replace preferences: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn repeated_preference_saves_replace_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("i3rs").join("preferences.json");
+        let mut preferences = AppPreferences::default();
+
+        write_preferences(&path, &preferences).unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+
+        preferences.theme = ThemeChoice::Dark;
+        preferences.options.language = Language::Japanese;
+        preferences.options.font_size = 23.;
+        preferences.options.shortcuts[0].key = "F8".into();
+        preferences
+            .channel_preferences
+            .insert("Engine Speed".into(), ChannelPreference::default());
+        write_preferences(&path, &preferences).unwrap();
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(updated, original);
+        let restored: AppPreferences = serde_json::from_str(&updated).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&preferences).unwrap()
+        );
+
+        // A third, shorter save also replaces the file without stale JSON bytes.
+        preferences = AppPreferences::default();
+        write_preferences(&path, &preferences).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
     #[test]
     fn old_preferences_migrate_and_all_shortcuts_are_valid() {
         let old: AppPreferences =

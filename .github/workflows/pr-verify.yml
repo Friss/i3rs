@@ -100,6 +100,10 @@ jobs:
         if: ${{ !matrix.web }}
         run: cargo build --workspace --all-targets
 
+      - name: Test native preference persistence
+        if: ${{ !matrix.web }}
+        run: cargo test -p i3rs-app --lib preferences::tests
+
       - name: Build web bundle
         if: ${{ matrix.web }}
         working-directory: crates/i3rs-app
