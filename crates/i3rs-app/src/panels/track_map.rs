@@ -29,6 +29,7 @@ pub struct TrackMapPanel {
     track_data: Option<Arc<TrackData>>,
     /// Channel index for rainbow coloring (None = solid color).
     pub color_channel_idx: Option<usize>,
+    pub requested_color: Option<String>,
     /// Cached per-sample RGBA colors.
     cached_colors: Option<Arc<[[u8; 4]]>>,
     cached_color_range: Option<(f64, f64)>,
@@ -47,6 +48,7 @@ pub struct TrackMapPanel {
     color_filter: String,
     /// Whether this panel is currently in a popped-out OS window.
     pub is_popped_out: bool,
+    pub window: crate::workspace::WorksheetWindow,
     /// Set by the "Pop Out" button; consumed by App to move panel to its own window.
     pub pop_out_requested: bool,
     /// Set by the "Dock" button or window close; consumed by App to move panel back to dock.
@@ -124,6 +126,7 @@ impl TrackMapPanel {
             status: None,
             track_data: None,
             color_channel_idx: None,
+            requested_color: None,
             cached_colors: None,
             cached_color_range: None,
             color_channel_name: String::new(),
@@ -137,6 +140,10 @@ impl TrackMapPanel {
             annotation_cache: None,
             color_filter: String::new(),
             is_popped_out: false,
+            window: crate::workspace::WorksheetWindow {
+                size: [800., 600.],
+                ..Default::default()
+            },
             pop_out_requested: false,
             dock_requested: false,
             home_worksheet: 0,
@@ -156,6 +163,18 @@ impl TrackMapPanel {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, shared: &mut SharedState) {
         let _perf = crate::perf_metrics::scope("track-map draw");
+        if let Some(reference) = &self.requested_color {
+            self.color_channel_idx = match shared.resolve_analysis_reference(reference) {
+                i3rs_core::ChannelResolution::Resolved {
+                    key: i3rs_core::ChannelKey::Physical(i),
+                    ..
+                } => Some(i),
+                _ => None,
+            };
+            if self.color_channel_idx.is_none() {
+                ui.weak(format!("Colour channel unavailable: {reference}"));
+            }
+        }
 
         // If popped out, handle OS window close → dock back
         if self.is_popped_out && ui.input(|i| i.viewport().close_requested()) {
@@ -552,6 +571,7 @@ impl TrackMapPanel {
                         .selectable_value(&mut self.color_channel_idx, None, "None")
                         .clicked()
                     {
+                        self.requested_color = None;
                         self.invalidate_color_cache();
                         self.color_filter.clear();
                     }
@@ -572,6 +592,7 @@ impl TrackMapPanel {
                                 .selectable_value(&mut self.color_channel_idx, Some(i), label)
                                 .clicked()
                             {
+                                self.requested_color = Some(ch.name.clone());
                                 self.invalidate_color_cache();
                                 self.color_filter.clear();
                             }

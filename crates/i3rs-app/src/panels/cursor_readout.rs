@@ -25,6 +25,170 @@ pub fn show(ui: &mut egui::Ui, shared: &mut SharedState) {
         ui.weak(format!("{} · {:?}", kind.label(), selection.trust));
     }
     let time = shared.cursor_time;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(time.is_some(), egui::Button::new("Set cursor B"))
+            .clicked()
+        {
+            shared.measurement_cursor = time;
+        }
+        if ui.small_button("Clear B").clicked() {
+            shared.measurement_cursor = None;
+        }
+    });
+    if let (Some(a), Some(b)) = (time, shared.measurement_cursor) {
+        ui.label(format!("A {a:.3} s · B {b:.3} s · A − B {:+.3} s", a - b));
+        if let Some(axis) = &shared.distance_axis_cache
+            && let (Some(da), Some(db)) = (
+                i3rs_core::sample_at_time(&axis.data, axis.freq, a),
+                i3rs_core::sample_at_time(&axis.data, axis.freq, b),
+            )
+        {
+            ui.label(format!("Distance A − B: {:+.1} m", da - db));
+        }
+        ui.collapsing("Interval measurements", |ui| {
+            for info in &shared.display_channel_registry {
+                let window = i3rs_core::sample_window_for_time(
+                    info.freq,
+                    info.data.len(),
+                    a.min(b),
+                    a.max(b),
+                );
+                let samples: Vec<_> = info.data[window.start_sample..window.end_sample]
+                    .iter()
+                    .map(|v| info.transform_value(*v))
+                    .collect();
+                let stats = i3rs_core::compute_stats(&samples, Some(info.freq));
+                let read = |t| {
+                    i3rs_core::channels::sample_with_policy(
+                        &info.data,
+                        info.freq,
+                        t,
+                        info.interpolation,
+                    )
+                    .map(|v| info.transform_value(v))
+                };
+                let delta = read(a).zip(read(b)).map(|(x, y)| x - y);
+                let number = |v: Option<f64>| v.map_or_else(|| "—".into(), |v| format!("{v:.3}"));
+                ui.collapsing(
+                    format!(
+                        "{} · Δ {} {} · {} / {} finite samples",
+                        info.name,
+                        number(delta),
+                        info.unit,
+                        stats.finite_count,
+                        stats.sample_count
+                    ),
+                    |ui| {
+                        ui.label(format!(
+                            "A {} · B {} · min {} · max {}",
+                            number(read(a)),
+                            number(read(b)),
+                            number(stats.min),
+                            number(stats.max)
+                        ));
+                        let pair = read(a).zip(read(b));
+                        ui.label(format!(
+                            "cursor average {} {} · cursor slope {} {}/s",
+                            number(pair.map(|(x, y)| (x + y) / 2.)),
+                            info.unit,
+                            number(pair.filter(|_| a != b).map(|(x, y)| (x - y) / (a - b))),
+                            info.unit
+                        ));
+                        ui.label(format!(
+                            "mean {} · σ {} · RMS {} · integral {} {}·s",
+                            number(stats.mean),
+                            number(stats.stddev),
+                            number(stats.rms),
+                            number(stats.integral),
+                            info.unit
+                        ));
+                    },
+                );
+            }
+        });
+    }
+    if let (Some(a), Some(b)) = (time, shared.measurement_cursor) {
+        let channels: Vec<_> = shared
+            .display_channel_registry
+            .iter()
+            .filter_map(|info| {
+                let mut pc = super::utils::create_plotted_channel(info.channel_id, shared, 0)?;
+                pc.display_scale = info.display_scale;
+                pc.display_offset = info.display_offset;
+                pc.display_unit = Some(info.unit.clone());
+                Some(pc)
+            })
+            .collect();
+        let slots: Vec<_> = channels.iter().collect();
+        let overlays = crate::comparison::overlay_populations_in_range(
+            shared,
+            &slots,
+            &Default::default(),
+            (a.min(b), a.max(b)),
+        );
+        ui.collapsing("Overlay interval measurements", |ui| {
+            for overlay in overlays {
+                ui.colored_label(overlay.color, overlay.label);
+                let (oa, ob) = if a < b {
+                    (overlay.range.0, overlay.range.1)
+                } else {
+                    (overlay.range.1, overlay.range.0)
+                };
+                for info in overlay.channels {
+                    let w = i3rs_core::sample_window_for_time(
+                        info.freq,
+                        info.data.len(),
+                        overlay.range.0,
+                        overlay.range.1,
+                    );
+                    let samples: Vec<_> = info.data[w.start_sample..w.end_sample]
+                        .iter()
+                        .map(|v| info.transform_value(*v))
+                        .collect();
+                    let s = i3rs_core::compute_stats(&samples, Some(info.freq));
+                    let read = |t| {
+                        i3rs_core::channels::sample_with_policy(
+                            &info.data,
+                            info.freq,
+                            t,
+                            info.interpolation,
+                        )
+                        .map(|v| info.transform_value(v))
+                    };
+                    let pair = read(oa).zip(read(ob));
+                    let number =
+                        |v: Option<f64>| v.map_or_else(|| "—".into(), |v| format!("{v:.3}"));
+                    ui.collapsing(
+                        format!("{} · {} finite samples", info.name, s.finite_count),
+                        |ui| {
+                            ui.label(format!(
+                                "A {} · B {} · Δ {} · cursor average {} {} · cursor slope {} {}/s",
+                                number(read(oa)),
+                                number(read(ob)),
+                                number(pair.map(|(x, y)| x - y)),
+                                number(pair.map(|(x, y)| (x + y) / 2.)),
+                                info.unit,
+                                number(pair.filter(|_| oa != ob).map(|(x, y)| (x - y) / (oa - ob))),
+                                info.unit
+                            ));
+                            ui.label(format!(
+                                "min {} · max {} · mean {} · σ {} · RMS {} · integral {} {}·s",
+                                number(s.min),
+                                number(s.max),
+                                number(s.mean),
+                                number(s.stddev),
+                                number(s.rms),
+                                number(s.integral),
+                                info.unit
+                            ));
+                        },
+                    );
+                }
+            }
+        });
+    }
+
     ui.label(time.map_or_else(
         || "Hover a graph for cursor values".into(),
         |t| format!("Time: {t:.3} s"),

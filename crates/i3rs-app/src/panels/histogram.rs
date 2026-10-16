@@ -16,6 +16,7 @@ use super::distribution::ColorBands;
 
 /// Cached histogram bin counts for a single channel.
 struct HistogramBins {
+    freq: u16,
     min: f64,
     bin_width: f64,
     counts: Vec<u64>,
@@ -42,6 +43,8 @@ impl HistogramChannelFingerprint {
 
 #[derive(PartialEq, Eq)]
 struct HistogramFingerprint {
+    overlays: String,
+    filter: String,
     channels: Vec<HistogramChannelFingerprint>,
     zoom_key: Option<(u64, u64)>,
     bin_count: usize,
@@ -53,12 +56,17 @@ struct HistogramFingerprint {
 }
 
 struct HistogramCache {
+    bounds: Vec<(f64, f64)>,
     fingerprint: HistogramFingerprint,
     /// One entry per chart: (bins, color, label)
     charts: Vec<(HistogramBins, egui::Color32, String)>,
 }
 
 pub struct HistogramPanel {
+    pub band_presentation: super::distribution::BandPresentation,
+    pub seconds: bool,
+    pub bin_settings: HistogramBinSettings,
+    pub filter: super::distribution::ComponentFilter,
     pub id: u64,
     pub title: String,
     pub channels: Vec<PlottedChannel>,
@@ -81,6 +89,10 @@ pub struct HistogramPanel {
 impl HistogramPanel {
     pub fn new(id: u64, title: impl Into<String>) -> Self {
         Self {
+            band_presentation: Default::default(),
+            seconds: false,
+            bin_settings: Default::default(),
+            filter: Default::default(),
             id,
             title: title.into(),
             channels: Vec::new(),
@@ -176,6 +188,12 @@ impl HistogramPanel {
                 self.color_channel = None;
             }
             ui.checkbox(&mut self.percentage, "Percent");
+            if ui.checkbox(&mut self.seconds, "Seconds").changed() && self.seconds {
+                self.percentage = false;
+            }
+            if self.percentage {
+                self.seconds = false;
+            }
             ui.separator();
             ui.checkbox(&mut self.lock_x_range, "Lock X");
             if self.lock_x_range {
@@ -251,6 +269,27 @@ impl HistogramPanel {
         });
         ui.separator();
 
+        self.band_presentation.controls(ui, self.color_bands);
+        self.filter.controls(ui);
+        let filter = self.filter.prepare(ui, shared);
+
+        ui.horizontal_wrapped(|ui| {
+            let mut manual = self.bin_settings.width.is_some();
+            if ui.checkbox(&mut manual, "Bin width").changed() {
+                self.bin_settings.width = manual.then_some(100.);
+            }
+            if let Some(width) = &mut self.bin_settings.width {
+                ui.add(egui::DragValue::new(width).range(0.000001..=1e9));
+            }
+            ui.checkbox(&mut self.bin_settings.centered, "Centred X bins");
+            for (policy, name) in [
+                (OverflowPolicy::Exclude, "Exclude overflow"),
+                (OverflowPolicy::Clamp, "Clamp overflow"),
+                (OverflowPolicy::Separate, "Overflow bins"),
+            ] {
+                ui.selectable_value(&mut self.bin_settings.overflow, policy, name);
+            }
+        });
         // Plot histograms
         let plot = Plot::new(format!("histogram_{}", self.id))
             .legend(Legend::default())
@@ -258,6 +297,8 @@ impl HistogramPanel {
             .x_axis_label("Value")
             .y_axis_label(if self.percentage {
                 "Percent of samples"
+            } else if self.seconds {
+                "Seconds"
             } else {
                 "Count"
             });
@@ -284,8 +325,55 @@ impl HistogramPanel {
             (self.lock_x_range && self.x_max > self.x_min).then_some((self.x_min, self.x_max));
 
         // Cache histogram computation
-        let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
+        let (t0, t1) = shared.analysis_range();
+        let slots: Vec<_> = self
+            .channels
+            .iter()
+            .chain(self.color_channel.iter())
+            .collect();
+        let overlays = crate::comparison::overlay_populations(shared, &slots, &self.filter);
+        let zoom_key = Some((t0.to_bits(), t1.to_bits()));
         let fingerprint = HistogramFingerprint {
+            overlays: format!(
+                "{:?}",
+                overlays
+                    .iter()
+                    .map(|o| (
+                        &o.label,
+                        o.range,
+                        &o.filter.trusted_ranges,
+                        o.filter.constant,
+                        o.filter.gate.as_ref().map(|g| (
+                            g.data.as_ptr() as usize,
+                            g.freq,
+                            g.interpolation
+                        )),
+                        o.channels
+                            .iter()
+                            .map(|c| (
+                                c.data.as_ptr() as usize,
+                                c.freq,
+                                c.display_scale,
+                                c.display_offset,
+                                c.interpolation
+                            ))
+                            .collect::<Vec<_>>()
+                    ))
+                    .collect::<Vec<_>>()
+            ),
+            filter: format!(
+                "{}:{:?}:{:?}",
+                filter.key,
+                self.bin_settings,
+                self.channels
+                    .iter()
+                    .chain(self.color_channel.iter())
+                    .map(|c| {
+                        let i = build_plotted_channel_info(c, shared);
+                        (i.freq, i.interpolation)
+                    })
+                    .collect::<Vec<_>>()
+            ),
             channels: self
                 .channels
                 .iter()
@@ -313,10 +401,16 @@ impl HistogramPanel {
             .is_none_or(|c| c.fingerprint != fingerprint)
         {
             let mut charts = Vec::new();
+            let mut common_bounds = Vec::new();
             let color_meta = self
                 .color_channel
                 .as_ref()
                 .map(|c| resolve_plotted_channel_display_meta(c, shared));
+            let color_policy = self
+                .color_channel
+                .as_ref()
+                .map(|c| build_plotted_channel_info(c, shared).interpolation)
+                .unwrap_or_default();
             let bands = self.color_channel.as_ref().map(|_| self.color_bands);
             for (ch_idx, pc) in self.channels.iter().enumerate() {
                 let (name, unit, freq, _, _) = resolve_plotted_channel_display_meta(pc, shared);
@@ -334,16 +428,23 @@ impl HistogramPanel {
                 // Share bin edges across the displayed ranges, excluding samples
                 // outside them.
                 let bounds = locked_x_range.unwrap_or_else(|| {
-                    selected_bounds(
-                        &pc.data,
-                        freq,
-                        ranges.iter().map(|(_, range)| *range),
-                        pc.display_scale,
-                        pc.display_offset,
-                    )
+                    let main = ranges
+                        .iter()
+                        .flat_map(|(_, range)| sample_range(pc.data.len(), freq, *range))
+                        .filter(|i| filter.includes(*i as f64 / freq as f64))
+                        .map(|i| transform_channel_value(pc, pc.data[i]));
+                    let comparison = overlays.iter().flat_map(|overlay| {
+                        let info = &overlay.channels[ch_idx];
+                        sample_range(info.data.len(), info.freq, overlay.range)
+                            .filter(move |i| overlay.filter.includes(*i as f64 / info.freq as f64))
+                            .map(move |i| info.transform_value(info.data[i]))
+                    });
+                    finite_bounds(main.chain(comparison))
                 });
+                common_bounds.push(bounds);
                 for (lap_idx, (lap_name, range)) in ranges.into_iter().enumerate() {
                     let samples: Vec<_> = sample_range(pc.data.len(), freq, range)
+                        .filter(|i| filter.includes(*i as f64 / freq as f64))
                         .map(|i| {
                             let value = transform_channel_value(pc, pc.data[i]);
                             let band_value = self
@@ -351,16 +452,28 @@ impl HistogramPanel {
                                 .as_ref()
                                 .zip(color_meta.as_ref())
                                 .and_then(|(c, meta)| {
-                                    interp_at_time(&c.data, meta.2, i as f64 / freq as f64)
-                                        .map(|v| transform_channel_value(c, v))
+                                    i3rs_core::channels::sample_with_policy(
+                                        &c.data,
+                                        meta.2,
+                                        i as f64 / freq as f64,
+                                        color_policy,
+                                    )
+                                    .map(|v| transform_channel_value(c, v))
                                 });
                             (value, band_value.unwrap_or(f64::NAN))
                         })
                         .collect();
-                    for (band_idx, bins) in histogram_bins(&samples, self.bin_count, bounds, bands)
-                        .into_iter()
-                        .enumerate()
+                    for (band_idx, mut bins) in histogram_bins_configured(
+                        &samples,
+                        self.bin_count,
+                        bounds,
+                        bands,
+                        self.bin_settings,
+                    )
+                    .into_iter()
+                    .enumerate()
                     {
+                        bins.freq = freq;
                         let count: u64 = bins.counts.iter().sum();
                         let (color, label) = if let Some(bands) = bands {
                             (
@@ -386,14 +499,87 @@ impl HistogramPanel {
                 }
             }
             self.cache = Some(HistogramCache {
+                bounds: common_bounds,
                 fingerprint,
                 charts,
             });
         }
 
+        let mut overlay_charts = Vec::new();
+        for overlay in &overlays {
+            for (i, info) in overlay
+                .channels
+                .iter()
+                .take(self.channels.len())
+                .enumerate()
+            {
+                let bounds = self.cache.as_ref().unwrap().bounds[i];
+                let samples: Vec<_> = sample_range(info.data.len(), info.freq, overlay.range)
+                    .filter(|i| overlay.filter.includes(*i as f64 / info.freq as f64))
+                    .map(|i| {
+                        let color = overlay
+                            .channels
+                            .get(self.channels.len())
+                            .and_then(|c| {
+                                i3rs_core::channels::sample_with_policy(
+                                    &c.data,
+                                    c.freq,
+                                    i as f64 / info.freq as f64,
+                                    c.interpolation,
+                                )
+                                .map(|v| c.transform_value(v))
+                            })
+                            .unwrap_or(f64::NAN);
+                        (info.transform_value(info.data[i]), color)
+                    })
+                    .collect();
+                for (band, mut bins) in histogram_bins_configured(
+                    &samples,
+                    self.bin_count,
+                    bounds,
+                    self.color_channel.as_ref().map(|_| self.color_bands),
+                    self.bin_settings,
+                )
+                .into_iter()
+                .enumerate()
+                {
+                    bins.freq = info.freq;
+                    let count: u64 = bins.counts.iter().sum();
+                    overlay_charts.push((
+                        bins,
+                        overlay.color,
+                        format!(
+                            "{} · {} · {} · {} samples",
+                            overlay.label,
+                            info.name,
+                            if self.color_channel.is_some() {
+                                self.color_bands.label(band)
+                            } else {
+                                String::new()
+                            },
+                            count
+                        ),
+                        band,
+                    ));
+                }
+            }
+        }
+        if !shared.comparisons.overlays.is_empty() {
+            ui.weak(format!("{} comparison populations ready", overlays.len()));
+            if shared
+                .comparisons
+                .sessions
+                .iter()
+                .any(|s| !s.requests.is_empty())
+            {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
         let cached = self.cache.as_ref().unwrap();
 
         let percentage = self.percentage;
+        let seconds = self.seconds;
         let sample_count: u64 = cached.charts.iter().flat_map(|(b, _, _)| &b.counts).sum();
         ui.label(format!("{sample_count} samples"));
         let locked_y_range = if self.lock_y_range {
@@ -403,6 +589,7 @@ impl HistogramPanel {
                 .flat_map(|(bins, _, _)| {
                     bins.counts.iter().zip(&bins.base).map(move |(n, base)| {
                         histogram_height(n + base, bins.denominator, percentage)
+                            / if seconds { bins.freq.max(1) as f64 } else { 1. }
                     })
                 })
                 .fold(0.0_f64, f64::max);
@@ -419,11 +606,43 @@ impl HistogramPanel {
             if let Some((y_min, y_max)) = locked_y_range {
                 plot_ui.set_plot_bounds_y(y_min..=y_max);
             }
-            for (bins, color, name) in &cached.charts {
-                let bars = bins_to_bar_chart(bins, *color, name, self.percentage);
+            for (index, (bins, color, name)) in cached.charts.iter().enumerate() {
+                if self.color_channel.is_some()
+                    && !self
+                        .band_presentation
+                        .visible(index % self.color_bands.len())
+                {
+                    continue;
+                }
+                let color = if self.color_channel.is_some() {
+                    self.band_presentation
+                        .color(self.color_bands, index % self.color_bands.len())
+                } else {
+                    *color
+                };
+                let bars = bins_to_bar_chart(bins, color, name, self.percentage, self.seconds);
                 plot_ui.bar_chart(bars);
             }
 
+            for (bins, color, label, band) in &overlay_charts {
+                if self.color_channel.is_some() && !self.band_presentation.visible(*band) {
+                    continue;
+                }
+                let color = if self.color_channel.is_some() {
+                    self.band_presentation
+                        .color(self.color_bands, *band)
+                        .gamma_multiply(0.5)
+                } else {
+                    *color
+                };
+                plot_ui.bar_chart(bins_to_bar_chart(
+                    bins,
+                    color,
+                    label,
+                    self.percentage,
+                    self.seconds,
+                ));
+            }
             for (name, val, color) in &cursor_values {
                 plot_ui.vline(
                     egui_plot::VLine::new(format!("{}: {:.2}", name, val), *val)
@@ -456,6 +675,7 @@ impl HistogramPanel {
     }
 }
 
+#[cfg(test)]
 fn selected_bounds(
     data: &[f64],
     freq: u16,
@@ -484,20 +704,72 @@ fn finite_bounds(values: impl Iterator<Item = f64>) -> (f64, f64) {
     }
 }
 
+#[cfg(test)]
 fn histogram_bins(
     samples: &[(f64, f64)],
     count: usize,
     bounds: (f64, f64),
     bands: Option<ColorBands>,
 ) -> Vec<HistogramBins> {
+    histogram_bins_configured(
+        samples,
+        count,
+        bounds,
+        bands,
+        HistogramBinSettings::default(),
+    )
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum OverflowPolicy {
+    #[default]
+    Exclude,
+    Clamp,
+    Separate,
+}
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct HistogramBinSettings {
+    pub width: Option<f64>,
+    pub centered: bool,
+    pub overflow: OverflowPolicy,
+}
+fn histogram_bins_configured(
+    samples: &[(f64, f64)],
+    count: usize,
+    bounds: (f64, f64),
+    bands: Option<ColorBands>,
+    settings: HistogramBinSettings,
+) -> Vec<HistogramBins> {
+    let requested_width = settings.width.filter(|w| w.is_finite() && *w > 0.);
+    let count = requested_width
+        .map_or(count, |w| {
+            ((bounds.1 - bounds.0) / w).ceil() as usize + usize::from(settings.centered)
+        })
+        .clamp(1, 500);
+    let width = requested_width.unwrap_or(
+        (bounds.1 - bounds.0)
+            / if settings.centered {
+                count.saturating_sub(1).max(1)
+            } else {
+                count
+            } as f64,
+    );
+    let lower = bounds.0 - if settings.centered { width / 2. } else { 0. };
+    let bounds = (lower, lower + width * count as f64);
+    let extra = if settings.overflow == OverflowPolicy::Separate {
+        2
+    } else {
+        0
+    };
     let count = count.clamp(1, 500);
     let width = (bounds.1 - bounds.0) / count as f64;
     let mut result: Vec<_> = (0..bands.map_or(1, ColorBands::len))
         .map(|_| HistogramBins {
-            min: bounds.0,
+            freq: 1,
+            min: bounds.0 - if extra > 0 { width } else { 0. },
             bin_width: width,
-            counts: vec![0; count],
-            base: vec![0; count],
+            counts: vec![0; count + extra],
+            base: vec![0; count + extra],
             denominator: 0,
         })
         .collect();
@@ -506,15 +778,24 @@ fn histogram_bins(
     }
     let mut total = 0;
     for &(value, color) in samples {
-        if !value.is_finite() || value < bounds.0 || value > bounds.1 {
+        if !value.is_finite()
+            || (settings.overflow == OverflowPolicy::Exclude
+                && (value < bounds.0 || value > bounds.1))
+        {
             continue;
         }
-        let bin = (((value - bounds.0) / width).floor() as usize).min(count - 1);
+        let bin = if extra > 0 && value < bounds.0 {
+            0
+        } else if extra > 0 && value > bounds.1 {
+            count + 1
+        } else {
+            (((value - bounds.0) / width).floor().max(0.) as usize).min(count - 1) + extra / 2
+        };
         let band = bands.map_or(0, |b| b.index(color));
         result[band].counts[bin] += 1;
         total += 1;
     }
-    let mut base = vec![0; count];
+    let mut base = vec![0; count + extra];
     for bins in &mut result {
         bins.denominator = total;
         bins.base.clone_from(&base);
@@ -546,6 +827,7 @@ fn bins_to_bar_chart(
     color: egui::Color32,
     name: &str,
     percentage: bool,
+    seconds: bool,
 ) -> BarChart {
     let bars: Vec<Bar> = bins
         .counts
@@ -555,9 +837,13 @@ fn bins_to_bar_chart(
             let center = bins.min + (i as f64 + 0.5) * bins.bin_width;
             Bar::new(
                 center,
-                histogram_height(count, bins.denominator, percentage),
+                histogram_height(count, bins.denominator, percentage)
+                    / if seconds { bins.freq.max(1) as f64 } else { 1. },
             )
-            .base_offset(histogram_height(bins.base[i], bins.denominator, percentage))
+            .base_offset(
+                histogram_height(bins.base[i], bins.denominator, percentage)
+                    / if seconds { bins.freq.max(1) as f64 } else { 1. },
+            )
             .width(bins.bin_width * 0.9)
             .fill(color)
             .stroke(egui::Stroke::NONE)
@@ -730,5 +1016,64 @@ mod tests {
         let lap_b = histogram_bins(&[(9.0, 0.0)], 2, (0.0, 10.0), None);
         assert_eq!(lap_a[0].counts, [1, 0]);
         assert_eq!(lap_b[0].counts, [0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    #[test]
+    fn width_center_overflow_and_seconds_preserve_population() {
+        let samples = [
+            (-6., 0.),
+            (-5., 0.),
+            (0., 0.),
+            (5., 0.),
+            (10., 0.),
+            (15., 0.),
+            (16., 0.),
+            (f64::NAN, 0.),
+        ];
+        let settings = HistogramBinSettings {
+            width: Some(10.),
+            centered: true,
+            overflow: OverflowPolicy::Separate,
+        };
+        let mut b = histogram_bins_configured(&samples, 20, (0., 10.), None, settings).remove(0);
+        assert_eq!(b.counts, [1, 2, 3, 1]);
+        assert_eq!(b.denominator, 7);
+        b.freq = 2;
+        assert_eq!(b.counts.iter().sum::<u64>() as f64 / b.freq as f64, 3.5);
+        let percent: f64 = b
+            .counts
+            .iter()
+            .map(|n| histogram_height(*n, b.denominator, true))
+            .sum();
+        assert!((percent - 100.).abs() < 1e-10);
+        let b = histogram_bins_configured(
+            &samples,
+            20,
+            (0., 10.),
+            None,
+            HistogramBinSettings {
+                overflow: OverflowPolicy::Clamp,
+                ..settings
+            },
+        )
+        .remove(0);
+        assert_eq!(b.counts, [3, 4]);
+        let b = histogram_bins_configured(
+            &samples,
+            20,
+            (0., 10.),
+            None,
+            HistogramBinSettings {
+                overflow: OverflowPolicy::Exclude,
+                ..settings
+            },
+        )
+        .remove(0);
+        assert_eq!(b.counts, [2, 3]);
+        assert_eq!(b.denominator, 5);
     }
 }

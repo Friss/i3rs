@@ -1,6 +1,7 @@
 //! Shared library entry points for the native and web i3rs app.
 
 mod channel_analysis;
+mod comparison;
 mod recording_analysis;
 
 mod app;

@@ -13,6 +13,10 @@ use crate::panels::utils::{format_enum_value, sample_range, uses_discrete_values
 /// Identifies a channel: either a physical channel from the .ld file or a math channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelId {
+    /// A configured slot whose source is not currently available.
+    Unresolved(usize),
+    /// Portable reference to a W02 constant or W03 generated channel.
+    Analysis(usize),
     /// Index into `LdFile::channels`.
     Physical(usize),
     /// Index into `SharedState::math_channels`.
@@ -38,6 +42,8 @@ pub enum ScaleMode {
 
 /// A loaded channel's cached display data.
 pub struct PlottedChannel {
+    pub portable_source_unit: Option<String>,
+    pub requested_reference: Option<(String, bool)>,
     pub channel_id: ChannelId,
     pub color: egui::Color32,
     pub data: Arc<[f64]>,
@@ -416,8 +422,14 @@ impl ReportCache {
     }
 }
 
+type AnalysisConstantCache = HashMap<usize, (u64, usize, Arc<[f64]>)>;
+
 /// State shared across all panels.
 pub struct SharedState {
+    analysis_constant_cache: RefCell<AnalysisConstantCache>,
+    pub unresolved_references: RefCell<Vec<(String, bool)>>,
+    pub comparisons: crate::comparison::Comparisons,
+    pub measurement_cursor: Option<f64>,
     pub session_id: u64,
     pub ld_file: Option<Arc<LdFile>>,
     pub ld_path: Option<PathBuf>,
@@ -497,8 +509,82 @@ pub struct SharedState {
 }
 
 impl SharedState {
+    pub fn unresolved_channel(&self, name: &str, is_math: bool) -> ChannelId {
+        let mut refs = self.unresolved_references.borrow_mut();
+        let index = refs
+            .iter()
+            .position(|r| r.0 == name && r.1 == is_math)
+            .unwrap_or_else(|| {
+                refs.push((name.into(), is_math));
+                refs.len() - 1
+            });
+        ChannelId::Unresolved(index)
+    }
+    pub fn analysis_channel(&self, name: &str) -> ChannelId {
+        let ChannelId::Unresolved(index) = self.unresolved_channel(name, false) else {
+            unreachable!()
+        };
+        ChannelId::Analysis(index)
+    }
+    pub fn analysis_series(&self, index: usize) -> Option<(Arc<[f64]>, u16)> {
+        let reference = self.unresolved_references.borrow().get(index)?.0.clone();
+        match self.resolve_analysis_reference(&reference) {
+            i3rs_core::ChannelResolution::Resolved {
+                key: i3rs_core::ChannelKey::Constant(i),
+                ..
+            } => {
+                let c = &self.channel_settings.constants[i];
+                let len = self.data_duration.unwrap_or(0.).ceil().max(0.) as usize;
+                let mut cache = self.analysis_constant_cache.borrow_mut();
+                let entry = cache
+                    .entry(i)
+                    .or_insert_with(|| (c.value.to_bits(), len, Arc::from(vec![c.value; len])));
+                if entry.0 != c.value.to_bits() || entry.1 != len {
+                    *entry = (c.value.to_bits(), len, Arc::from(vec![c.value; len]));
+                }
+                Some((entry.2.clone(), 1))
+            }
+            i3rs_core::ChannelResolution::Resolved {
+                key: i3rs_core::ChannelKey::Generated(name),
+                ..
+            } => {
+                self.request_track_data_build();
+                match name.as_str() {
+                    "Corr Speed" => self.correction_speed.clone(),
+                    "Corr GPS Speed" => self.correction_gps_speed.clone(),
+                    _ => self.correction_distance.clone(),
+                }
+            }
+            _ => None,
+        }
+    }
+    pub fn resolve_slot(&self, name: &str, is_math: bool) -> Option<ChannelId> {
+        if is_math {
+            return self.resolved_math_index(name).map(ChannelId::Math);
+        }
+        match self.resolve_analysis_reference(name) {
+            i3rs_core::ChannelResolution::Resolved {
+                key: i3rs_core::ChannelKey::Physical(i),
+                ..
+            } => Some(ChannelId::Physical(i)),
+            i3rs_core::ChannelResolution::Resolved {
+                key: i3rs_core::ChannelKey::Derived(id),
+                ..
+            } => self.math_channel_index_by_id(id).map(ChannelId::Math),
+            i3rs_core::ChannelResolution::Resolved {
+                key: i3rs_core::ChannelKey::Constant(_) | i3rs_core::ChannelKey::Generated(_),
+                ..
+            } => Some(self.analysis_channel(name)),
+            _ => None,
+        }
+    }
+
     pub fn new() -> Self {
         Self {
+            analysis_constant_cache: Default::default(),
+            unresolved_references: Default::default(),
+            comparisons: Default::default(),
+            measurement_cursor: None,
             session_id: 0,
             recording_analyses: Default::default(),
             correction_gps_speed: None,
@@ -573,6 +659,7 @@ impl SharedState {
     }
 
     pub fn invalidate_session_caches(&mut self) {
+        self.analysis_constant_cache.borrow_mut().clear();
         self.correction_gps_speed = None;
         self.correction_speed = None;
         self.correction_distance = None;

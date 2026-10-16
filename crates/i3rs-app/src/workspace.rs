@@ -13,12 +13,8 @@ use crate::panels::histogram::HistogramPanel;
 use crate::panels::mixture_map::MixtureMapPanel;
 use crate::panels::scatter::ScatterPanel;
 use crate::panels::track_map::TrackMapPanel;
-use crate::panels::utils::{
-    apply_channel_preferences, apply_math_display_defaults, create_plotted_channel,
-};
-use crate::state::{
-    CHANNEL_COLORS, ChannelId, GraphMode, GraphXAxis, SharedState, compute_channel_stats,
-};
+use crate::panels::utils::create_plotted_channel;
+use crate::state::{CHANNEL_COLORS, ChannelId, GraphMode, GraphXAxis, SharedState};
 
 // ---------------------------------------------------------------------------
 // Serializable workspace types
@@ -26,6 +22,10 @@ use crate::state::{
 
 #[derive(Serialize, Deserialize)]
 pub struct WorkspaceFile {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub comparisons: Option<ComparisonConfig>,
     pub worksheets: Vec<WorksheetConfig>,
     pub active_worksheet: usize,
     pub last_file_path: Option<String>,
@@ -54,12 +54,34 @@ pub struct ChannelAliasConfig {
 
 #[derive(Serialize, Deserialize)]
 pub struct WorksheetConfig {
+    #[serde(default)]
+    pub dock: Option<DockState<usize>>,
+    #[serde(default)]
+    pub window: WorksheetWindow,
     pub name: String,
     pub panels: Vec<PanelConfig>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorksheetWindow {
+    pub detached: bool,
+    pub size: [f32; 2],
+    pub position: Option<[f32; 2]>,
+}
+impl Default for WorksheetWindow {
+    fn default() -> Self {
+        Self {
+            detached: false,
+            size: [1000., 700.],
+            position: None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum PanelConfig {
+    Calculations(CalculationsConfig),
     Graph(GraphPanelConfig),
     TrackMap(TrackMapPanelConfig),
     ChannelBrowser,
@@ -73,7 +95,30 @@ pub enum PanelConfig {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct CalculationsConfig {
+    #[serde(default = "default_velocity_bins")]
+    pub suspension_bins: usize,
+    #[serde(default)]
+    pub suspension_output: crate::panels::calculations::DistributionOutput,
+    #[serde(default)]
+    pub suspension_line: bool,
+    pub id: u64,
+    pub title: String,
+    pub channels: Vec<AnalysisChannelConfig>,
+    pub filter: crate::panels::distribution::ComponentFilter,
+    pub mode: crate::panels::calculations::CalculationMode,
+    pub interval_seconds: f64,
+    pub suspension: i3rs_core::distribution::SuspensionSettings,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct GraphPanelConfig {
+    #[serde(default)]
+    pub channels: Vec<GraphChannelSlot>,
+    #[serde(default)]
+    pub view: crate::comparison::GraphView,
+    #[serde(default)]
+    pub unresolved_channels: Vec<GraphChannelSlot>,
     #[serde(default)]
     pub full_resolution: bool,
     pub id: u64,
@@ -110,7 +155,7 @@ fn default_graph_embedded_gauge_height() -> f32 {
     176.0
 }
 
-fn gauge_style_to_string(style: GaugeStyle) -> &'static str {
+pub(crate) fn gauge_style_to_string(style: GaugeStyle) -> &'static str {
     match style {
         GaugeStyle::Analog => "Analog",
         GaugeStyle::Bar => "Bar",
@@ -119,7 +164,7 @@ fn gauge_style_to_string(style: GaugeStyle) -> &'static str {
     }
 }
 
-fn gauge_style_from_string(style: &str) -> GaugeStyle {
+pub(crate) fn gauge_style_from_string(style: &str) -> GaugeStyle {
     match style {
         "Bar" => GaugeStyle::Bar,
         "Digital" => GaugeStyle::Digital,
@@ -128,8 +173,26 @@ fn gauge_style_from_string(style: &str) -> GaugeStyle {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
+pub struct ComparisonConfig {
+    pub main_lap: Option<usize>,
+    pub overlays: Vec<GraphOverlayConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GraphChannelSlot {
+    pub channel: AnalysisChannelConfig,
+    pub tile_group: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct GraphOverlayConfig {
+    #[serde(default)]
+    pub gps_align: bool,
+    #[serde(default = "default_track_annotations")]
+    pub visible: bool,
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
     pub file_path: Option<String>,
     pub lap_index: usize,
     pub manual_offset: f64,
@@ -138,12 +201,18 @@ pub struct GraphOverlayConfig {
 
 #[derive(Serialize, Deserialize)]
 pub struct GraphGaugeConfig {
+    #[serde(default)]
+    pub channel: Option<AnalysisChannelConfig>,
+    #[serde(default)]
+    pub settings: crate::panels::gauge::GaugeSettings,
+    #[serde(default)]
+    pub transform: Option<GraphDisplayTransformConfig>,
     pub channel_name: String,
     pub is_math: bool,
     pub style: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct GraphDisplayTransformConfig {
     pub scale: f64,
     pub offset: f64,
@@ -228,20 +297,31 @@ pub struct ReportPanelConfig {
     pub channels: Vec<AnalysisChannelConfig>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct AnalysisChannelConfig {
+    #[serde(default)]
+    pub source_unit: Option<String>,
+    /// Legacy slots without explicit transforms inherit current channel defaults.
+    #[serde(default)]
+    pub inherit_display: bool,
     pub name: String,
     pub is_math: bool,
     pub color: [u8; 3],
     pub transform: GraphDisplayTransformConfig,
 }
 
-fn save_analysis_channel(
+pub(crate) fn save_analysis_channel(
     pc: &crate::state::PlottedChannel,
     shared: &SharedState,
 ) -> Option<AnalysisChannelConfig> {
-    let (name, is_math) = channel_name_and_kind(pc.channel_id, shared)?;
+    let (name, is_math) = saved_channel_identity(pc, shared)?;
     Some(AnalysisChannelConfig {
+        source_unit: if matches!(pc.channel_id, ChannelId::Unresolved(_)) {
+            pc.portable_source_unit.clone()
+        } else {
+            Some(crate::panels::utils::resolve_channel_meta(pc.channel_id, shared).1)
+        },
+        inherit_display: false,
         name,
         is_math,
         color: [pc.color.r(), pc.color.g(), pc.color.b()],
@@ -249,7 +329,7 @@ fn save_analysis_channel(
     })
 }
 
-fn load_analysis_channel(
+pub(crate) fn load_analysis_channel(
     c: &AnalysisChannelConfig,
     shared: &SharedState,
 ) -> Option<crate::state::PlottedChannel> {
@@ -260,12 +340,18 @@ fn load_analysis_channel(
         eframe::egui::Color32::from_rgb(c.color[0], c.color[1], c.color[2]),
         0,
     )?;
-    c.transform.apply_to(&mut pc);
+    if !c.inherit_display {
+        c.transform.apply_to(&mut pc);
+    }
+    pc.portable_source_unit = c.source_unit.clone();
+    crate::panels::utils::reconcile_source_unit(&mut pc, shared);
     Some(pc)
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct TrackMapPanelConfig {
+    #[serde(default)]
+    pub window: WorksheetWindow,
     pub id: u64,
     pub title: String,
     pub color_channel_name: Option<String>,
@@ -283,6 +369,16 @@ fn default_track_annotations() -> bool {
 
 #[derive(Serialize, Deserialize)]
 pub struct HistogramPanelConfig {
+    #[serde(default)]
+    pub bin_settings: crate::panels::histogram::HistogramBinSettings,
+    #[serde(default)]
+    pub band_presentation: crate::panels::distribution::BandPresentation,
+    #[serde(default)]
+    pub channels: Vec<AnalysisChannelConfig>,
+    #[serde(default)]
+    pub seconds: bool,
+    #[serde(default)]
+    pub filter: crate::panels::distribution::ComponentFilter,
     pub id: u64,
     pub title: String,
     pub bin_count: usize,
@@ -319,6 +415,28 @@ fn default_histogram_y_headroom_pct() -> f64 {
 
 #[derive(Serialize, Deserialize)]
 pub struct ScatterPanelConfig {
+    #[serde(default)]
+    pub show_interval_averages: bool,
+    #[serde(default = "default_interval_width")]
+    pub interval_width: f64,
+    #[serde(default)]
+    pub interval_origin: f64,
+    #[serde(default)]
+    pub density: bool,
+    #[serde(default)]
+    pub band_presentation: crate::panels::distribution::BandPresentation,
+    #[serde(default)]
+    pub x_channel: Option<AnalysisChannelConfig>,
+    #[serde(default)]
+    pub y_channel: Option<AnalysisChannelConfig>,
+    #[serde(default)]
+    pub color_channel: Option<AnalysisChannelConfig>,
+    #[serde(default)]
+    pub color_bands: crate::panels::distribution::ColorBands,
+    #[serde(default)]
+    pub show_regression: bool,
+    #[serde(default)]
+    pub filter: crate::panels::distribution::ComponentFilter,
     pub id: u64,
     pub title: String,
     #[serde(default)]
@@ -347,19 +465,47 @@ fn default_scatter_point_size() -> f32 {
 
 #[derive(Serialize, Deserialize)]
 pub struct FftPanelConfig {
+    #[serde(default)]
+    pub channels: Vec<AnalysisChannelConfig>,
     pub id: u64,
     pub title: String,
     pub log_scale: bool,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SavedGauge {
+    pub channel: AnalysisChannelConfig,
+    pub style: String,
+    #[serde(default)]
+    pub settings: crate::panels::gauge::GaugeSettings,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct GaugePanelConfig {
+    #[serde(default)]
+    pub gauges: Vec<SavedGauge>,
     pub id: u64,
     pub title: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct MixtureMapPanelConfig {
+    #[serde(default)]
+    pub show_trends: bool,
+    #[serde(default = "default_interval_width")]
+    pub trend_width: f64,
+    #[serde(default)]
+    pub band_presentation: crate::panels::distribution::BandPresentation,
+    #[serde(default)]
+    pub x_channel: Option<AnalysisChannelConfig>,
+    #[serde(default)]
+    pub y_channel: Option<AnalysisChannelConfig>,
+    #[serde(default)]
+    pub value_channel: Option<AnalysisChannelConfig>,
+    #[serde(default)]
+    pub gear_filter: i3rs_core::distribution::GearFilter,
+    #[serde(default)]
+    pub filter: crate::panels::distribution::ComponentFilter,
     pub id: u64,
     pub title: String,
     pub bins: usize,
@@ -410,6 +556,9 @@ impl MathChannelConfig {
 
 fn channel_name_and_kind(channel_id: ChannelId, shared: &SharedState) -> Option<(String, bool)> {
     match channel_id {
+        ChannelId::Analysis(i) | ChannelId::Unresolved(i) => {
+            shared.unresolved_references.borrow().get(i).cloned()
+        }
         ChannelId::Physical(idx) => {
             Some((shared.ld_file.as_ref()?.channels[idx].name.clone(), false))
         }
@@ -420,6 +569,15 @@ fn channel_name_and_kind(channel_id: ChannelId, shared: &SharedState) -> Option<
     }
 }
 
+fn saved_channel_identity(
+    pc: &crate::state::PlottedChannel,
+    shared: &SharedState,
+) -> Option<(String, bool)> {
+    pc.requested_reference
+        .clone()
+        .or_else(|| channel_name_and_kind(pc.channel_id, shared))
+}
+
 fn resolve_saved_plotted_channel(
     shared: &SharedState,
     channel_name: &str,
@@ -427,51 +585,42 @@ fn resolve_saved_plotted_channel(
     color: eframe::egui::Color32,
     tile_group: usize,
 ) -> Option<crate::state::PlottedChannel> {
-    if is_math {
-        let idx = shared.resolved_math_index(channel_name)?;
-        let data = shared.math_channels.get(idx)?.data.clone()?;
-        let stats = compute_channel_stats(&data);
-        let mut plotted = crate::state::PlottedChannel {
-            channel_id: ChannelId::Math(idx),
-            color,
-            data,
+    let id = shared
+        .resolve_slot(channel_name, is_math)
+        .unwrap_or_else(|| shared.unresolved_channel(channel_name, is_math));
+    let mut plotted = create_plotted_channel(id, shared, tile_group).or_else(|| {
+        create_plotted_channel(
+            shared.unresolved_channel(channel_name, is_math),
+            shared,
             tile_group,
-            y_axis: crate::state::YAxis::Left,
-            display_scale: 1.0,
-            display_offset: 0.0,
-            display_unit: None,
-            math_id: Some(shared.math_channels[idx].id),
-            recording_display_base: None,
-            math_display_signature: None,
-            scale_mode: crate::state::ScaleMode::Auto,
-            manual_min: stats.min,
-            manual_max: stats.max,
-            cached_min: stats.min,
-            cached_max: stats.max,
-            cached_avg: stats.avg,
-        };
-        apply_math_display_defaults(&mut plotted, shared);
-        apply_channel_preferences(&mut plotted, shared);
-        Some(plotted)
-    } else {
-        let channel_idx = shared
-            .ld_file
-            .as_ref()?
-            .find_channel_by_name(channel_name)?
-            .index;
-        let mut plotted =
-            create_plotted_channel(ChannelId::Physical(channel_idx), shared, tile_group)?;
-        plotted.color = color;
-        plotted.tile_group = tile_group;
-        plotted.y_axis = crate::state::YAxis::Left;
-        apply_channel_preferences(&mut plotted, shared);
-        Some(plotted)
-    }
+        )
+    })?;
+    plotted.requested_reference = Some((channel_name.into(), is_math));
+    plotted.color = color;
+    plotted.tile_group = tile_group;
+    Some(plotted)
 }
 
 // ---------------------------------------------------------------------------
 // Conversion: App state → WorkspaceFile
 // ---------------------------------------------------------------------------
+
+fn finite_dock_layout(
+    dock: &DockState<PanelTab>,
+    locations: &std::collections::HashMap<usize, usize>,
+) -> DockState<usize> {
+    let mut topology = dock.map_tabs(|tab| locations[&(tab as *const PanelTab as usize)]);
+    for (_, node) in topology.iter_all_nodes_mut() {
+        node.set_rect(egui::Rect::ZERO);
+        if let Some(leaf) = node.get_leaf_mut() {
+            leaf.viewport = egui::Rect::ZERO;
+            if !leaf.scroll.is_finite() {
+                leaf.scroll = 0.;
+            }
+        }
+    }
+    topology
+}
 
 pub fn save_workspace(
     worksheets: &[(String, &DockState<PanelTab>)],
@@ -482,26 +631,33 @@ pub fn save_workspace(
         .iter()
         .map(|(name, dock)| {
             let mut panels = Vec::new();
+            let mut locations = std::collections::HashMap::new();
             for (_path, tab) in dock.iter_all_tabs() {
+                locations.insert(tab as *const PanelTab as usize, panels.len());
                 let config = match tab {
+                    PanelTab::Calculations(p) => PanelConfig::Calculations(CalculationsConfig {
+                        suspension_bins: p.suspension_bins,
+                        suspension_output: p.suspension_output,
+                        suspension_line: p.suspension_line,
+                        id: p.id,
+                        title: p.title.clone(),
+                        channels: p
+                            .channels
+                            .iter()
+                            .filter_map(|c| save_analysis_channel(c, shared))
+                            .collect(),
+                        filter: p.filter.clone(),
+                        mode: p.mode,
+                        interval_seconds: p.interval_seconds,
+                        suspension: p.suspension,
+                    }),
                     PanelTab::Graph(g) => {
                         let mut channel_names = Vec::new();
                         let mut is_math = Vec::new();
                         for pc in &g.plotted_channels {
-                            match pc.channel_id {
-                                ChannelId::Physical(idx) => {
-                                    if let Some(ld) = &shared.ld_file {
-                                        channel_names.push(ld.channels[idx].name.clone());
-                                    }
-                                    is_math.push(false);
-                                }
-                                ChannelId::Math(idx) => {
-                                    if let Some(mc) = shared.math_channels.get(idx) {
-                                        channel_names
-                                            .push(format!("{}::{}", mc.options.source, mc.name));
-                                    }
-                                    is_math.push(true);
-                                }
+                            if let Some((name, math)) = saved_channel_identity(pc, shared) {
+                                channel_names.push(name);
+                                is_math.push(math);
                             }
                         }
                         let colors: Vec<[u8; 3]> = g
@@ -531,6 +687,9 @@ pub fn save_workspace(
                                         .map(|session| session.path.to_string_lossy().to_string()),
                                 };
                                 GraphOverlayConfig {
+                                    gps_align: overlay.gps_align,
+                                    visible: overlay.visible,
+                                    color: overlay.color.map(|c| [c.r(), c.g(), c.b()]),
                                     file_path,
                                     lap_index: overlay.lap_idx,
                                     manual_offset: overlay.manual_offset,
@@ -542,23 +701,47 @@ pub fn save_workspace(
                             .embedded_gauges
                             .iter()
                             .filter_map(|gauge| {
-                                let (channel_name, is_math) = match gauge.channel.channel_id {
-                                    ChannelId::Physical(idx) => {
-                                        (shared.ld_file.as_ref()?.channels[idx].name.clone(), false)
-                                    }
-                                    ChannelId::Math(idx) => {
-                                        let mc = shared.math_channels.get(idx)?;
-                                        (format!("{}::{}", mc.options.source, mc.name), true)
-                                    }
-                                };
+                                let (channel_name, is_math) =
+                                    saved_channel_identity(&gauge.channel, shared)?;
                                 Some(GraphGaugeConfig {
+                                    channel: save_analysis_channel(&gauge.channel, shared),
+                                    settings: gauge.settings,
+                                    transform: Some(GraphDisplayTransformConfig::of(
+                                        &gauge.channel,
+                                    )),
                                     channel_name,
                                     is_math,
                                     style: gauge_style_to_string(gauge.style).into(),
                                 })
                             })
+                            .chain(g.unresolved_gauges.iter().map(|slot| {
+                                GraphGaugeConfig {
+                                    channel: Some(slot.channel.clone()),
+                                    channel_name: slot.channel.name.clone(),
+                                    is_math: slot.channel.is_math,
+                                    style: slot.style.clone(),
+                                    settings: slot.settings,
+                                    transform: (!slot.channel.inherit_display)
+                                        .then(|| slot.channel.transform.clone()),
+                                }
+                            }))
                             .collect();
                         PanelConfig::Graph(GraphPanelConfig {
+                            channels: g
+                                .plotted_channels
+                                .iter()
+                                .filter_map(|pc| {
+                                    save_analysis_channel(pc, shared).map(|channel| {
+                                        GraphChannelSlot {
+                                            channel,
+                                            tile_group: pc.tile_group,
+                                        }
+                                    })
+                                })
+                                .chain(g.unresolved_channels.iter().cloned())
+                                .collect(),
+                            view: g.view.clone(),
+                            unresolved_channels: g.unresolved_channels.clone(),
                             full_resolution: g.full_resolution,
                             id: g.id,
                             title: g.title.clone(),
@@ -583,13 +766,19 @@ pub fn save_workspace(
                         })
                     }
                     PanelTab::TrackMap(t) => {
-                        let color_channel_name = t.color_channel_idx.and_then(|idx| {
-                            shared
-                                .ld_file
-                                .as_ref()
-                                .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
+                        let color_channel_name = t.requested_color.clone().or_else(|| {
+                            t.color_channel_idx.and_then(|idx| {
+                                shared
+                                    .ld_file
+                                    .as_ref()
+                                    .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
+                            })
                         });
                         PanelConfig::TrackMap(TrackMapPanelConfig {
+                            window: WorksheetWindow {
+                                detached: t.is_popped_out,
+                                ..t.window.clone()
+                            },
                             id: t.id,
                             title: t.title.clone(),
                             color_channel_name,
@@ -610,6 +799,15 @@ pub fn save_workspace(
                             .collect(),
                     }),
                     PanelTab::Histogram(h) => PanelConfig::Histogram(HistogramPanelConfig {
+                        bin_settings: h.bin_settings,
+                        band_presentation: h.band_presentation.clone(),
+                        channels: h
+                            .channels
+                            .iter()
+                            .filter_map(|p| save_analysis_channel(p, shared))
+                            .collect(),
+                        filter: h.filter.clone(),
+                        seconds: h.seconds,
                         id: h.id,
                         title: h.title.clone(),
                         bin_count: h.bin_count,
@@ -630,15 +828,14 @@ pub fn save_workspace(
                             .channels
                             .iter()
                             .filter_map(|pc| {
-                                channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                                saved_channel_identity(pc, shared).map(|(name, _)| name)
                             })
                             .collect(),
                         is_math: h
                             .channels
                             .iter()
                             .filter_map(|pc| {
-                                channel_name_and_kind(pc.channel_id, shared)
-                                    .map(|(_, is_math)| is_math)
+                                saved_channel_identity(pc, shared).map(|(_, is_math)| is_math)
                             })
                             .collect(),
                         colors: h
@@ -651,28 +848,46 @@ pub fn save_workspace(
                             .collect(),
                     }),
                     PanelTab::Scatter(s) => PanelConfig::Scatter(ScatterPanelConfig {
+                        show_interval_averages: s.show_interval_averages,
+                        interval_width: s.interval_width,
+                        interval_origin: s.interval_origin,
+                        density: s.density,
+                        band_presentation: s.band_presentation.clone(),
+                        x_channel: s
+                            .x_channel
+                            .as_ref()
+                            .and_then(|p| save_analysis_channel(p, shared)),
+                        y_channel: s
+                            .y_channel
+                            .as_ref()
+                            .and_then(|p| save_analysis_channel(p, shared)),
+                        filter: s.filter.clone(),
+                        color_channel: s
+                            .color_channel
+                            .as_ref()
+                            .and_then(|c| save_analysis_channel(c, shared)),
+                        color_bands: s.color_bands,
+                        show_regression: s.show_regression,
                         id: s.id,
                         title: s.title.clone(),
                         x_channel_name: s.x_channel.as_ref().and_then(|pc| {
-                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                            saved_channel_identity(pc, shared).map(|(name, _)| name)
                         }),
                         y_channel_name: s.y_channel.as_ref().and_then(|pc| {
-                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                            saved_channel_identity(pc, shared).map(|(name, _)| name)
                         }),
                         x_is_math: s
                             .x_channel
                             .as_ref()
                             .and_then(|pc| {
-                                channel_name_and_kind(pc.channel_id, shared)
-                                    .map(|(_, is_math)| is_math)
+                                saved_channel_identity(pc, shared).map(|(_, is_math)| is_math)
                             })
                             .unwrap_or(false),
                         y_is_math: s
                             .y_channel
                             .as_ref()
                             .and_then(|pc| {
-                                channel_name_and_kind(pc.channel_id, shared)
-                                    .map(|(_, is_math)| is_math)
+                                saved_channel_identity(pc, shared).map(|(_, is_math)| is_math)
                             })
                             .unwrap_or(false),
                         x_color: s.x_channel.as_ref().map(|pc| {
@@ -688,15 +903,51 @@ pub fn save_workspace(
                         lock_bounds: s.lock_bounds,
                     }),
                     PanelTab::Fft(f) => PanelConfig::Fft(FftPanelConfig {
+                        channels: f
+                            .channels
+                            .iter()
+                            .filter_map(|p| save_analysis_channel(p, shared))
+                            .collect(),
                         id: f.id,
                         title: f.title.clone(),
                         log_scale: f.log_scale,
                     }),
                     PanelTab::Gauge(g) => PanelConfig::Gauge(GaugePanelConfig {
+                        gauges: g
+                            .gauges
+                            .iter()
+                            .filter_map(|gc| {
+                                save_analysis_channel(&gc.channel, shared).map(|channel| {
+                                    SavedGauge {
+                                        channel,
+                                        style: gauge_style_to_string(gc.style).into(),
+                                        settings: gc.settings,
+                                    }
+                                })
+                            })
+                            .chain(g.unresolved_gauges.iter().cloned())
+                            .collect(),
                         id: g.id,
                         title: g.title.clone(),
                     }),
                     PanelTab::MixtureMap(m) => PanelConfig::MixtureMap(MixtureMapPanelConfig {
+                        show_trends: m.show_trends,
+                        trend_width: m.trend_width,
+                        band_presentation: m.band_presentation.clone(),
+                        x_channel: m
+                            .x_channel
+                            .as_ref()
+                            .and_then(|p| save_analysis_channel(p, shared)),
+                        y_channel: m
+                            .y_channel
+                            .as_ref()
+                            .and_then(|p| save_analysis_channel(p, shared)),
+                        value_channel: m
+                            .value_channel
+                            .as_ref()
+                            .and_then(|p| save_analysis_channel(p, shared)),
+                        filter: m.filter.clone(),
+                        gear_filter: m.gear_filter,
                         id: m.id,
                         title: m.title.clone(),
                         bins: m.bins,
@@ -705,36 +956,33 @@ pub fn save_workspace(
                         minimum_y: m.minimum_y,
                         color_bands: m.color_bands,
                         x_channel_name: m.x_channel.as_ref().and_then(|pc| {
-                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                            saved_channel_identity(pc, shared).map(|(name, _)| name)
                         }),
                         y_channel_name: m.y_channel.as_ref().and_then(|pc| {
-                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                            saved_channel_identity(pc, shared).map(|(name, _)| name)
                         }),
                         value_channel_name: m.value_channel.as_ref().and_then(|pc| {
-                            channel_name_and_kind(pc.channel_id, shared).map(|(name, _)| name)
+                            saved_channel_identity(pc, shared).map(|(name, _)| name)
                         }),
                         x_is_math: m
                             .x_channel
                             .as_ref()
                             .and_then(|pc| {
-                                channel_name_and_kind(pc.channel_id, shared)
-                                    .map(|(_, is_math)| is_math)
+                                saved_channel_identity(pc, shared).map(|(_, is_math)| is_math)
                             })
                             .unwrap_or(false),
                         y_is_math: m
                             .y_channel
                             .as_ref()
                             .and_then(|pc| {
-                                channel_name_and_kind(pc.channel_id, shared)
-                                    .map(|(_, is_math)| is_math)
+                                saved_channel_identity(pc, shared).map(|(_, is_math)| is_math)
                             })
                             .unwrap_or(false),
                         value_is_math: m
                             .value_channel
                             .as_ref()
                             .and_then(|pc| {
-                                channel_name_and_kind(pc.channel_id, shared)
-                                    .map(|(_, is_math)| is_math)
+                                saved_channel_identity(pc, shared).map(|(_, is_math)| is_math)
                             })
                             .unwrap_or(false),
                     }),
@@ -742,6 +990,8 @@ pub fn save_workspace(
                 panels.push(config);
             }
             WorksheetConfig {
+                dock: Some(finite_dock_layout(dock, &locations)),
+                window: Default::default(),
                 name: name.clone(),
                 panels,
             }
@@ -774,6 +1024,32 @@ pub fn save_workspace(
     let sectors: Vec<Sector> = shared.sectors.clone();
 
     WorkspaceFile {
+        version: 2,
+        comparisons: Some(ComparisonConfig {
+            main_lap: shared.comparisons.main_lap,
+            overlays: shared
+                .comparisons
+                .overlays
+                .iter()
+                .map(|o| GraphOverlayConfig {
+                    gps_align: o.gps_align,
+                    visible: o.visible,
+                    color: o.color.map(|c| [c.r(), c.g(), c.b()]),
+                    file_path: match o.source {
+                        OverlaySource::MainSession => None,
+                        OverlaySource::External(i) => shared
+                            .comparisons
+                            .sessions
+                            .get(i)
+                            .map(|s| s.path.to_string_lossy().into_owned()),
+                    },
+                    lap_index: o.lap_idx,
+                    manual_offset: o.manual_offset,
+                    stretch_to_reference: o.stretch_to_reference,
+                })
+                .chain(shared.comparisons.unresolved_overlays.iter().cloned())
+                .collect(),
+        }),
         worksheets: ws_configs,
         active_worksheet,
         last_file_path: shared
@@ -854,8 +1130,60 @@ pub fn load_workspace(
     workspace: &WorkspaceFile,
     shared: &mut SharedState,
 ) -> Vec<(String, DockState<PanelTab>)> {
+    shared.comparisons = Default::default();
+    let legacy = workspace
+        .worksheets
+        .iter()
+        .flat_map(|w| &w.panels)
+        .find_map(|p| {
+            if let PanelConfig::Graph(g) = p {
+                g.reference_lap.map(|_| g)
+            } else {
+                None
+            }
+        });
+    let (main, overlays) = workspace
+        .comparisons
+        .as_ref()
+        .map(|c| (c.main_lap, c.overlays.as_slice()))
+        .or_else(|| legacy.map(|g| (g.reference_lap, g.overlays.as_slice())))
+        .unwrap_or((None, &[]));
+    let mut loader = GraphPanel::new(0, "comparison loader");
+    for overlay in overlays {
+        let source = if let Some(path) = &overlay.file_path {
+            loader
+                .load_external_overlay_path(path.into())
+                .map(OverlaySource::External)
+        } else {
+            Some(OverlaySource::MainSession)
+        };
+        if let Some(source) = source {
+            loader.lap_overlays.push(crate::panels::graph::LapOverlay {
+                alignment_valid: false,
+                gps_align: overlay.gps_align,
+                source,
+                lap_idx: overlay.lap_index,
+                visible: overlay.visible,
+                color: overlay
+                    .color
+                    .map(|c| egui::Color32::from_rgb(c[0], c[1], c[2])),
+                manual_offset: overlay.manual_offset,
+                stretch_to_reference: overlay.stretch_to_reference,
+            });
+        } else {
+            shared.message(format!("Overlay file unavailable: {:?}", overlay.file_path));
+            shared.comparisons.unresolved_overlays.push(overlay.clone());
+        }
+    }
+    shared.comparisons.main_lap = main;
+    shared.comparisons.overlays = loader.lap_overlays;
+    shared.comparisons.sessions = loader.overlay_sessions;
     shared.channel_settings = workspace.channel_settings.clone();
     restore_track_sections(workspace, shared);
+    if let Some(main) = main.filter(|i| *i < shared.laps.len()) {
+        shared.select_lap(Some(main));
+        shared.reference_lap = Some(main);
+    }
     workspace
         .worksheets
         .iter()
@@ -865,6 +1193,22 @@ pub fn load_workspace(
                 .panels
                 .iter()
                 .map(|panel| match panel {
+                    PanelConfig::Calculations(c) => {
+                        let mut p =
+                            crate::panels::calculations::CalculationsPanel::new(c.id, &c.title);
+                        p.channels = c
+                            .channels
+                            .iter()
+                            .filter_map(|s| load_analysis_channel(s, shared))
+                            .collect();
+                        p.filter = c.filter.clone();
+                        p.mode = c.mode;
+                        p.interval_seconds = c.interval_seconds;
+                        p.suspension = c.suspension;
+                        p.suspension_bins=c.suspension_bins;p.suspension_output=c.suspension_output;p.suspension_line=c.suspension_line;
+                        shared.next_panel_id = shared.next_panel_id.max(c.id + 1);
+                        PanelTab::Calculations(p)
+                    }
                     PanelConfig::Graph(gc) => {
                         let mut graph = GraphPanel::new(gc.id, &gc.title);
                         graph.graph_mode = match gc.graph_mode.as_str() {
@@ -876,106 +1220,79 @@ pub fn load_workspace(
                             _ => GraphXAxis::Time,
                         };
                         graph.full_resolution = gc.full_resolution;
-                        graph.reference_lap = gc.reference_lap;
+                        graph.view = gc.view.clone();
+                        graph.unresolved_channels = gc.unresolved_channels.clone();
                         graph.embedded_gauge_height = gc.embedded_gauge_height;
                         graph.tile_heights = gc.tile_heights.clone();
 
-                        // Resolve channels by name
-                        for (i, name) in gc.channel_names.iter().enumerate() {
-                            let is_math = gc.is_math.get(i).copied().unwrap_or(false);
-                            let color = gc
-                                .colors
-                                .get(i)
-                                .map(|c| eframe::egui::Color32::from_rgb(c[0], c[1], c[2]))
-                                .unwrap_or(CHANNEL_COLORS[i % CHANNEL_COLORS.len()]);
-                            let tile_group = gc.tile_groups.get(i).copied().unwrap_or(i);
-                            let identity = GraphDisplayTransformConfig::default();
-                            let display_transform =
-                                gc.display_transforms.get(i).unwrap_or(&identity);
-
-                            if is_math {
-                                // Find math channel by name
-                                if let Some(mc_idx) = shared.resolved_math_index(name)
-                                    && let Some(data) = &shared.math_channels[mc_idx].data
-                                {
-                                    let stats = compute_channel_stats(data);
-                                    let mut plotted = crate::state::PlottedChannel {
-                                        channel_id: ChannelId::Math(mc_idx),
-                                        color,
-                                        data: data.clone(),
-                                        tile_group,
-                                        y_axis: crate::state::YAxis::Left,
-                                        display_scale: 1.0,
-                                        display_offset: 0.0,
-                                        display_unit: None,
-                                        math_id: Some(shared.math_channels[mc_idx].id),
-                                        recording_display_base: None,
-                                        math_display_signature: None,
-                                        scale_mode: crate::state::ScaleMode::Auto,
-                                        manual_min: stats.min,
-                                        manual_max: stats.max,
-                                        cached_min: stats.min,
-                                        cached_max: stats.max,
-                                        cached_avg: stats.avg,
-                                    };
-                                    apply_math_display_defaults(&mut plotted, shared);
-                                    if gc.display_transforms.get(i).is_some() {
-                                        display_transform.apply_to(&mut plotted);
-                                    }
-                                    graph.plotted_channels.push(plotted);
+                        if !gc.channels.is_empty() {
+                            graph.unresolved_channels.clear();
+                            for slot in &gc.channels {
+                                if let Some(mut pc) = load_analysis_channel(&slot.channel, shared) {
+                                    pc.tile_group = slot.tile_group;
+                                    graph.plotted_channels.push(pc);
                                 }
-                            } else if let Some(ld) = &shared.ld_file
-                                && let Some(ch) = ld.find_channel_by_name(name)
-                                && let Some(mut plotted) = create_plotted_channel(
-                                    ChannelId::Physical(ch.index),
-                                    shared,
-                                    tile_group,
-                                )
-                            {
-                                plotted.color = color;
-                                plotted.tile_group = tile_group;
-                                plotted.y_axis = crate::state::YAxis::Left;
-                                display_transform.apply_to(&mut plotted);
-                                graph.plotted_channels.push(plotted);
+                            }
+                        } else {
+                            for (i, name) in gc.channel_names.iter().enumerate() {
+                                let color = gc.colors.get(i).copied().unwrap_or([255, 100, 100]);
+                                let slot = GraphChannelSlot {
+                                    channel: AnalysisChannelConfig {
+                                        source_unit: None,
+                                        inherit_display: gc
+                                            .is_math
+                                            .get(i)
+                                            .copied()
+                                            .unwrap_or(false)
+                                            && gc.display_transforms.get(i).is_none(),
+                                        name: name.clone(),
+                                        is_math: gc.is_math.get(i).copied().unwrap_or(false),
+                                        color,
+                                        transform: gc
+                                            .display_transforms
+                                            .get(i)
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                    },
+                                    tile_group: gc.tile_groups.get(i).copied().unwrap_or(i),
+                                };
+                                if let Some(mut pc) = load_analysis_channel(&slot.channel, shared) {
+                                    pc.tile_group = slot.tile_group;
+                                    graph.plotted_channels.push(pc);
+                                } else {
+                                    graph.unresolved_channels.push(slot);
+                                }
                             }
                         }
 
-                        for gauge in &gc.embedded_gauges {
-                            let channel_id = if gauge.is_math {
-                                shared
-                                    .resolved_math_index(&gauge.channel_name)
-                                    .map(ChannelId::Math)
-                            } else {
-                                shared.ld_file.as_ref().and_then(|ld| {
-                                    ld.find_channel_by_name(&gauge.channel_name)
-                                        .map(|channel| ChannelId::Physical(channel.index))
-                                })
+                        for saved in &gc.embedded_gauges {
+                            let slot = SavedGauge {
+                                channel: AnalysisChannelConfig {
+                                    source_unit: None,
+                                    inherit_display: saved.transform.is_none(),
+                                    name: saved.channel_name.clone(),
+                                    is_math: saved.is_math,
+                                    color: [255, 100, 100],
+                                    transform: saved.transform.clone().unwrap_or_default(),
+                                },
+                                style: saved.style.clone(),
+                                settings: saved.settings,
                             };
-                            if let Some(channel_id) = channel_id {
-                                graph.add_embedded_gauge_with_style(
-                                    channel_id,
-                                    shared,
-                                    gauge_style_from_string(&gauge.style),
-                                );
-                            }
-                        }
-
-                        for overlay in &gc.overlays {
-                            let source = if let Some(path) = &overlay.file_path {
-                                let path = std::path::PathBuf::from(path);
+                            let slot = SavedGauge {
+                                channel: saved.channel.clone().unwrap_or(slot.channel),
+                                ..slot
+                            };
+                            if let Some(channel) = load_analysis_channel(&slot.channel, shared) {
                                 graph
-                                    .load_external_overlay_path(path)
-                                    .map(OverlaySource::External)
+                                    .embedded_gauges
+                                    .push(crate::panels::gauge::GaugeChannel {
+                                        last_unit: None,
+                                        channel,
+                                        style: gauge_style_from_string(&slot.style),
+                                        settings: slot.settings,
+                                    });
                             } else {
-                                Some(OverlaySource::MainSession)
-                            };
-                            if let Some(source) = source {
-                                graph.lap_overlays.push(crate::panels::graph::LapOverlay {
-                                    source,
-                                    lap_idx: overlay.lap_index,
-                                    manual_offset: overlay.manual_offset,
-                                    stretch_to_reference: overlay.stretch_to_reference,
-                                });
+                                graph.unresolved_gauges.push(slot);
                             }
                         }
 
@@ -988,10 +1305,13 @@ pub fn load_workspace(
                     }
                     PanelConfig::TrackMap(tc) => {
                         let mut track_map = TrackMapPanel::new(tc.id, &tc.title);
+                        track_map.window=tc.window.clone();
+                        #[cfg(not(target_arch="wasm32"))] {track_map.is_popped_out=tc.window.detached;}
                         track_map.home_worksheet = worksheet_idx;
                         track_map.section_times_only = tc.section_times_only;
                         track_map.show_annotations = tc.show_annotations;
                         track_map.annotation_settings = tc.annotation_settings.clone();
+                        track_map.requested_color = tc.color_channel_name.clone();
                         // Resolve color channel by name
                         if let Some(ref color_name) = tc.color_channel_name
                             && let Some(ld) = &shared.ld_file
@@ -1021,6 +1341,10 @@ pub fn load_workspace(
                     }
                     PanelConfig::Histogram(hc) => {
                         let mut histogram = HistogramPanel::new(hc.id, &hc.title);
+                        histogram.band_presentation = hc.band_presentation.clone();
+                        histogram.bin_settings = hc.bin_settings;
+                        histogram.filter = hc.filter.clone();
+                        histogram.seconds = hc.seconds && !hc.percentage;
                         histogram.bin_count = hc.bin_count.clamp(5, 500);
                         histogram.percentage = hc.percentage;
                         histogram.color_bands = hc.color_bands.valid();
@@ -1050,6 +1374,13 @@ pub fn load_workspace(
                                 histogram.channels.push(pc);
                             }
                         }
+                        if !hc.channels.is_empty() {
+                            histogram.channels = hc
+                                .channels
+                                .iter()
+                                .filter_map(|p| load_analysis_channel(p, shared))
+                                .collect();
+                        }
                         if hc.id >= shared.next_panel_id {
                             shared.next_panel_id = hc.id + 1;
                         }
@@ -1057,6 +1388,16 @@ pub fn load_workspace(
                     }
                     PanelConfig::Scatter(sc) => {
                         let mut scatter = ScatterPanel::new(sc.id, &sc.title);
+                        scatter.show_interval_averages=sc.show_interval_averages;scatter.interval_width=sc.interval_width;scatter.interval_origin=sc.interval_origin;
+                        scatter.band_presentation = sc.band_presentation.clone();
+                        scatter.density = sc.density;
+                        scatter.filter = sc.filter.clone();
+                        scatter.color_channel = sc
+                            .color_channel
+                            .as_ref()
+                            .and_then(|c| load_analysis_channel(c, shared));
+                        scatter.color_bands = sc.color_bands;
+                        scatter.show_regression = sc.show_regression;
                         scatter.point_size = sc.point_size;
                         scatter.bounds_padding_frac = sc.bounds_padding_frac;
                         scatter.lock_bounds = sc.lock_bounds;
@@ -1082,21 +1423,44 @@ pub fn load_workspace(
                                 1,
                             );
                         }
+                        if let Some(c) = &sc.x_channel {
+                            scatter.x_channel = load_analysis_channel(c, shared);
+                        }
+                        if let Some(c) = &sc.y_channel {
+                            scatter.y_channel = load_analysis_channel(c, shared);
+                        }
                         if sc.id >= shared.next_panel_id {
                             shared.next_panel_id = sc.id + 1;
                         }
-                        PanelTab::Scatter(scatter)
+                        PanelTab::Scatter(Box::new(scatter))
                     }
                     PanelConfig::Fft(fc) => {
                         let mut fft = FftPanel::new(fc.id, &fc.title);
                         fft.log_scale = fc.log_scale;
+                        fft.channels = fc
+                            .channels
+                            .iter()
+                            .filter_map(|p| load_analysis_channel(p, shared))
+                            .collect();
                         if fc.id >= shared.next_panel_id {
                             shared.next_panel_id = fc.id + 1;
                         }
                         PanelTab::Fft(fft)
                     }
                     PanelConfig::Gauge(gc) => {
-                        let gauge = GaugePanel::new(gc.id, &gc.title);
+                        let mut gauge = GaugePanel::new(gc.id, &gc.title);
+                        for saved in &gc.gauges {
+                            if let Some(channel) = load_analysis_channel(&saved.channel, shared) {
+                                gauge.gauges.push(crate::panels::gauge::GaugeChannel {
+                                    last_unit: None,
+                                    channel,
+                                    style: gauge_style_from_string(&saved.style),
+                                    settings: saved.settings,
+                                });
+                            } else {
+                                gauge.unresolved_gauges.push(saved.clone());
+                            }
+                        }
                         if gc.id >= shared.next_panel_id {
                             shared.next_panel_id = gc.id + 1;
                         }
@@ -1104,6 +1468,10 @@ pub fn load_workspace(
                     }
                     PanelConfig::MixtureMap(mc) => {
                         let mut mixture_map = MixtureMapPanel::new(mc.id, &mc.title);
+                        mixture_map.show_trends=mc.show_trends;mixture_map.trend_width=mc.trend_width;
+                        mixture_map.band_presentation = mc.band_presentation.clone();
+                        mixture_map.filter = mc.filter.clone();
+                        mixture_map.gear_filter = mc.gear_filter;
                         mixture_map.bins = mc.bins.clamp(5, 100);
                         mixture_map.scatter_mode = mc.scatter_mode;
                         mixture_map.sensor_delay =
@@ -1137,13 +1505,45 @@ pub fn load_workspace(
                                 2,
                             );
                         }
+                        if let Some(c) = &mc.x_channel {
+                            mixture_map.x_channel = load_analysis_channel(c, shared);
+                        }
+                        if let Some(c) = &mc.y_channel {
+                            mixture_map.y_channel = load_analysis_channel(c, shared);
+                        }
+                        if let Some(c) = &mc.value_channel {
+                            mixture_map.value_channel = load_analysis_channel(c, shared);
+                        }
                         if mc.id >= shared.next_panel_id {
                             shared.next_panel_id = mc.id + 1;
                         }
-                        PanelTab::MixtureMap(mixture_map)
+                        PanelTab::MixtureMap(Box::new(mixture_map))
                     }
                 })
                 .collect();
+
+            if let Some(topology) = &ws_config.dock {
+                let indices: Vec<_> = topology.iter_all_tabs().map(|(_, i)| *i).collect();
+                let unique: std::collections::HashSet<_> = indices.iter().copied().collect();
+                if unique.len() == indices.len()
+                    && tabs.iter().enumerate().all(|(i,_)|unique.contains(&i)||matches!(&ws_config.panels[i],PanelConfig::TrackMap(c) if c.window.detached))
+                    && indices.iter().all(|i| *i < tabs.len())
+                    && !tabs.is_empty()
+                {
+                    let mut slots: Vec<_> = tabs.into_iter().map(Some).collect();
+                    let mut dock = topology
+                        .map_tabs(|i| slots[*i].take().expect("validated unique layout slot"));
+                    for tab in slots.into_iter().flatten(){
+                        #[cfg(not(target_arch="wasm32"))] dock.add_window(vec![tab]);
+                        #[cfg(target_arch="wasm32")] dock.push_to_focused_leaf(tab);
+                    }
+                    return (ws_config.name.clone(), dock);
+                }
+                shared.message(format!(
+                    "{}: invalid saved docking layout; restored tabs",
+                    ws_config.name
+                ));
+            }
 
             // Build dock state — put first tab as root, rest as tabbed
             if tabs.is_empty() {
@@ -1210,6 +1610,8 @@ mod tests {
             display_offset: 0.0,
             display_unit: None,
             math_id: None,
+            requested_reference: None,
+            portable_source_unit: None,
             recording_display_base: None,
             math_display_signature: None,
             scale_mode: ScaleMode::Manual,
@@ -1357,7 +1759,7 @@ mod tests {
             PanelTab::Graph(graph),
             PanelTab::Report(report),
             PanelTab::Histogram(histogram),
-            PanelTab::MixtureMap(mixture),
+            PanelTab::MixtureMap(Box::new(mixture)),
             PanelTab::TrackMap(track),
         ]);
         let saved = save_workspace(&[("Circuit".into(), &dock)], 0, &shared);
@@ -1443,4 +1845,276 @@ mod tests {
         assert_eq!(channel.scale_mode, ScaleMode::Manual);
         assert_eq!((channel.manual_min, channel.manual_max), (-5.0, 25.0));
     }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+    use crate::panels::gauge::{GaugeChannel, GaugeSettings};
+    use std::sync::Arc;
+    fn slot(name: &str) -> AnalysisChannelConfig {
+        AnalysisChannelConfig {
+            source_unit: None,
+            inherit_display: false,
+            name: name.into(),
+            is_math: false,
+            color: [10, 20, 30],
+            transform: Default::default(),
+        }
+    }
+    #[test]
+    fn unresolved_graph_and_gauge_slots_survive_repeated_round_trips_and_rebind() {
+        let mut shared = SharedState::new();
+        let mut graph = GraphPanel::new(1, "Graph");
+        graph.view.mode = crate::comparison::ViewMode::Independent;
+        graph.view.local_range = Some((2., 4.));
+        graph.unresolved_channels.push(GraphChannelSlot {
+            channel: slot("Engine Speed"),
+            tile_group: 3,
+        });
+        let mut gauges = GaugePanel::new(2, "Gauges");
+        gauges.unresolved_gauges.push(SavedGauge {
+            channel: slot("Engine Speed"),
+            style: "Analog".into(),
+            settings: GaugeSettings {
+                range: Some((0., 9000.)),
+                warning_above: Some(7000.),
+                fault_above: Some(8500.),
+                ..Default::default()
+            },
+        });
+        let dock = DockState::new(vec![PanelTab::Graph(graph), PanelTab::Gauge(gauges)]);
+        let workspace = save_workspace(&[("Driver".into(), &dock)], 0, &shared);
+        let loaded = load_workspace(&workspace, &mut shared);
+        let roundtrip = save_workspace(&[(loaded[0].0.clone(), &loaded[0].1)], 0, &shared);
+        let roundtrip: WorkspaceFile =
+            serde_json::from_str(&serde_json::to_string(&roundtrip).unwrap()).unwrap();
+        assert_eq!(roundtrip.version, 2);
+        let PanelConfig::Graph(g) = &roundtrip.worksheets[0].panels[0] else {
+            panic!()
+        };
+        assert_eq!(g.channels.len(), 1);
+        assert_eq!(g.channels[0].tile_group, 3);
+        assert_eq!(g.view.local_range, Some((2., 4.)));
+        shared.ld_file = Some(Arc::new(
+            i3rs_core::LdFile::open(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../test_data/VIR_LAP.ld"
+            ))
+            .unwrap(),
+        ));
+        assert!(load_analysis_channel(&g.channels[0].channel, &shared).is_some());
+        let PanelConfig::Gauge(g) = &roundtrip.worksheets[0].panels[1] else {
+            panic!()
+        };
+        assert_eq!(g.gauges[0].settings.fault_above, Some(8500.));
+        assert!(load_analysis_channel(&g.gauges[0].channel, &shared).is_some());
+    }
+    #[test]
+    fn gauge_channels_transforms_and_properties_are_saved() {
+        let mut shared = SharedState::new();
+        let mut def = shared.create_math_channel_def("Test".into(), "1".into(), "rpm".into(), 2);
+        def.data = Some(Arc::from(vec![1., 2.]));
+        def.freq = 1;
+        shared.math_channels.push(def);
+        let mut gauge = GaugePanel::new(1, "Gauge");
+        let mut channel = create_plotted_channel(ChannelId::Math(0), &shared, 0).unwrap();
+        channel.display_scale = 2.;
+        channel.display_offset = 3.;
+        gauge.gauges.push(GaugeChannel {
+            last_unit: None,
+            channel,
+            style: GaugeStyle::Bar,
+            settings: GaugeSettings {
+                precision: Some(3),
+                ticks: 12,
+                sweep_degrees: 180.,
+                font_size: 22.,
+                ..Default::default()
+            },
+        });
+        let dock = DockState::new(vec![PanelTab::Gauge(gauge)]);
+        let workspace = save_workspace(&[("Driver".into(), &dock)], 0, &shared);
+        let restored = load_workspace(&workspace, &mut shared);
+        let (_, PanelTab::Gauge(g)) = restored[0].1.iter_all_tabs().next().unwrap() else {
+            panic!()
+        };
+        assert_eq!(g.gauges[0].channel.display_scale, 2.);
+        assert_eq!(g.gauges[0].channel.display_offset, 3.);
+        assert_eq!(g.gauges[0].settings.ticks, 12);
+        assert_eq!(g.gauges[0].style, GaugeStyle::Bar);
+    }
+    #[test]
+    fn old_workspace_without_version_or_new_settings_still_loads() {
+        let json = r#"{"worksheets":[{"name":"Driver","panels":[{"Gauge":{"id":1,"title":"Gauge"}}]}],"active_worksheet":0,"last_file_path":null}"#;
+        let workspace: WorkspaceFile = serde_json::from_str(json).unwrap();
+        assert_eq!(workspace.version, 0);
+        assert_eq!(load_workspace(&workspace, &mut SharedState::new()).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod legacy_math_display_tests {
+    use super::*;
+    #[test]
+    fn old_graph_without_saved_transforms_retains_math_display_units() {
+        let mut shared = SharedState::new();
+        let mut def = shared.create_math_channel_def("Angle".into(), "1".into(), "rad".into(), 2);
+        def.options.display_unit = Some("deg".into());
+        def.data = Some(std::sync::Arc::from(vec![1., 2.]));
+        def.freq = 1;
+        shared.math_channels.push(def);
+        let json = r#"{"worksheets":[{"name":"Angles","panels":[{"Graph":{"id":1,"title":"Angle","channel_names":["Angle"],"colors":[[255,0,0]],"graph_mode":"Tiled","is_math":[true]}}]}],"active_worksheet":0,"last_file_path":null}"#;
+        let workspace: WorkspaceFile = serde_json::from_str(json).unwrap();
+        let restored = load_workspace(&workspace, &mut shared);
+        let (_, PanelTab::Graph(graph)) = restored[0].1.iter_all_tabs().next().unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            graph.plotted_channels[0].display_unit.as_deref(),
+            Some("deg")
+        );
+        assert!(
+            (graph.plotted_channels[0].display_scale - 180. / std::f64::consts::PI).abs() < 1e-10
+        );
+    }
+}
+
+#[cfg(test)]
+mod portable_component_tests {
+    use super::*;
+    use crate::panels::{calculations::CalculationsPanel, report::ReportPanel};
+    fn slot(shared: &SharedState) -> crate::state::PlottedChannel {
+        let id = shared.unresolved_channel("Missing::Requested", false);
+        let mut pc = create_plotted_channel(id, shared, 0).unwrap();
+        pc.requested_reference = Some(("Missing::Requested".into(), false));
+        pc.display_scale = 2.;
+        pc.display_offset = 3.;
+        pc.display_unit = Some("display unit".into());
+        pc
+    }
+    #[test]
+    fn every_component_retains_missing_slots_and_split_floating_window_topology() {
+        let mut shared = SharedState::new();
+        let mut graph = GraphPanel::new(1, "Graph");
+        graph.plotted_channels.push(slot(&shared));
+        let mut histogram = HistogramPanel::new(2, "Histo");
+        histogram.channels.push(slot(&shared));
+        histogram.color_channel = Some(slot(&shared));
+        histogram.bin_settings.width = Some(100.);
+        histogram.bin_settings.centered = true;
+        histogram.band_presentation.hidden.push(3);
+        let mut scatter = ScatterPanel::new(3, "Scatter");
+        scatter.x_channel = Some(slot(&shared));
+        scatter.y_channel = Some(slot(&shared));
+        scatter.color_channel = Some(slot(&shared));
+        scatter.density = true;
+        scatter.show_interval_averages = true;
+        scatter.interval_width = 250.;
+        scatter.interval_origin = 50.;
+        let mut mixture = MixtureMapPanel::new(4, "Mixture");
+        mixture.x_channel = Some(slot(&shared));
+        mixture.y_channel = Some(slot(&shared));
+        mixture.value_channel = Some(slot(&shared));
+        mixture.show_trends = true;
+        mixture.trend_width = 200.;
+        let mut fft = FftPanel::new(5, "FFT");
+        fft.channels.push(slot(&shared));
+        let mut calc = CalculationsPanel::new(6, "Calculations");
+        calc.channels.push(slot(&shared));
+        calc.interval_seconds = 0.25;
+        calc.suspension_bins = 51;
+        calc.suspension_line = true;
+        calc.suspension_output = crate::panels::calculations::DistributionOutput::Percent;
+        let mut report = ReportPanel::new(7, "Report");
+        report.channels.push(slot(&shared));
+        let mut track = TrackMapPanel::new(8, "Track");
+        track.requested_color = Some("Missing GPS colour".into());
+        let mut dock = DockState::new(vec![PanelTab::Graph(graph), PanelTab::Histogram(histogram)]);
+        dock.main_surface_mut().split_right(
+            NodeIndex::root(),
+            0.4,
+            vec![
+                PanelTab::Scatter(Box::new(scatter)),
+                PanelTab::MixtureMap(Box::new(mixture)),
+            ],
+        );
+        let window = dock.add_window(vec![
+            PanelTab::Fft(fft),
+            PanelTab::Calculations(calc),
+            PanelTab::Report(report),
+            PanelTab::TrackMap(track),
+        ]);
+        dock.get_window_state_mut(window)
+            .unwrap()
+            .set_position(egui::pos2(20., 30.))
+            .set_size(egui::vec2(600., 500.));
+        let mut saved = save_workspace(&[("Sheet".into(), &dock)], 0, &shared);
+        saved.worksheets[0].window = WorksheetWindow {
+            detached: true,
+            size: [900., 600.],
+            position: Some([100., 200.]),
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        let saved: WorkspaceFile = serde_json::from_str(&json).unwrap();
+        assert!(saved.worksheets[0].window.detached);
+        let loaded = load_workspace(&saved, &mut shared);
+        let saved = save_workspace(&[(loaded[0].0.clone(), &loaded[0].1)], 0, &shared);
+        assert_eq!(saved.worksheets[0].panels.len(), 8);
+        let topology: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(saved.worksheets[0].dock.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let original: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(topology, original["worksheets"][0]["dock"]);
+        let mut slots = 0;
+        for config in &saved.worksheets[0].panels {
+            match config {
+                PanelConfig::Graph(g) => slots += g.channels.len(),
+                PanelConfig::Histogram(h) => {
+                    slots += h.channels.len() + usize::from(h.color_channel.is_some());
+                    assert_eq!(h.bin_settings.width, Some(100.));
+                    assert_eq!(h.band_presentation.hidden, [3]);
+                }
+                PanelConfig::Scatter(s) => {
+                    slots += usize::from(s.x_channel.is_some())
+                        + usize::from(s.y_channel.is_some())
+                        + usize::from(s.color_channel.is_some());
+                    assert!(s.density);
+                    assert!(s.show_interval_averages);
+                    assert_eq!((s.interval_width, s.interval_origin), (250., 50.));
+                }
+                PanelConfig::MixtureMap(m) => {
+                    slots += usize::from(m.x_channel.is_some())
+                        + usize::from(m.y_channel.is_some())
+                        + usize::from(m.value_channel.is_some())
+                }
+                PanelConfig::Fft(f) => slots += f.channels.len(),
+                PanelConfig::Calculations(c) => {
+                    slots += c.channels.len();
+                    assert_eq!(c.interval_seconds, 0.25);
+                    assert_eq!(c.suspension_bins, 51);
+                    assert!(c.suspension_line);
+                    assert_eq!(
+                        c.suspension_output,
+                        crate::panels::calculations::DistributionOutput::Percent
+                    );
+                }
+                PanelConfig::Report(r) => slots += r.channels.len(),
+                PanelConfig::TrackMap(t) => {
+                    assert_eq!(t.color_channel_name.as_deref(), Some("Missing GPS colour"))
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(slots, 12);
+    }
+}
+
+fn default_interval_width() -> f64 {
+    100.
+}
+
+fn default_velocity_bins() -> usize {
+    41
 }

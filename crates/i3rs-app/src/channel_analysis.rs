@@ -160,6 +160,18 @@ impl SharedState {
 
     pub fn channel_enabled(&self, id: ChannelId) -> bool {
         match id {
+            ChannelId::Unresolved(_) => false,
+            ChannelId::Analysis(i) => {
+                self.unresolved_references
+                    .borrow()
+                    .get(i)
+                    .is_some_and(|(name, _)| {
+                        matches!(
+                            self.resolve_analysis_reference(name),
+                            ChannelResolution::Resolved { .. }
+                        )
+                    })
+            }
             ChannelId::Physical(_) => self.channel_settings.enabled("Logged"),
             ChannelId::Math(idx) => self.math_channels.get(idx).is_some_and(|mc| {
                 self.channel_settings.enabled(&mc.options.source)

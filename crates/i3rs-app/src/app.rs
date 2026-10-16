@@ -30,6 +30,7 @@ use crate::state::SharedState;
 
 /// A named workspace layout.
 struct Worksheet {
+    window: crate::workspace::WorksheetWindow,
     name: String,
     dock_state: DockState<PanelTab>,
 }
@@ -132,6 +133,9 @@ pub struct App {
     project_name: Option<String>,
     project_sessions: Vec<ProjectSessionRecord>,
     theme_choice: ThemeChoice,
+    options: crate::preferences::AppOptions,
+    show_options: bool,
+    show_help: bool,
     show_channel_preferences: bool,
     show_session_details: bool,
     recording_editor: crate::panels::recording_editor::RecordingEditor,
@@ -159,15 +163,18 @@ impl App {
         let (web_load_tx, web_load_rx) = crate::platform::web_load_channel();
         #[cfg(not(target_arch = "wasm32"))]
         let (native_pick_tx, native_pick_rx) = crate::platform::native_pick_channel();
+        crate::preferences::install_fonts(&cc.egui_ctx);
         let preferences = crate::preferences::load_preferences();
         let mut shared = SharedState::new();
         shared.channel_preferences = preferences.channel_preferences.clone();
         let dock_state = Self::default_dock_state(&mut shared);
         let worksheets = vec![Worksheet {
+            window: Default::default(),
             name: "Sheet 1".into(),
             dock_state,
         }];
         apply_theme_to_ctx(&cc.egui_ctx, preferences.theme);
+        preferences.options.apply(&cc.egui_ctx);
         Self {
             egui_ctx: cc.egui_ctx.clone(),
             shared,
@@ -183,6 +190,9 @@ impl App {
             project_name: None,
             project_sessions: Vec::new(),
             theme_choice: preferences.theme,
+            options: preferences.options,
+            show_options: false,
+            show_help: false,
             show_channel_preferences: false,
             show_session_details: false,
             recording_editor: Default::default(),
@@ -223,14 +233,19 @@ impl App {
         let mut workspace =
             crate::workspace::save_workspace(&ws_refs, self.active_worksheet, &self.shared);
 
+        for (saved, ws) in workspace.worksheets.iter_mut().zip(&self.worksheets) {
+            saved.window = ws.window.clone();
+        }
         if include_popped_out_track_maps {
             // Preserve popped-out track maps in the worksheet they came from.
             for tm in &self.popped_out_track_maps {
-                let color_channel_name = tm.color_channel_idx.and_then(|idx| {
-                    self.shared
-                        .ld_file
-                        .as_ref()
-                        .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
+                let color_channel_name = tm.requested_color.clone().or_else(|| {
+                    tm.color_channel_idx.and_then(|idx| {
+                        self.shared
+                            .ld_file
+                            .as_ref()
+                            .and_then(|ld| ld.channels.get(idx).map(|ch| ch.name.clone()))
+                    })
                 });
                 let worksheet_idx = tm
                     .home_worksheet
@@ -238,6 +253,10 @@ impl App {
                 if let Some(ws) = workspace.worksheets.get_mut(worksheet_idx) {
                     ws.panels.push(crate::workspace::PanelConfig::TrackMap(
                         crate::workspace::TrackMapPanelConfig {
+                            window: crate::workspace::WorksheetWindow {
+                                detached: true,
+                                ..tm.window.clone()
+                            },
                             id: tm.id,
                             title: tm.title.clone(),
                             color_channel_name,
@@ -266,8 +285,33 @@ impl App {
         let loaded = crate::workspace::load_workspace(&workspace, &mut self.shared);
         self.worksheets = loaded
             .into_iter()
-            .map(|(name, dock_state)| Worksheet { name, dock_state })
+            .map(|(name, dock_state)| Worksheet {
+                name,
+                dock_state,
+                window: Default::default(),
+            })
             .collect();
+        for (ws, saved) in self.worksheets.iter_mut().zip(&workspace.worksheets) {
+            ws.window = saved.window.clone();
+            #[cfg(target_arch = "wasm32")]
+            {
+                ws.window.detached = false;
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        for ws in &mut self.worksheets {
+            while let Some(path) = ws
+                .dock_state
+                .find_tab_from(|tab| matches!(tab,PanelTab::TrackMap(t) if t.is_popped_out))
+            {
+                if let Some(PanelTab::TrackMap(map)) = ws.dock_state.remove_tab(path) {
+                    self.popped_out_track_maps.retain(|old| old.id != map.id);
+                    self.popped_out_track_maps.push(map);
+                } else {
+                    break;
+                }
+            }
+        }
         self.active_worksheet = active_worksheet.min(self.worksheets.len().saturating_sub(1));
     }
 
@@ -333,6 +377,8 @@ impl App {
         self.shared.ld_path = loaded.ld_path;
         self.shared.selected_lap = None;
         self.shared.cursor_time = None;
+        self.shared.measurement_cursor = None;
+        self.shared.comparisons = Default::default();
         self.shared.playback_active = false;
         self.shared.zoom_range = Some((0.0, loaded.data_duration));
         self.shared.invalidate_session_caches();
@@ -363,6 +409,7 @@ impl App {
                     PanelTab::Fft(f) => f.clear_channels(),
                     PanelTab::Gauge(g) => g.clear_channels(),
                     PanelTab::MixtureMap(m) => m.clear_channels(),
+                    PanelTab::Calculations(p) => p.channels.clear(),
                     _ => {}
                 }
             }
@@ -386,7 +433,11 @@ impl App {
             if !defaults.is_empty() {
                 self.worksheets = defaults
                     .into_iter()
-                    .map(|(name, dock_state)| Worksheet { name, dock_state })
+                    .map(|(name, dock_state)| Worksheet {
+                        name,
+                        dock_state,
+                        window: Default::default(),
+                    })
                     .collect();
                 self.active_worksheet = 0;
             }
@@ -698,6 +749,10 @@ impl App {
             math_editor::reevaluate_math_channels_waiting_on_inputs(&mut self.shared);
             ctx.request_repaint();
         }
+        // Disabled/out-of-recording definitions can all settle locally without
+        // emitting a background result. Their completion must also restore the
+        // saved components after switching Main recordings.
+        self.maybe_apply_pending_workspace_restore();
     }
 
     fn submit_requested_track_data_build(&mut self, ctx: &egui::Context) {
@@ -835,6 +890,7 @@ impl App {
     fn persist_preferences(&self) {
         let preferences = AppPreferences {
             theme: self.theme_choice,
+            options: self.options.clone(),
             channel_preferences: self.shared.channel_preferences.clone(),
         };
 
@@ -849,13 +905,11 @@ impl App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let messages = self.shared.analysis_messages.clone();
-            let session_id = self.shared.session_id;
-            std::thread::spawn(move || {
-                if let Err(e) = crate::preferences::save_preferences(&preferences) {
-                    messages.record(session_id, format!("Failed to save preferences: {e}"));
-                }
-            });
+            crate::preferences::queue_save(
+                preferences,
+                self.shared.analysis_messages.clone(),
+                self.shared.session_id,
+            );
         }
     }
 
@@ -1108,6 +1162,7 @@ impl App {
             .clicked();
         if changed {
             apply_theme_to_ctx(ctx, self.theme_choice);
+            self.options.apply(ctx);
             self.persist_preferences();
         }
     }
@@ -1364,74 +1419,115 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        use egui::{Key, KeyboardShortcut, Modifiers};
+        let mut bindings = self.options.shortcuts.clone();
+        bindings.sort_by_key(|b| std::cmp::Reverse((b.shift as u8) + (b.alt as u8)));
+        for binding in bindings {
+            let Some(shortcut) = binding.shortcut() else {
+                continue;
+            };
+            if ctx.egui_wants_keyboard_input() && !binding.command {
+                continue;
+            }
+            if !ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+                continue;
+            }
+            match binding.action.as_str() {
+                "Open" => self.start_open_session(ctx),
+                "Save project" => self.save_project(),
+                "Load project" => self.load_project(),
+                "Save workspace" => self.save_workspace(),
+                "Channels" => self.show_channel_browser = !self.show_channel_browser,
+                "Readout" => self.show_cursor_readout = !self.show_cursor_readout,
+                "Maths" => self.show_math_editor = !self.show_math_editor,
+                "Details" => self.show_session_details = true,
+                "Options" => self.show_options = true,
+                "Help" => self.show_help = true,
+                "Graph" => self.add_graph_panel(),
+                "Track map" => self.add_track_map_panel(),
+                "Histogram" => self.add_histogram_panel(),
+                "Scatter" => self.add_scatter_panel(),
+                "FFT" => self.add_fft_panel(),
+                "Previous worksheet" => {
+                    self.active_worksheet =
+                        (self.active_worksheet + self.worksheets.len() - 1) % self.worksheets.len()
+                }
+                "Next worksheet" => {
+                    self.active_worksheet = (self.active_worksheet + 1) % self.worksheets.len()
+                }
+                _ => {}
+            }
+        }
+    }
 
-        let command = Modifiers::COMMAND;
-        let command_shift = Modifiers {
-            command: true,
-            shift: true,
-            ..Default::default()
-        };
-
-        let open_file = KeyboardShortcut::new(command, Key::O);
-        let save_project = KeyboardShortcut::new(command, Key::S);
-        let load_project = KeyboardShortcut::new(command_shift, Key::O);
-        let save_workspace = KeyboardShortcut::new(command_shift, Key::S);
-        let toggle_browser = KeyboardShortcut::new(command, Key::B);
-        let toggle_readout = KeyboardShortcut::new(command, Key::R);
-        let toggle_math = KeyboardShortcut::new(command, Key::M);
-        let show_details = KeyboardShortcut::new(command, Key::I);
-        let show_prefs = KeyboardShortcut::new(command, Key::Comma);
-        let add_graph = KeyboardShortcut::new(command, Key::G);
-        let add_track_map = KeyboardShortcut::new(command_shift, Key::T);
-        let add_histogram = KeyboardShortcut::new(command_shift, Key::H);
-        let add_scatter = KeyboardShortcut::new(command_shift, Key::X);
-        let add_fft = KeyboardShortcut::new(command_shift, Key::F);
-
-        // egui allows extra Shift/Alt modifiers, so consume the more specific
-        // shortcuts first before their unshifted counterparts.
-        if ctx.input_mut(|i| i.consume_shortcut(&load_project)) {
-            self.load_project();
+    fn show_options_and_help(&mut self, ctx: &egui::Context) {
+        let l = self.options.language;
+        let mut open = self.show_options;
+        let before = serde_json::to_string(&self.options).unwrap_or_default();
+        egui::Window::new(l.text(
+            "Application options",
+            "Options de l’application",
+            "アプリケーション設定",
+        ))
+        .id(egui::Id::new("application-options"))
+        .open(&mut open)
+        .vscroll(true)
+        .show(ctx, |ui| {
+            self.options.controls(ui);
+            ui.separator();
+            ui.collapsing(
+                l.text(
+                    "Analysis and circuit",
+                    "Analyse et circuit",
+                    "解析とサーキット",
+                ),
+                |ui| {
+                    ui.checkbox(
+                        &mut self.shared.show_lap_markers,
+                        l.text("Lap markers", "Repères de tours", "ラップマーカー"),
+                    );
+                    ui.checkbox(
+                        &mut self.show_cursor_readout,
+                        l.text("Cursor readout", "Valeurs du curseur", "カーソル値"),
+                    );
+                    if ui
+                        .button(l.text(
+                            "Ranges, corrections and details",
+                            "Plages, corrections et détails",
+                            "範囲・補正・詳細",
+                        ))
+                        .clicked()
+                    {
+                        self.shared.show_recording_editor = true;
+                    }
+                },
+            );
+            if ui
+                .button(l.text(
+                    "Channel preferences",
+                    "Préférences des canaux",
+                    "チャンネル設定",
+                ))
+                .clicked()
+            {
+                self.show_channel_preferences = true;
+            }
+            if ui.button(l.text("Help", "Aide", "ヘルプ")).clicked() {
+                self.show_help = true;
+            }
+        });
+        self.show_options = open;
+        if serde_json::to_string(&self.options).unwrap_or_default() != before {
+            apply_theme_to_ctx(ctx, self.theme_choice);
+            self.options.apply(ctx);
+            self.persist_preferences();
         }
-        if ctx.input_mut(|i| i.consume_shortcut(&save_workspace)) {
-            self.save_workspace();
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&open_file)) {
-            self.start_open_session(ctx);
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&save_project)) {
-            self.save_project();
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&toggle_browser)) {
-            self.show_channel_browser = !self.show_channel_browser;
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&toggle_readout)) {
-            self.show_cursor_readout = !self.show_cursor_readout;
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&toggle_math)) {
-            self.show_math_editor = !self.show_math_editor;
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&show_details)) {
-            self.show_session_details = true;
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&show_prefs)) {
-            self.show_channel_preferences = true;
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&add_graph)) {
-            self.add_graph_panel();
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&add_track_map)) {
-            self.add_track_map_panel();
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&add_histogram)) {
-            self.add_histogram_panel();
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&add_scatter)) {
-            self.add_scatter_panel();
-        }
-        if ctx.input_mut(|i| i.consume_shortcut(&add_fft)) {
-            self.add_fft_panel();
-        }
+        egui::Window::new(l.text("Help","Aide","ヘルプ")).open(&mut self.show_help).vscroll(true).show(ctx,|ui| {
+            ui.label(l.text("Open a log, choose a lap, then drag channels onto a component. Right-click a channel for units, scales and display settings.","Ouvrez un enregistrement, choisissez un tour et glissez des canaux sur un composant. Le clic droit règle les unités, échelles et l’affichage.","ログを開き、ラップを選び、チャンネルをパネルへドラッグします。右クリックで単位・スケール・表示を設定できます。"));
+            ui.label(l.text("Graphs share Main and Overlay selections. Drag to zoom; use the graph commands for precise ranges. Pin cursor B in Readout for interval statistics. Overview and local views can follow their own ranges.","Les graphiques partagent les sélections Main et Overlay. Utilisez les commandes pour une plage précise et le curseur B pour les statistiques d’intervalle.","グラフは Main と Overlay を共有します。範囲操作でズームし、Readout の B カーソルで区間統計を表示します。"));
+            ui.label(l.text("Distributions use native finite samples in half-open ranges. Positive gate values include samples; missing gates exclude all. Hiding a colour band changes presentation only.","Les distributions utilisent les échantillons natifs finis. Une valeur de filtre positive inclut l’échantillon. Masquer une bande ne change pas les totaux.","分布は範囲内の有効な元サンプルを使用します。ゲートが正なら含め、欠損なら除外します。色帯の非表示は集計値を変えません。"));
+            ui.separator();
+            for binding in &self.options.shortcuts {ui.label(format!("{}: {}{}{}{}",binding.action,if binding.command{"Command+"}else{""},if binding.shift{"Shift+"}else{""},if binding.alt{"Alt+"}else{""},binding.key));}
+        });
     }
 
     fn add_graph_panel(&mut self) {
@@ -1479,7 +1575,7 @@ impl App {
         let scatter = ScatterPanel::new(id, format!("Scatter {}", id));
         self.worksheets[self.active_worksheet]
             .dock_state
-            .push_to_focused_leaf(PanelTab::Scatter(scatter));
+            .push_to_focused_leaf(PanelTab::Scatter(Box::new(scatter)));
     }
 
     fn add_fft_panel(&mut self) {
@@ -1506,13 +1602,14 @@ impl App {
         let mixture_map = MixtureMapPanel::new(id, format!("Mixture Map {}", id));
         self.worksheets[self.active_worksheet]
             .dock_state
-            .push_to_focused_leaf(PanelTab::MixtureMap(mixture_map));
+            .push_to_focused_leaf(PanelTab::MixtureMap(Box::new(mixture_map)));
     }
 
     fn add_worksheet(&mut self) {
         let idx = self.worksheets.len() + 1;
         let dock_state = Self::default_dock_state(&mut self.shared);
         self.worksheets.push(Worksheet {
+            window: Default::default(),
             name: format!("Sheet {}", idx),
             dock_state,
         });
@@ -1602,166 +1699,203 @@ impl App {
 
     fn show_menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("Open .ld file...").clicked() {
-                    self.start_open_session(ctx);
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Save Workspace...").clicked() {
-                    self.save_workspace();
-                    ui.close();
-                }
-                if ui.button("Save Project...").clicked() {
-                    self.save_project();
-                    ui.close();
-                }
-                if ui.button("Load Workspace...").clicked() {
-                    self.load_workspace();
-                    ui.close();
-                }
-                if ui.button("Load Project...").clicked() {
-                    self.load_project();
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Save Math Channels...").clicked() {
-                    math_editor::save_math_channels(&self.shared);
-                    ui.close();
-                }
-                if ui.button("Load Math Channels...").clicked() {
-                    math_editor::load_math_channels(&mut self.shared);
-                    ui.close();
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(
-                        !self.shared.display_channel_registry.is_empty(),
-                        egui::Button::new("Export CSV..."),
-                    )
-                    .clicked()
-                {
-                    self.export_csv();
-                    ui.close();
-                }
-            });
-            ui.menu_button("View", |ui| {
-                if ui.button("Add Graph Panel").clicked() {
-                    self.add_graph_panel();
-                    ui.close();
-                }
-                if ui.button("Add Report Panel").clicked() {
-                    self.add_report_panel();
-                    ui.close();
-                }
-                if ui.button("Add Track Map").clicked() {
-                    self.add_track_map_panel();
-                    ui.close();
-                }
-                if ui.button("Add Histogram").clicked() {
-                    self.add_histogram_panel();
-                    ui.close();
-                }
-                if ui.button("Add Scatter Plot").clicked() {
-                    self.add_scatter_panel();
-                    ui.close();
-                }
-                if ui.button("Add FFT").clicked() {
-                    self.add_fft_panel();
-                    ui.close();
-                }
-                if ui.button("Add Gauges").clicked() {
-                    self.add_gauge_panel();
-                    ui.close();
-                }
-                if ui.button("Add Mixture Map").clicked() {
-                    self.add_mixture_map_panel();
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("Add Worksheet").clicked() {
-                    self.add_worksheet();
-                    ui.close();
-                }
-                ui.separator();
-
-                // Graph mode
-                let dock = &mut self.worksheets[self.active_worksheet].dock_state;
-                let mut current_mode = None;
-                let mut current_x_axis = None;
-                for (_path, tab) in dock.iter_all_tabs() {
-                    if let PanelTab::Graph(g) = tab {
-                        current_mode = Some(g.graph_mode);
-                        current_x_axis = Some(g.x_axis_mode);
-                        break;
-                    }
-                }
-                if let Some(mut mode) = current_mode {
-                    let changed_tiled = ui
-                        .radio_value(&mut mode, crate::state::GraphMode::Tiled, "Tiled")
-                        .clicked();
-                    let changed_overlay = ui
-                        .radio_value(&mut mode, crate::state::GraphMode::Overlay, "Overlay")
-                        .clicked();
-                    if changed_tiled || changed_overlay {
-                        for (_path, tab) in dock.iter_all_tabs_mut() {
-                            if let PanelTab::Graph(g) = tab {
-                                g.graph_mode = mode;
-                            }
-                        }
+            ui.menu_button(
+                self.options.language.text("File", "Fichier", "ファイル"),
+                |ui| {
+                    if ui.button("Open .ld file...").clicked() {
+                        self.start_open_session(ctx);
                         ui.close();
                     }
-                }
-
-                if let Some(mut x_axis_mode) = current_x_axis {
                     ui.separator();
-                    ui.label("Graph X-axis");
-                    let changed_time = ui
-                        .radio_value(&mut x_axis_mode, crate::state::GraphXAxis::Time, "Time")
-                        .clicked();
-                    let changed_distance = ui
-                        .radio_value(
-                            &mut x_axis_mode,
-                            crate::state::GraphXAxis::Distance,
-                            "Distance",
-                        )
-                        .clicked();
-                    if changed_time || changed_distance {
-                        for (_path, tab) in dock.iter_all_tabs_mut() {
-                            if let PanelTab::Graph(g) = tab {
-                                g.x_axis_mode = x_axis_mode;
-                            }
-                        }
+                    if ui.button("Save Workspace...").clicked() {
+                        self.save_workspace();
                         ui.close();
                     }
-                }
+                    if ui.button("Save Project...").clicked() {
+                        self.save_project();
+                        ui.close();
+                    }
+                    if ui.button("Load Workspace...").clicked() {
+                        self.load_workspace();
+                        ui.close();
+                    }
+                    if ui.button("Load Project...").clicked() {
+                        self.load_project();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Save Math Channels...").clicked() {
+                        math_editor::save_math_channels(&self.shared);
+                        ui.close();
+                    }
+                    if ui.button("Load Math Channels...").clicked() {
+                        math_editor::load_math_channels(&mut self.shared);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            !self.shared.display_channel_registry.is_empty(),
+                            egui::Button::new("Export CSV..."),
+                        )
+                        .clicked()
+                    {
+                        self.export_csv();
+                        ui.close();
+                    }
+                },
+            );
+            ui.menu_button(
+                self.options.language.text("View", "Affichage", "表示"),
+                |ui| {
+                    if ui.button("Add Graph Panel").clicked() {
+                        self.add_graph_panel();
+                        ui.close();
+                    }
+                    if ui.button("Add Report Panel").clicked() {
+                        self.add_report_panel();
+                        ui.close();
+                    }
+                    if ui.button("Add Track Map").clicked() {
+                        self.add_track_map_panel();
+                        ui.close();
+                    }
+                    if ui.button("Add Histogram").clicked() {
+                        self.add_histogram_panel();
+                        ui.close();
+                    }
+                    if ui.button("Add Scatter Plot").clicked() {
+                        self.add_scatter_panel();
+                        ui.close();
+                    }
+                    if ui.button("Add FFT").clicked() {
+                        self.add_fft_panel();
+                        ui.close();
+                    }
+                    if ui.button("Add Gauges").clicked() {
+                        self.add_gauge_panel();
+                        ui.close();
+                    }
+                    if ui.button("Add Interval / Suspension Analysis").clicked() {
+                        let id = self.shared.next_panel_id;
+                        self.shared.next_panel_id += 1;
+                        self.worksheets[self.active_worksheet]
+                            .dock_state
+                            .push_to_focused_leaf(PanelTab::Calculations(
+                                crate::panels::calculations::CalculationsPanel::new(
+                                    id,
+                                    "Calculations",
+                                ),
+                            ));
+                        ui.close();
+                    }
+                    if ui.button("Add Mixture Map").clicked() {
+                        self.add_mixture_map_panel();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Add Worksheet").clicked() {
+                        self.add_worksheet();
+                        ui.close();
+                    }
+                    ui.separator();
 
-                ui.separator();
-                ui.checkbox(&mut self.shared.show_lap_markers, "Show lap markers");
-                ui.separator();
-                ui.checkbox(&mut self.show_channel_browser, "Channel Browser");
-                ui.checkbox(&mut self.show_cursor_readout, "Cursor Readout");
-                ui.checkbox(&mut self.show_math_editor, "Math Editor");
-                ui.checkbox(
-                    &mut self.shared.show_channel_status,
-                    "Channel Status / Messages",
-                );
-                ui.checkbox(
-                    &mut self.shared.show_recording_editor,
-                    "Ranges / Corrections / Details",
-                );
-                if ui.button("Session Details").clicked() {
-                    self.show_session_details = true;
-                    ui.close();
-                }
-                if ui.button("Global Channel Preferences").clicked() {
-                    self.show_channel_preferences = true;
-                    ui.close();
-                }
-                ui.separator();
-                ui.label("Theme");
-                self.show_theme_menu(ui, ctx);
-            });
+                    // Graph mode
+                    let dock = &mut self.worksheets[self.active_worksheet].dock_state;
+                    let mut current_mode = None;
+                    let mut current_x_axis = None;
+                    for (_path, tab) in dock.iter_all_tabs() {
+                        if let PanelTab::Graph(g) = tab {
+                            current_mode = Some(g.graph_mode);
+                            current_x_axis = Some(g.x_axis_mode);
+                            break;
+                        }
+                    }
+                    if let Some(mut mode) = current_mode {
+                        let changed_tiled = ui
+                            .radio_value(&mut mode, crate::state::GraphMode::Tiled, "Tiled")
+                            .clicked();
+                        let changed_overlay = ui
+                            .radio_value(&mut mode, crate::state::GraphMode::Overlay, "Overlay")
+                            .clicked();
+                        if changed_tiled || changed_overlay {
+                            for (_path, tab) in dock.iter_all_tabs_mut() {
+                                if let PanelTab::Graph(g) = tab {
+                                    g.graph_mode = mode;
+                                }
+                            }
+                            ui.close();
+                        }
+                    }
+
+                    if let Some(mut x_axis_mode) = current_x_axis {
+                        ui.separator();
+                        ui.label("Graph X-axis");
+                        let changed_time = ui
+                            .radio_value(&mut x_axis_mode, crate::state::GraphXAxis::Time, "Time")
+                            .clicked();
+                        let changed_distance = ui
+                            .radio_value(
+                                &mut x_axis_mode,
+                                crate::state::GraphXAxis::Distance,
+                                "Distance",
+                            )
+                            .clicked();
+                        if changed_time || changed_distance {
+                            for (_path, tab) in dock.iter_all_tabs_mut() {
+                                if let PanelTab::Graph(g) = tab {
+                                    g.x_axis_mode = x_axis_mode;
+                                }
+                            }
+                            ui.close();
+                        }
+                    }
+
+                    ui.separator();
+                    ui.checkbox(&mut self.shared.show_lap_markers, "Show lap markers");
+                    ui.separator();
+                    ui.checkbox(&mut self.show_channel_browser, "Channel Browser");
+                    ui.checkbox(&mut self.show_cursor_readout, "Cursor Readout");
+                    ui.checkbox(&mut self.show_math_editor, "Math Editor");
+                    ui.checkbox(
+                        &mut self.shared.show_channel_status,
+                        "Channel Status / Messages",
+                    );
+                    ui.checkbox(
+                        &mut self.shared.show_recording_editor,
+                        "Ranges / Corrections / Details",
+                    );
+                    if ui.button("Session Details").clicked() {
+                        self.show_session_details = true;
+                        ui.close();
+                    }
+                    if ui.button("Global Channel Preferences").clicked() {
+                        self.show_channel_preferences = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .button(self.options.language.text(
+                            "Application options",
+                            "Options",
+                            "設定",
+                        ))
+                        .clicked()
+                    {
+                        self.show_options = true;
+                        ui.close();
+                    }
+                    if ui
+                        .button(self.options.language.text("Help", "Aide", "ヘルプ"))
+                        .clicked()
+                    {
+                        self.show_help = true;
+                        ui.close();
+                    }
+                    ui.label("Theme");
+                    self.show_theme_menu(ui, ctx);
+                },
+            );
         });
     }
 
@@ -1874,15 +2008,39 @@ impl App {
     }
 
     fn show_worksheet_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let mut new_active = self.active_worksheet;
-            for (i, ws) in self.worksheets.iter().enumerate() {
+            if ui.small_button("‹").clicked() {
+                new_active =
+                    (self.active_worksheet + self.worksheets.len() - 1) % self.worksheets.len();
+            }
+            for (i, ws) in self.worksheets.iter_mut().enumerate() {
                 let selected = i == self.active_worksheet;
-                if ui.selectable_label(selected, &ws.name).clicked() {
+                let response = ui.selectable_label(selected, &ws.name);
+                if response.clicked() {
                     new_active = i;
                 }
+                response.context_menu(|ui| {
+                    ui.label("Worksheet name");
+                    ui.text_edit_singleline(&mut ws.name);
+                });
+            }
+            if ui.small_button("›").clicked() {
+                new_active = (self.active_worksheet + 1) % self.worksheets.len();
             }
             self.active_worksheet = new_active;
+            #[cfg(not(target_arch = "wasm32"))]
+            if ui
+                .small_button(if self.worksheets[new_active].window.detached {
+                    "Dock worksheet"
+                } else {
+                    "Detach worksheet"
+                })
+                .clicked()
+            {
+                self.worksheets[new_active].window.detached =
+                    !self.worksheets[new_active].window.detached;
+            }
 
             if ui.small_button("+").clicked() {
                 self.add_worksheet();
@@ -2157,21 +2315,66 @@ impl eframe::App for App {
             .nth(1)
             .is_some();
 
-        // Dock area fills the rest (graph + report panels)
-        let dock = &mut self.worksheets[self.active_worksheet].dock_state;
-        let mut viewer = AppTabViewer {
-            shared: &mut self.shared,
-        };
-        let mut dock_style = egui_dock::Style::from_egui(ui.style().as_ref());
-        if !show_inner_tab_bar {
-            dock_style.tab_bar.height = 0.0;
+        // Each worksheet is rendered once, using either the main surface or its own native viewport.
+        if !self.worksheets[self.active_worksheet].window.detached {
+            let dock = &mut self.worksheets[self.active_worksheet].dock_state;
+            let mut viewer = AppTabViewer {
+                shared: &mut self.shared,
+            };
+            let mut dock_style = egui_dock::Style::from_egui(ui.style().as_ref());
+            if !show_inner_tab_bar {
+                dock_style.tab_bar.height = 0.0;
+            }
+            DockArea::new(dock)
+                .style(dock_style)
+                .show_close_buttons(show_inner_tab_bar)
+                .show_leaf_collapse_buttons(false)
+                .draggable_tabs(true)
+                .show_inside(ui, &mut viewer);
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label("This worksheet is open in a separate window");
+            });
         }
-        DockArea::new(dock)
-            .style(dock_style)
-            .show_close_buttons(show_inner_tab_bar)
-            .show_leaf_collapse_buttons(false)
-            .draggable_tabs(true)
-            .show_inside(ui, &mut viewer);
+        #[cfg(not(target_arch = "wasm32"))]
+        for (index, worksheet) in self
+            .worksheets
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, w)| w.window.detached)
+        {
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title(format!("i3rs — {}", worksheet.name))
+                .with_inner_size(worksheet.window.size);
+            if let Some(position) = worksheet.window.position {
+                builder = builder.with_position(position);
+            }
+            ui.ctx().show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("worksheet", index)),
+                builder,
+                |child, _| {
+                    if child.input(|i| i.viewport().close_requested()) {
+                        worksheet.window.detached = false;
+                    }
+                    if let Some(rect) = child.input(|i| i.viewport().inner_rect) {
+                        worksheet.window.size = [rect.width(), rect.height()];
+                    }
+                    if let Some(rect) = child.input(|i| i.viewport().outer_rect) {
+                        worksheet.window.position = Some([rect.min.x, rect.min.y]);
+                    }
+                    if child.button("Dock worksheet").clicked() {
+                        worksheet.window.detached = false;
+                    }
+                    let mut viewer = AppTabViewer {
+                        shared: &mut self.shared,
+                    };
+                    DockArea::new(&mut worksheet.dock_state)
+                        .id(egui::Id::new(("detached_dock", index)))
+                        .draggable_tabs(true)
+                        .show_inside(child, &mut viewer);
+                },
+            );
+        }
 
         if self.shared.dragging_channel.is_some() {
             if ui.input(|i| i.pointer.any_released()) {
@@ -2183,18 +2386,19 @@ impl eframe::App for App {
 
         #[cfg(not(target_arch = "wasm32"))]
         // Pop-out: move track map panels that requested pop-out from dock to separate windows
-        let dock = &mut self.worksheets[self.active_worksheet].dock_state;
-        #[cfg(not(target_arch = "wasm32"))]
-        while let Some(path) =
-            dock.find_tab_from(|t| matches!(t, PanelTab::TrackMap(tm) if tm.pop_out_requested))
-        {
-            if let Some(PanelTab::TrackMap(mut tm)) = dock.remove_tab(path) {
-                tm.pop_out_requested = false;
-                tm.is_popped_out = true;
-                tm.home_worksheet = self.active_worksheet;
-                self.popped_out_track_maps.push(tm);
-            } else {
-                break;
+        for (worksheet_index, worksheet) in self.worksheets.iter_mut().enumerate() {
+            let dock = &mut worksheet.dock_state;
+            while let Some(path) =
+                dock.find_tab_from(|t| matches!(t, PanelTab::TrackMap(tm) if tm.pop_out_requested))
+            {
+                if let Some(PanelTab::TrackMap(mut tm)) = dock.remove_tab(path) {
+                    tm.pop_out_requested = false;
+                    tm.is_popped_out = true;
+                    tm.home_worksheet = worksheet_index;
+                    self.popped_out_track_maps.push(tm);
+                } else {
+                    break;
+                }
             }
         }
 
@@ -2206,15 +2410,23 @@ impl eframe::App for App {
         #[cfg(not(target_arch = "wasm32"))]
         for tm in popped_out.iter_mut() {
             let viewport_id = egui::ViewportId::from_hash_of(format!("track_map_{}", tm.id));
-            ui.ctx().show_viewport_immediate(
-                viewport_id,
-                egui::ViewportBuilder::default()
-                    .with_title(format!("Track Map — {}", tm.title))
-                    .with_inner_size([800.0, 600.0]),
-                |viewport_ui, _class| {
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title(format!("Track Map — {}", tm.title))
+                .with_inner_size(tm.window.size)
+                .with_min_inner_size([320., 240.]);
+            if let Some(position) = tm.window.position {
+                builder = builder.with_position(position);
+            }
+            ui.ctx()
+                .show_viewport_immediate(viewport_id, builder, |viewport_ui, _class| {
+                    if let Some(rect) = viewport_ui.input(|i| i.viewport().inner_rect) {
+                        tm.window.size = [rect.width(), rect.height()];
+                    }
+                    if let Some(rect) = viewport_ui.input(|i| i.viewport().outer_rect) {
+                        tm.window.position = Some([rect.min.x, rect.min.y]);
+                    }
                     tm.ui(viewport_ui, shared);
-                },
-            );
+                });
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -2238,7 +2450,34 @@ impl eframe::App for App {
         }
 
         crate::panels::channel_status::show(ui.ctx(), &mut self.shared);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(index) = self.shared.comparisons.pending_swap.take() {
+            if let Some(current) = self
+                .shared
+                .ld_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+            {
+                let mut workspace = self.build_workspace_snapshot_with_popped_out_track_maps(true);
+                if let Some(config) = workspace.comparisons.as_mut() {
+                    match crate::comparison::swap_external_main(config, &current, index) {
+                        Ok(path) => {
+                            workspace.last_file_path = Some(path.clone());
+                            self.open_file_async(path.into(), ui.ctx());
+                            if let Some(pending) = self.pending_session_load.as_mut() {
+                                pending.workspace_snapshot = Some(workspace);
+                            }
+                        }
+                        Err(error) => self.shared.message(error),
+                    }
+                }
+            } else {
+                self.shared
+                    .message("Cannot swap an uploaded Main recording without a reusable path");
+            }
+        }
         self.show_channel_preferences_window(ui.ctx());
+        self.show_options_and_help(ui.ctx());
         self.show_session_details_window(ui.ctx());
         self.recording_editor.show(ui.ctx(), &mut self.shared);
         self.submit_requested_channel_decodes(ui.ctx());
@@ -2265,6 +2504,7 @@ mod tests {
 
     fn worksheet_with_tabs(tabs: Vec<PanelTab>) -> Worksheet {
         Worksheet {
+            window: Default::default(),
             name: "Test".into(),
             dock_state: DockState::new(tabs),
         }
@@ -2288,6 +2528,9 @@ mod tests {
             project_name: None,
             project_sessions: Vec::new(),
             theme_choice: ThemeChoice::System,
+            options: Default::default(),
+            show_options: false,
+            show_help: false,
             show_channel_preferences: false,
             show_session_details: false,
             recording_editor: Default::default(),
@@ -2382,6 +2625,8 @@ mod tests {
             display_offset: 0.0,
             display_unit: None,
             math_id: None,
+            requested_reference: None,
+            portable_source_unit: None,
             recording_display_base: None,
             math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
@@ -2412,6 +2657,8 @@ mod tests {
             display_offset: 0.0,
             display_unit: None,
             math_id: None,
+            requested_reference: None,
+            portable_source_unit: None,
             recording_display_base: None,
             math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
@@ -2525,6 +2772,8 @@ mod tests {
             display_offset: 0.0,
             display_unit: None,
             math_id: None,
+            requested_reference: None,
+            portable_source_unit: None,
             recording_display_base: None,
             math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
@@ -2587,5 +2836,151 @@ mod tests {
             restored_graph.plotted_channels[0].channel_id,
             ChannelId::Math(0)
         ));
+    }
+    #[test]
+    fn recording_scoped_math_errors_complete_layout_restore_without_background_results() {
+        let mut app = test_app(
+            SharedState::new(),
+            vec![worksheet_with_tabs(vec![
+                PanelTab::Graph(GraphPanel::new(1, "Graph")),
+                PanelTab::Histogram(HistogramPanel::new(2, "Histogram")),
+            ])],
+        );
+        app.open_file(TEST_LD.into());
+        let index = app
+            .shared
+            .ld_file
+            .as_ref()
+            .unwrap()
+            .find_channel_by_name("Engine Speed")
+            .unwrap()
+            .index;
+        let channel = crate::panels::utils::create_plotted_channel(
+            ChannelId::Physical(index),
+            &app.shared,
+            0,
+        )
+        .unwrap();
+        if let PanelTab::Graph(graph) = app.worksheets[0]
+            .dock_state
+            .iter_all_tabs_mut()
+            .next()
+            .unwrap()
+            .1
+        {
+            graph.plotted_channels.push(channel);
+        }
+        let mut math = app.shared.create_math_channel_def(
+            "Scoped coefficient".into(),
+            "1".into(),
+            "".into(),
+            2,
+        );
+        math.options.recording = Some("another-recording.ld".into());
+        app.shared.math_channels.push(math);
+        app.open_file(TEST_LD.into());
+        assert!(app.pending_workspace_restore.is_some());
+        app.submit_requested_math_channel_evaluations(&egui::Context::default());
+        assert!(app.pending_workspace_restore.is_none());
+        assert_eq!(
+            app.shared.math_channels[0].evaluation_state,
+            MathEvaluationState::Error
+        );
+        let graph = app.worksheets[0]
+            .dock_state
+            .iter_all_tabs()
+            .find_map(|(_, tab)| match tab {
+                PanelTab::Graph(graph) => Some(graph),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(graph.plotted_channels.len(), 1);
+        assert_eq!(
+            crate::panels::utils::resolve_channel_meta(
+                graph.plotted_channels[0].channel_id,
+                &app.shared
+            )
+            .0,
+            "Engine Speed"
+        );
+    }
+    #[test]
+    #[ignore = "requires local May 8 reference recording"]
+    fn external_main_swap_installs_recording_and_rebinds_component_slots() {
+        let mut app = test_app(
+            SharedState::new(),
+            vec![worksheet_with_tabs(vec![
+                PanelTab::Graph(GraphPanel::new(1, "Graph")),
+                PanelTab::Histogram(HistogramPanel::new(2, "Histogram")),
+            ])],
+        );
+        app.open_file(TEST_LD.into());
+        app.shared.comparisons.main_lap = Some(0);
+        let main = app
+            .shared
+            .ld_path
+            .as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let other = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../S1_#28299_20260508_174455_02.ld"
+        );
+        let mut graph = GraphPanel::new(99, "loader");
+        let source = graph.load_external_overlay_path(other.into()).unwrap();
+        app.shared.comparisons.sessions = graph.overlay_sessions;
+        app.shared
+            .comparisons
+            .overlays
+            .push(crate::panels::graph::LapOverlay {
+                alignment_valid: false,
+                gps_align: false,
+                visible: true,
+                color: None,
+                source: crate::panels::graph::OverlaySource::External(source),
+                lap_idx: 3,
+                manual_offset: 0.,
+                stretch_to_reference: false,
+            });
+        let mut workspace = app.build_workspace_snapshot();
+        let path = crate::comparison::swap_external_main(
+            workspace.comparisons.as_mut().unwrap(),
+            &main,
+            0,
+        )
+        .unwrap();
+        let loaded = load_session_from_path(path.into()).unwrap();
+        app.install_loaded_session(loaded, Some(workspace));
+        assert_eq!(app.shared.comparisons.main_lap, Some(3));
+        assert_eq!(app.shared.selected_lap, Some(3));
+        assert_eq!(app.shared.comparisons.sessions.len(), 1);
+        assert_eq!(app.shared.comparisons.sessions[0].path, PathBuf::from(main));
+        assert_eq!(app.shared.comparisons.overlays[0].lap_idx, 0);
+    }
+    #[test]
+    fn native_track_window_restore_preserves_geometry_without_duplicate_ownership() {
+        let mut app = test_app(
+            SharedState::new(),
+            vec![worksheet_with_tabs(vec![
+                PanelTab::Graph(GraphPanel::new(1, "G")),
+                PanelTab::Histogram(HistogramPanel::new(2, "H")),
+            ])],
+        );
+        let mut map = TrackMapPanel::new(3, "Map");
+        map.is_popped_out = true;
+        map.window.position = Some([120., 140.]);
+        map.window.size = [700., 500.];
+        app.popped_out_track_maps.push(map);
+        let workspace = app.build_workspace_snapshot();
+        let json = serde_json::to_string(&workspace).unwrap();
+        app.apply_workspace_snapshot(serde_json::from_str(&json).unwrap());
+        assert_eq!(app.popped_out_track_maps.len(), 1);
+        assert_eq!(
+            app.popped_out_track_maps[0].window.position,
+            Some([120., 140.])
+        );
+        assert_eq!(app.popped_out_track_maps[0].window.size, [700., 500.]);
+        assert_eq!(app.worksheets[0].dock_state.iter_all_tabs().count(), 2);
     }
 }

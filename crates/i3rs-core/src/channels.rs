@@ -316,6 +316,14 @@ pub fn unit_transform(from: &str, to: &str) -> Result<(f64, f64), String> {
             return None;
         }
         match unit.to_lowercase().replace(' ', "").as_str() {
+            "s" | "sec" | "second" | "seconds" => Some(("time", 1.0, 0.0)),
+            "ms" => Some(("time", 0.001, 0.0)),
+            "min" => Some(("time", 60.0, 0.0)),
+            "h" | "hour" => Some(("time", 3600.0, 0.0)),
+            "rpm" | "r/min" | "1/min" => Some(("angular speed", std::f64::consts::TAU / 60., 0.0)),
+            "rad/s" => Some(("angular speed", 1.0, 0.0)),
+            "mm/s" => Some(("speed", 0.001, 0.0)),
+            "in/s" => Some(("speed", 0.0254, 0.0)),
             "m/s" => Some(("speed", 1.0, 0.0)),
             "km/h" | "kph" => Some(("speed", 1.0 / 3.6, 0.0)),
             "mph" => Some(("speed", 0.44704, 0.0)),
@@ -326,6 +334,7 @@ pub fn unit_transform(from: &str, to: &str) -> Result<(f64, f64), String> {
             "m" => Some(("length", 1.0, 0.0)),
             "mm" => Some(("length", 0.001, 0.0)),
             "ft" => Some(("length", 0.3048, 0.0)),
+            "in" => Some(("length", 0.0254, 0.0)),
             "pa" => Some(("pressure", 1.0, 0.0)),
             "kpa" => Some(("pressure", 1000.0, 0.0)),
             "bar" => Some(("pressure", 100000.0, 0.0)),

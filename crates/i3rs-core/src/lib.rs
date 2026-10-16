@@ -6,6 +6,7 @@
 pub mod analysis;
 pub mod channels;
 pub mod distance;
+pub mod distribution;
 mod downsample;
 pub mod export;
 pub mod fft;

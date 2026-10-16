@@ -1,5 +1,6 @@
 //! UI panels for the application.
 
+pub mod calculations;
 pub mod channel_browser;
 pub mod channel_setup;
 pub mod channel_status;
@@ -34,16 +35,17 @@ use track_map::TrackMapPanel;
 
 /// Each dockable tab in the workspace.
 pub enum PanelTab {
+    Calculations(calculations::CalculationsPanel),
     Graph(GraphPanel),
     TrackMap(TrackMapPanel),
     ChannelBrowser,
     CursorReadout,
     Report(ReportPanel),
     Histogram(HistogramPanel),
-    Scatter(ScatterPanel),
+    Scatter(Box<ScatterPanel>),
     Fft(FftPanel),
     Gauge(GaugePanel),
-    MixtureMap(MixtureMapPanel),
+    MixtureMap(Box<MixtureMapPanel>),
 }
 
 /// Viewer that bridges shared state to individual panel tabs.
@@ -56,6 +58,7 @@ impl TabViewer for AppTabViewer<'_> {
 
     fn title(&mut self, tab: &mut PanelTab) -> egui::WidgetText {
         match tab {
+            PanelTab::Calculations(p) => p.title.clone().into(),
             PanelTab::Graph(g) => g.title.clone().into(),
             PanelTab::TrackMap(t) => t.title.clone().into(),
             PanelTab::ChannelBrowser => "Channels".into(),
@@ -71,6 +74,7 @@ impl TabViewer for AppTabViewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut PanelTab) {
         match tab {
+            PanelTab::Calculations(p) => p.ui(ui, self.shared),
             PanelTab::Graph(graph) => {
                 graph.ui(ui, self.shared);
             }
@@ -106,6 +110,7 @@ impl TabViewer for AppTabViewer<'_> {
 
     fn id(&mut self, tab: &mut PanelTab) -> egui::Id {
         match tab {
+            PanelTab::Calculations(p) => egui::Id::new(("calculations", p.id)),
             PanelTab::Graph(g) => egui::Id::new(format!("graph_{}", g.id)),
             PanelTab::TrackMap(t) => egui::Id::new(format!("trackmap_{}", t.id)),
             PanelTab::ChannelBrowser => egui::Id::new("channel_browser"),
@@ -122,7 +127,8 @@ impl TabViewer for AppTabViewer<'_> {
     fn is_closeable(&self, tab: &PanelTab) -> bool {
         matches!(
             tab,
-            PanelTab::Graph(_)
+            PanelTab::Calculations(_)
+                | PanelTab::Graph(_)
                 | PanelTab::TrackMap(_)
                 | PanelTab::Report(_)
                 | PanelTab::Histogram(_)

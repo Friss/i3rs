@@ -382,49 +382,99 @@ fn make_plotted_channel(
     Some(channel)
 }
 
+fn named_slot(
+    ld: &LdFile,
+    shared: &mut SharedState,
+    names: &[&str],
+    color: egui::Color32,
+    group: usize,
+) -> Option<PlottedChannel> {
+    let requested = *names.first()?;
+    let found = find_first_channel(ld, names);
+    let mut alternatives: Vec<String> = names.iter().map(|n| (*n).into()).collect();
+    if let Some(index) = found
+        && !alternatives.contains(&ld.channels[index].name)
+    {
+        alternatives.push(ld.channels[index].name.clone());
+    }
+    if alternatives.len() > 1 {
+        shared
+            .channel_settings
+            .aliases
+            .entry(requested.into())
+            .or_insert(alternatives);
+    }
+    let id = shared
+        .resolve_slot(requested, false)
+        .or_else(|| found.map(ChannelId::Physical))
+        .unwrap_or_else(|| shared.unresolved_channel(requested, false));
+    let mut channel = create_plotted_channel(id, shared, group)?;
+    channel.requested_reference = Some((requested.into(), false));
+    channel.color = color;
+    channel.tile_group = group;
+    Some(channel)
+}
+
 fn build_graph_panel(
     ld: &LdFile,
     shared: &mut SharedState,
     template: &GraphWorksheetTemplate,
 ) -> Option<GraphPanel> {
     let mut graph = GraphPanel::new(next_panel_id(shared), template.name);
-    let mut matched = Vec::new();
+    for gauge in template.embedded_gauges {
+        if let Some(channel) = named_slot(
+            ld,
+            shared,
+            gauge.names,
+            CHANNEL_COLORS[graph.embedded_gauges.len() % CHANNEL_COLORS.len()],
+            0,
+        ) {
+            graph
+                .embedded_gauges
+                .push(crate::panels::gauge::GaugeChannel {
+                    last_unit: None,
+                    channel,
+                    style: gauge.style,
+                    settings: Default::default(),
+                });
+        }
+    }
 
-    for (i, chan_name) in template.channels.iter().enumerate() {
-        let Some(chan_idx) = find_channel(ld, chan_name) else {
-            continue;
-        };
-        if matched.contains(&chan_idx) {
+    let mut matched = Vec::new();
+    for (i, name) in template.channels.iter().enumerate() {
+        if let Some(index) = find_channel(ld, name) {
+            let actual = &ld.channels[index].name;
+            if actual != name {
+                shared
+                    .channel_settings
+                    .aliases
+                    .entry((*name).into())
+                    .or_insert_with(|| vec![actual.clone()]);
+            }
+        }
+        let id = shared
+            .resolve_slot(name, false)
+            .unwrap_or_else(|| shared.unresolved_channel(name, false));
+        if matched.contains(&id) {
             continue;
         }
-        matched.push(chan_idx);
-
-        let channel_name = &ld.channels[chan_idx].name;
-        let tile_group = template
+        matched.push(id);
+        let group = template
             .tiled_groups
             .iter()
-            .position(|group| {
-                group
+            .position(|members| {
+                members
                     .iter()
-                    .any(|candidate| channel_name_matches(channel_name, candidate))
+                    .any(|candidate| channel_name_matches(name, candidate))
             })
             .unwrap_or(i);
-        if let Some(pc) = make_plotted_channel(
-            shared,
-            chan_idx,
-            CHANNEL_COLORS[i % CHANNEL_COLORS.len()],
-            tile_group,
-        ) {
-            graph.plotted_channels.push(pc);
+        if let Some(mut channel) = create_plotted_channel(id, shared, i) {
+            channel.requested_reference = Some(((*name).into(), false));
+            channel.color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
+            channel.tile_group = group;
+            graph.plotted_channels.push(channel);
         }
     }
-
-    for gauge in template.embedded_gauges {
-        if let Some(idx) = find_first_channel(ld, gauge.names) {
-            graph.add_embedded_gauge_with_style(ChannelId::Physical(idx), shared, gauge.style);
-        }
-    }
-
     (!graph.plotted_channels.is_empty()).then_some(graph)
 }
 
@@ -464,10 +514,13 @@ fn build_histogram_panel(
         panel.y_headroom_pct = default_y_headroom_pct;
     }
     for (i, candidates) in channel_names.iter().enumerate() {
-        if let Some(idx) = find_first_channel(ld, candidates)
-            && let Some(pc) =
-                make_plotted_channel(shared, idx, CHANNEL_COLORS[i % CHANNEL_COLORS.len()], i)
-        {
+        if let Some(pc) = named_slot(
+            ld,
+            shared,
+            candidates,
+            CHANNEL_COLORS[i % CHANNEL_COLORS.len()],
+            i,
+        ) {
             panel.channels.push(pc);
         }
     }
@@ -483,17 +536,15 @@ fn build_mixture_map_panel(
     value_names: &[&str],
     bins: usize,
 ) -> Option<MixtureMapPanel> {
-    let x_idx = find_first_channel(ld, x_names)?;
-    let y_idx = find_first_channel(ld, y_names)?;
-    let value_idx = find_first_channel(ld, value_names)?;
     let mut panel = MixtureMapPanel::new(next_panel_id(shared), title);
     panel.bins = bins;
     panel.scatter_mode = true;
     panel.sensor_delay = 0.15;
+    panel.gear_filter.enabled = true;
     panel.minimum_y = Some(0.5);
-    panel.x_channel = make_plotted_channel(shared, x_idx, CHANNEL_COLORS[0], 0);
-    panel.y_channel = make_plotted_channel(shared, y_idx, CHANNEL_COLORS[1], 1);
-    panel.value_channel = make_plotted_channel(shared, value_idx, CHANNEL_COLORS[2], 2);
+    panel.x_channel = named_slot(ld, shared, x_names, CHANNEL_COLORS[0], 0);
+    panel.y_channel = named_slot(ld, shared, y_names, CHANNEL_COLORS[1], 1);
+    panel.value_channel = named_slot(ld, shared, value_names, CHANNEL_COLORS[2], 2);
     (panel.x_channel.is_some() && panel.y_channel.is_some() && panel.value_channel.is_some())
         .then_some(panel)
 }
@@ -525,14 +576,14 @@ fn build_mixture_map_worksheet(
         (None, None) => None,
         (Some(panel), None) | (None, Some(panel)) => Some((
             "Mixture Map".to_string(),
-            DockState::new(vec![PanelTab::MixtureMap(panel)]),
+            DockState::new(vec![PanelTab::MixtureMap(Box::new(panel))]),
         )),
         (Some(left_panel), Some(right_panel)) => {
-            let mut dock = DockState::new(vec![PanelTab::MixtureMap(left_panel)]);
+            let mut dock = DockState::new(vec![PanelTab::MixtureMap(Box::new(left_panel))]);
             dock.main_surface_mut().split_right(
                 NodeIndex::root(),
                 0.5,
-                vec![PanelTab::MixtureMap(right_panel)],
+                vec![PanelTab::MixtureMap(Box::new(right_panel))],
             );
             Some(("Mixture Map".to_string(), dock))
         }
@@ -609,7 +660,7 @@ fn build_oil_pressure_worksheet(
 
     match (scatter, graph) {
         (Some(panel), Some(graph)) => {
-            let mut dock = DockState::new(vec![PanelTab::Scatter(panel)]);
+            let mut dock = DockState::new(vec![PanelTab::Scatter(Box::new(panel))]);
             dock.main_surface_mut().split_below(
                 NodeIndex::root(),
                 0.78,
@@ -619,7 +670,7 @@ fn build_oil_pressure_worksheet(
         }
         (Some(panel), None) => Some((
             "Oil Pressure".into(),
-            DockState::new(vec![PanelTab::Scatter(panel)]),
+            DockState::new(vec![PanelTab::Scatter(Box::new(panel))]),
         )),
         (None, Some(panel)) => Some((
             "Oil Pressure".to_string(),
@@ -715,8 +766,7 @@ pub fn create_default_worksheets(
     if let Some(sheet) = build_rpm_histo_worksheet(ld, shared) {
         worksheets.push(sheet);
     }
-    let has_gps = i3rs_core::track::gps_channels(ld).is_some();
-    if has_gps {
+    {
         let mut map = TrackMapPanel::new(next_panel_id(shared), "Track Report");
         map.home_worksheet = worksheets.len();
         worksheets.push((
@@ -736,15 +786,21 @@ pub fn create_default_worksheets(
         "Exhaust Lambda Bank 1",
         "Exhaust Lambda Bank 2",
     ] {
-        if let Some(idx) = find_channel(ld, name) {
-            report.add_channel(ChannelId::Physical(idx), shared);
+        if let Some(pc) = named_slot(
+            ld,
+            shared,
+            &[name],
+            CHANNEL_COLORS[report.channels.len() % CHANNEL_COLORS.len()],
+            0,
+        ) {
+            report.channels.push(pc);
         }
     }
     worksheets.push((
         "Channel Report".into(),
         DockState::new(vec![PanelTab::Report(report)]),
     ));
-    if has_gps {
+    {
         let mut sections = TrackMapPanel::new(next_panel_id(shared), "Section Times");
         sections.section_times_only = true;
         sections.home_worksheet = worksheets.len();

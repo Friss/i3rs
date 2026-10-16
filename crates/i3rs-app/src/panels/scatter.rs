@@ -1,7 +1,7 @@
 //! Scatter/XY plot panel: channel vs channel visualization.
 
 use eframe::egui;
-use egui_plot::{Legend, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, Points};
+use egui_plot::{Legend, Line, MarkerShape, Plot, PlotBounds, PlotPoint, PlotPoints, Points};
 
 use crate::state::{ChannelId, PlottedChannel, SharedState};
 
@@ -14,6 +14,8 @@ use super::utils::{
 
 #[derive(PartialEq, Eq)]
 struct ScatterFingerprint {
+    filter: String,
+    policies: [i3rs_core::Interpolation; 2],
     x_data_ptr: usize,
     x_data_len: usize,
     y_data_ptr: usize,
@@ -40,6 +42,16 @@ struct ScatterPoint {
 }
 
 pub struct ScatterPanel {
+    pub band_presentation: super::distribution::BandPresentation,
+    pub filter: super::distribution::ComponentFilter,
+    pub color_channel: Option<PlottedChannel>,
+    pub color_bands: super::distribution::ColorBands,
+    pub show_regression: bool,
+    pub show_interval_averages: bool,
+    pub interval_width: f64,
+    pub interval_origin: f64,
+    pub density: bool,
+    color_filter: String,
     pub id: u64,
     pub title: String,
     /// X-axis channel.
@@ -58,6 +70,16 @@ pub struct ScatterPanel {
 impl ScatterPanel {
     pub fn new(id: u64, title: impl Into<String>) -> Self {
         Self {
+            band_presentation: Default::default(),
+            filter: Default::default(),
+            color_channel: None,
+            color_bands: Default::default(),
+            show_regression: false,
+            show_interval_averages: false,
+            interval_width: 100.,
+            interval_origin: 0.,
+            density: false,
+            color_filter: String::new(),
             id,
             title: title.into(),
             x_channel: None,
@@ -206,6 +228,49 @@ impl ScatterPanel {
                 .push(build_plotted_channel_info(pc, shared));
         }
 
+        ui.checkbox(
+            &mut self.density,
+            "Density display (native population retained)",
+        );
+        self.band_presentation.controls(ui, self.color_bands);
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.show_interval_averages, "X interval averages");
+            if self.show_interval_averages {
+                ui.label("Width (X units)");
+                ui.add(egui::DragValue::new(&mut self.interval_width).range(0.000001..=1e9));
+                ui.label("Origin");
+                ui.add(egui::DragValue::new(&mut self.interval_origin));
+            }
+        });
+        self.filter.controls(ui);
+        let filter = self.filter.prepare(ui, shared);
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.show_regression, "Linear regression");
+            let mut selected = self.color_channel.as_ref().map(|c| c.channel_id);
+            if super::utils::channel_picker(
+                ui,
+                ("scatter_color", self.id),
+                &mut selected,
+                &mut self.color_filter,
+                shared,
+            ) {
+                self.color_channel = selected.and_then(|id| create_plotted_channel(id, shared, 0));
+            }
+            if let Some(c) = &mut self.color_channel {
+                refresh_plotted_channel(c, shared);
+                ui.label(format!(
+                    "Color: {}",
+                    resolve_plotted_channel_display_meta(c, shared).0
+                ));
+            }
+            if ui.small_button("Clear color").clicked() {
+                self.color_channel = None;
+            }
+        });
+        if self.color_channel.is_some() {
+            ui.horizontal_wrapped(|ui| self.color_bands.controls(ui));
+        }
+
         let (Some(x_ch), Some(y_ch)) = (&self.x_channel, &self.y_channel) else {
             ui.centered_and_justified(|ui| {
                 ui.label("Drop two channels: first for X axis, second for Y axis");
@@ -245,8 +310,13 @@ impl ScatterPanel {
         // Get time range for visible data
         let (t0, t1) = shared.analysis_range();
 
-        let zoom_key = shared.zoom_range.map(|(a, b)| (a.to_bits(), b.to_bits()));
+        let zoom_key = Some((t0.to_bits(), t1.to_bits()));
         let fingerprint = ScatterFingerprint {
+            filter: filter.key.clone(),
+            policies: [
+                build_plotted_channel_info(x_ch, shared).interpolation,
+                build_plotted_channel_info(y_ch, shared).interpolation,
+            ],
             x_data_ptr: x_ch.data.as_ptr() as usize,
             x_data_len: x_ch.data.len(),
             y_data_ptr: y_ch.data.as_ptr() as usize,
@@ -262,7 +332,15 @@ impl ScatterPanel {
             .as_ref()
             .is_none_or(|c| c.fingerprint != fingerprint)
         {
-            let points = build_scatter_points(x_ch, x_freq, y_ch, y_freq, target_freq, t0, t1);
+            let points: Vec<_> = scatter_info_points(
+                &build_plotted_channel_info(x_ch, shared),
+                &build_plotted_channel_info(y_ch, shared),
+                target_freq,
+                (t0, t1),
+            )
+            .into_iter()
+            .filter(|p| filter.includes(p.time))
+            .collect();
             let plot_points: Vec<_> = points.iter().map(|p| PlotPoint::new(p.x, p.y)).collect();
             let data_bounds = data_bounds(&plot_points);
             self.cache = Some(ScatterCache {
@@ -272,12 +350,177 @@ impl ScatterPanel {
                 data_bounds,
             });
         }
+        let overlay_slots: Vec<_> = self
+            .x_channel
+            .iter()
+            .chain(self.y_channel.iter())
+            .chain(self.color_channel.iter())
+            .collect();
+        let overlays = crate::comparison::overlay_populations(shared, &overlay_slots, &self.filter);
+        if !shared.comparisons.overlays.is_empty() {
+            ui.weak(format!("{} comparison populations ready", overlays.len()));
+            if shared
+                .comparisons
+                .sessions
+                .iter()
+                .any(|s| !s.requests.is_empty())
+            {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
+        let overlay_points: Vec<_> = overlays
+            .iter()
+            .map(|overlay| {
+                let x = &overlay.channels[0];
+                let y = &overlay.channels[1];
+                let points: Vec<_> = scatter_info_points(x, y, x.freq.max(y.freq), overlay.range)
+                    .into_iter()
+                    .filter(|p| overlay.filter.includes(p.time))
+                    .collect();
+                let fit =
+                    i3rs_core::distribution::linear_regression(points.iter().map(|p| (p.x, p.y)));
+                (overlay, points, fit)
+            })
+            .collect();
         let cache = self.cache.as_ref().unwrap();
         let points = &cache.points;
         ui.label(format!(
             "{} samples · range follows lap / zoom",
             points.len()
         ));
+        let regression =
+            i3rs_core::distribution::linear_regression(points.iter().map(|p| (p.x, p.y)));
+        if self.show_regression {
+            if let Some(r) = &regression {
+                ui.label(format!(
+                    "y = {:.6} x {:+.6} · R² {} · n={}",
+                    r.slope,
+                    r.intercept,
+                    r.r_squared
+                        .map_or_else(|| "undefined".into(), |v| format!("{v:.6}")),
+                    r.count
+                ));
+            } else {
+                ui.weak("Regression requires two finite samples with different X values");
+            }
+        }
+        if self.show_regression {
+            let mut rows = Vec::new();
+            if let Some(r) = &regression {
+                rows.extend(regression_rows(
+                    &format!("{} vs {}", y_name, x_name),
+                    r,
+                    shared.analysis_range(),
+                    &x_unit,
+                    &y_unit,
+                ));
+            }
+            for (overlay, points, fit) in &overlay_points {
+                ui.colored_label(
+                    overlay.color,
+                    format!("{} · {} samples", overlay.label, points.len()),
+                );
+                if let Some(r) = fit {
+                    ui.label(format!(
+                        "y = {:.6} x {:+.6} · R² {} · n={}",
+                        r.slope,
+                        r.intercept,
+                        r.r_squared
+                            .map_or_else(|| "undefined".into(), |v| format!("{v:.6}")),
+                        r.count
+                    ));
+                    rows.extend(regression_rows(
+                        &format!("{} · {} vs {}", overlay.label, y_name, x_name),
+                        r,
+                        overlay.range,
+                        &x_unit,
+                        &y_unit,
+                    ));
+                } else {
+                    ui.weak("Regression undefined for this comparison population");
+                }
+            }
+            super::calculations::export_buttons(ui, &super::calculations::result_csv(&rows));
+            if ui.button("Create scoped regression maths").on_hover_text("Creates editable slope, intercept and R² channels for each recording using this range and current gate/trust settings.").clicked() {
+                let x_expression=channel_expression(x_ch,shared);let y_expression=channel_expression(y_ch,shared);
+                match x_expression.zip(y_expression) {
+                    Some((x,y))=>{
+                        let mut definitions=Vec::new();
+                        if regression.is_some(){definitions.push((shared.recording_key().to_owned(),shared.analysis_range(),target_freq,filter.trusted_ranges.clone()));}
+                        for (o,_,fit) in &overlay_points {if fit.is_some(){definitions.push((o.recording.clone(),o.range,o.channels[0].freq.max(o.channels[1].freq),o.filter.trusted_ranges.clone()));}}
+                        for (recording,range,hz,trusted) in definitions {
+                            let Some(gate)=regression_gate_expression(&self.filter.gate,trusted.as_deref())else{shared.message("Cannot quote gate reference containing both quote characters");continue;};
+                            for (suffix,function,unit) in [("Slope","regression_slope",format!("{y_unit}/({x_unit})")),("Intercept","regression_intercept",y_unit.clone()),("R squared","regression_r_squared",String::new())] {
+                                let name=format!("{} regression {} {suffix}",self.title,self.id);
+                                let expression=format!("{function}({x},{y},{gate},{:.12},{:.12})",range.0,range.1);
+                                let id=shared.math_channels.iter().position(|m|m.name==name&&m.options.recording.as_deref()==Some(&recording));
+                                if let Some(index)=id {let def=&mut shared.math_channels[index];def.expression=expression;def.unit=unit;def.options.output_freq=Some(hz);def.options.comment="Regression over the captured component range and gate/trust configuration".into();}
+                                else{let mut def=shared.create_math_channel_def(name,expression,unit,6);def.options.recording=Some(recording.clone());def.options.output_freq=Some(hz);def.options.comment="Regression over the captured component range and gate/trust configuration".into();shared.math_channels.push(def);}
+                            }
+                        }
+                        crate::panels::math_editor::evaluate_all_math_channels(shared);
+                        shared.message("Scoped regression channels created; the expressions retain the selected range and gate/trust configuration");
+                    },None=>shared.message("Cannot quote channel reference containing both quote characters"),
+                }
+            }
+        }
+        let averages = i3rs_core::distribution::x_interval_averages(
+            points.iter().map(|p| (p.x, p.y)),
+            self.interval_width,
+            self.interval_origin,
+        );
+        let overlay_averages: Vec<_> = overlay_points
+            .iter()
+            .map(|(o, p, _)| {
+                (
+                    *o,
+                    i3rs_core::distribution::x_interval_averages(
+                        p.iter().map(|p| (p.x, p.y)),
+                        self.interval_width,
+                        self.interval_origin,
+                    ),
+                )
+            })
+            .collect();
+        if self.show_interval_averages {
+            ui.label(format!(
+                "{} populated X intervals · {} native samples",
+                averages.len(),
+                points.len()
+            ));
+            let mut csv = i3rs_core::distribution::x_interval_csv(
+                &format!("{} · {} vs {}", shared.file_name, y_name, x_name),
+                &x_unit,
+                &y_unit,
+                shared.analysis_range(),
+                &averages,
+                true,
+            );
+            for (o, rows) in &overlay_averages {
+                csv.push_str(&i3rs_core::distribution::x_interval_csv(
+                    &o.label, &x_unit, &y_unit, o.range, rows, false,
+                ));
+            }
+            super::calculations::export_buttons(ui, &csv);
+        }
+        let colored: Option<Vec<Vec<[f64; 2]>>> = self.color_channel.as_ref().map(|c| {
+            let meta = resolve_plotted_channel_display_meta(c, shared);
+            let mut bands = vec![Vec::new(); self.color_bands.len()];
+            let info = build_plotted_channel_info(c, shared);
+            for p in points {
+                let v = i3rs_core::channels::sample_with_policy(
+                    &c.data,
+                    meta.2,
+                    p.time,
+                    info.interpolation,
+                )
+                .map(|v| transform_channel_value(c, v))
+                .unwrap_or(f64::NAN);
+                bands[self.color_bands.index(v)].push([p.x, p.y]);
+            }
+            bands
+        });
         let plot_points = &cache.plot_points;
 
         let allowed_bounds = padded_bounds(cache.data_bounds, self.bounds_padding_frac).map(
@@ -303,13 +546,164 @@ impl ScatterPanel {
         let series_name = format!("{} vs {}", y_name, x_name);
 
         let plot_response = plot.show(ui, |plot_ui| {
-            plot_ui.points(
-                Points::new(&series_name, PlotPoints::Borrowed(plot_points.as_slice()))
-                    .shape(MarkerShape::Circle)
-                    .filled(false)
-                    .radius(point_size)
-                    .color(color),
-            );
+            for (overlay, samples, fit) in &overlay_points {
+                if self.show_regression
+                    && let Some(r) = fit
+                {
+                    let low = samples.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+                    let high = samples
+                        .iter()
+                        .map(|p| p.x)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    if high > low {
+                        plot_ui.line(
+                            Line::new(
+                                format!("{} · regression", overlay.label),
+                                vec![
+                                    [low, low * r.slope + r.intercept],
+                                    [high, high * r.slope + r.intercept],
+                                ],
+                            )
+                            .color(overlay.color),
+                        );
+                    }
+                }
+                if let Some(c) = overlay.channels.get(2) {
+                    let mut bands = vec![Vec::new(); self.color_bands.len()];
+                    for p in samples {
+                        let value = i3rs_core::channels::sample_with_policy(
+                            &c.data,
+                            c.freq,
+                            p.time,
+                            c.interpolation,
+                        )
+                        .map(|v| c.transform_value(v))
+                        .unwrap_or(f64::NAN);
+                        bands[self.color_bands.index(value)].push([p.x, p.y]);
+                    }
+                    for (band, values) in bands.into_iter().enumerate() {
+                        if !self.band_presentation.visible(band) {
+                            continue;
+                        }
+                        if self.density {
+                            draw_density(
+                                plot_ui,
+                                &values,
+                                cache.data_bounds,
+                                self.band_presentation.color(self.color_bands, band),
+                                point_size,
+                                &format!("{} · {}", overlay.label, self.color_bands.label(band)),
+                            );
+                            continue;
+                        }
+                        plot_ui.points(
+                            Points::new(
+                                format!(
+                                    "{} · {} · {} samples",
+                                    overlay.label,
+                                    self.color_bands.label(band),
+                                    values.len()
+                                ),
+                                values,
+                            )
+                            .radius(point_size)
+                            .filled(false)
+                            .color(self.band_presentation.color(self.color_bands, band)),
+                        );
+                    }
+                } else if self.density {
+                    draw_density(
+                        plot_ui,
+                        &samples.iter().map(|p| [p.x, p.y]).collect::<Vec<_>>(),
+                        cache.data_bounds,
+                        overlay.color,
+                        point_size,
+                        &overlay.label,
+                    );
+                } else {
+                    plot_ui.points(
+                        Points::new(
+                            format!("{} · {} samples", overlay.label, samples.len()),
+                            PlotPoints::new(samples.iter().map(|p| [p.x, p.y]).collect()),
+                        )
+                        .radius(point_size)
+                        .color(overlay.color),
+                    );
+                }
+            }
+            if self.show_interval_averages {
+                draw_interval_averages(
+                    plot_ui,
+                    "X interval averages",
+                    &averages,
+                    egui::Color32::LIGHT_RED,
+                );
+                for (o, rows) in &overlay_averages {
+                    draw_interval_averages(
+                        plot_ui,
+                        &format!("{} · averages", o.label),
+                        rows,
+                        o.color,
+                    );
+                }
+            }
+            if let Some(bands) = &colored {
+                for (i, values) in bands.iter().enumerate() {
+                    if !self.band_presentation.visible(i) {
+                        continue;
+                    }
+                    if self.density {
+                        draw_density(
+                            plot_ui,
+                            values,
+                            cache.data_bounds,
+                            self.band_presentation.color(self.color_bands, i),
+                            point_size,
+                            &self.color_bands.label(i),
+                        );
+                        continue;
+                    }
+                    plot_ui.points(
+                        Points::new(
+                            format!("{} · n={}", self.color_bands.label(i), values.len()),
+                            PlotPoints::new(values.clone()),
+                        )
+                        .radius(point_size)
+                        .color(self.band_presentation.color(self.color_bands, i)),
+                    );
+                }
+            } else if self.density {
+                draw_density(
+                    plot_ui,
+                    &points.iter().map(|p| [p.x, p.y]).collect::<Vec<_>>(),
+                    cache.data_bounds,
+                    color,
+                    point_size,
+                    &series_name,
+                );
+            } else {
+                plot_ui.points(
+                    Points::new(&series_name, PlotPoints::Borrowed(plot_points.as_slice()))
+                        .shape(MarkerShape::Circle)
+                        .filled(false)
+                        .radius(point_size)
+                        .color(color),
+                );
+            }
+            if self.show_regression
+                && let (Some(r), Some(((lo, hi), _))) = (&regression, cache.data_bounds)
+            {
+                plot_ui.line(
+                    Line::new(
+                        "Regression",
+                        vec![
+                            [lo, lo * r.slope + r.intercept],
+                            [hi, hi * r.slope + r.intercept],
+                        ],
+                    )
+                    .color(egui::Color32::WHITE),
+                );
+            }
 
             if let Some(cp) = cursor_point {
                 plot_ui.points(
@@ -499,6 +893,7 @@ fn clamp_axis_bounds(
     (min, max)
 }
 
+#[cfg(test)]
 /// Build scatter plot points by resampling both channels to a common frequency.
 fn build_scatter_points(
     x_channel: &PlottedChannel,
@@ -572,6 +967,8 @@ mod tests {
             display_offset: 0.0,
             display_unit: None,
             math_id: None,
+            requested_reference: None,
+            portable_source_unit: None,
             recording_display_base: None,
             math_display_signature: None,
             scale_mode: crate::state::ScaleMode::Auto,
@@ -635,4 +1032,213 @@ mod tests {
         );
         assert_eq!(timed.len(), 6706);
     }
+}
+
+fn density_cells(
+    points: &[[f64; 2]],
+    bounds: Option<((f64, f64), (f64, f64))>,
+) -> Vec<([f64; 2], usize)> {
+    let Some(((x0, x1), (y0, y1))) = bounds else {
+        return Vec::new();
+    };
+    let mut cells = std::collections::BTreeMap::<(usize, usize), (f64, f64, usize)>::new();
+    for &[x, y] in points {
+        let key = (
+            ((x - x0) / (x1 - x0).max(f64::EPSILON) * 100.).clamp(0., 99.) as usize,
+            ((y - y0) / (y1 - y0).max(f64::EPSILON) * 100.).clamp(0., 99.) as usize,
+        );
+        let cell = cells.entry(key).or_default();
+        cell.0 += x;
+        cell.1 += y;
+        cell.2 += 1;
+    }
+    cells
+        .values()
+        .map(|(x, y, n)| ([x / *n as f64, y / *n as f64], *n))
+        .collect()
+}
+fn draw_density(
+    plot: &mut egui_plot::PlotUi,
+    points: &[[f64; 2]],
+    bounds: Option<((f64, f64), (f64, f64))>,
+    color: egui::Color32,
+    size: f32,
+    name: &str,
+) {
+    let cells = density_cells(points, bounds);
+    let maximum = cells.iter().map(|(_, n)| *n).max().unwrap_or(1) as f32;
+    // Bucket equal occupancies to keep rendering bounded without losing weights.
+    let mut groups = std::collections::BTreeMap::<usize, Vec<[f64; 2]>>::new();
+    for (point, n) in cells {
+        groups.entry(n).or_default().push(point);
+    }
+    for (n, points) in groups {
+        let weight = (1. + n as f32).ln() / (1. + maximum).ln();
+        plot.points(
+            Points::new(format!("{name} · {n} samples/cell"), points)
+                .radius(size * (1. + weight * 3.))
+                .color(color.gamma_multiply(0.2 + 0.8 * weight)),
+        );
+    }
+}
+
+fn scatter_info_points(
+    x: &crate::state::PlottedChannelInfo,
+    y: &crate::state::PlottedChannelInfo,
+    hz: u16,
+    range: (f64, f64),
+) -> Vec<ScatterPoint> {
+    if hz == 0 || x.freq == 0 || y.freq == 0 {
+        return Vec::new();
+    }
+    let duration = (x.data.len() as f64 / x.freq as f64).min(y.data.len() as f64 / y.freq as f64);
+    let window = i3rs_core::sample_window_for_time(
+        hz,
+        (duration * hz as f64).ceil() as usize,
+        range.0,
+        range.1.min(duration),
+    );
+    (window.start_sample..window.end_sample)
+        .filter_map(|i| {
+            let time = i as f64 / hz as f64;
+            let sample = |info: &crate::state::PlottedChannelInfo| {
+                i3rs_core::channels::sample_with_policy(
+                    &info.data,
+                    info.freq,
+                    time,
+                    info.interpolation,
+                )
+                .map(|v| info.transform_value(v))
+            };
+            let (x, y) = (sample(x)?, sample(y)?);
+            (x.is_finite() && y.is_finite()).then_some(ScatterPoint { x, y, time })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    #[test]
+    fn density_occupancies_sum_to_native_population() {
+        let points = [[0., 0.], [0., 0.], [1., 1.], [1., 1.], [1., 1.]];
+        let cells = density_cells(&points, Some(((0., 1.), (0., 1.))));
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells.iter().map(|(_, n)| *n).sum::<usize>(), 5);
+    }
+}
+
+fn regression_rows(
+    name: &str,
+    r: &i3rs_core::distribution::Regression,
+    range: (f64, f64),
+    x_unit: &str,
+    y_unit: &str,
+) -> Vec<super::calculations::ResultRow> {
+    [
+        ("slope", Some(r.slope)),
+        ("intercept", Some(r.intercept)),
+        ("R squared", r.r_squared),
+    ]
+    .into_iter()
+    .map(|(result, value)| super::calculations::ResultRow {
+        channel: name.into(),
+        result: result.into(),
+        start: range.0,
+        end: range.1,
+        count: r.count,
+        value,
+        unit: match result {
+            "slope" => format!("{y_unit}/({x_unit})"),
+            "intercept" => y_unit.into(),
+            _ => String::new(),
+        },
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    #[test]
+    fn regression_export_includes_source_range_population_and_units() {
+        let r =
+            i3rs_core::distribution::linear_regression([(1., 5.), (2., 8.), (3., 11.)]).unwrap();
+        let rows = regression_rows(
+            "Overlay A · pressure vs speed",
+            &r,
+            (10., 13.),
+            "m/s",
+            "kPa",
+        );
+        let csv = super::super::calculations::result_csv(&rows);
+        assert_eq!(rows.len(), 3);
+        assert!(csv.contains("10.000000000,13.000000000,3,3.000000000000,\"kPa/(m/s)\""));
+        assert!(csv.contains("\"R squared\",10.000000000,13.000000000,3,1.000000000000"));
+    }
+}
+
+fn draw_interval_averages(
+    plot: &mut egui_plot::PlotUi,
+    label: &str,
+    rows: &[i3rs_core::distribution::XIntervalAverage],
+    color: egui::Color32,
+) {
+    let points: Vec<_> = rows
+        .iter()
+        .map(|r| [(r.lower + r.upper) / 2., r.mean_y])
+        .collect();
+    plot.line(
+        Line::new(label, points.clone())
+            .color(color)
+            .style(egui_plot::LineStyle::dashed_dense()),
+    );
+    plot.points(
+        Points::new(label, points)
+            .shape(MarkerShape::Diamond)
+            .radius(4.)
+            .color(color),
+    );
+}
+
+fn quoted_reference(name: &str) -> Option<String> {
+    if !name.contains('"') {
+        Some(format!("\"{name}\""))
+    } else if !name.contains('\'') {
+        Some(format!("'{name}'"))
+    } else {
+        None
+    }
+}
+fn channel_expression(pc: &PlottedChannel, shared: &SharedState) -> Option<String> {
+    let (name, unit, _, _) = super::utils::resolve_channel_meta(pc.channel_id, shared);
+    let reference = pc
+        .requested_reference
+        .as_ref()
+        .map_or(name.as_str(), |r| r.0.as_str());
+    let quoted = quoted_reference(reference)?;
+    let explicit_unit = if unit.is_empty() {
+        quoted
+    } else {
+        format!("{quoted}[{unit}]")
+    };
+    Some(format!(
+        "(({explicit_unit})*{:.15}+{:.15})",
+        pc.display_scale, pc.display_offset
+    ))
+}
+fn regression_gate_expression(gate: &str, trusted: Option<&[(f64, f64)]>) -> Option<String> {
+    let base = if gate.trim().is_empty() {
+        "1".into()
+    } else {
+        quoted_reference(gate.trim())?
+    };
+    Some(if let Some(ranges) = trusted {
+        let mask = ranges.iter().fold("0".to_owned(), |acc, (a, b)| {
+            format!("max({acc},((time()>={a:.12})*(time()<{b:.12})))")
+        });
+        format!("({base})*({mask})")
+    } else {
+        base
+    })
 }

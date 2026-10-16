@@ -529,6 +529,62 @@ impl<'a> EvaluationContext<'a> {
 
     fn evaluate_function(&mut self, name: &str, args: &[Expr]) -> Result<Arc<Vec<f64>>, MathError> {
         match name {
+            "time" => {
+                if !args.is_empty() {
+                    return Err(MathError {
+                        message: "time() takes no arguments".into(),
+                    });
+                }
+                Ok(Arc::new(
+                    (0..self.output_len)
+                        .map(|i| i as f64 / self.output_freq as f64)
+                        .collect(),
+                ))
+            }
+            "regression_slope" | "regression_intercept" | "regression_r_squared" => {
+                if ![2, 3, 5].contains(&args.len()) {
+                    return Err(MathError {
+                        message: format!(
+                            "{name} requires X, Y, optional positive gate, and optional start/end seconds"
+                        ),
+                    });
+                }
+                let x = self.evaluate(&args[0])?;
+                let y = self.evaluate(&args[1])?;
+                let gate = if args.len() >= 3 {
+                    Some(self.evaluate(&args[2])?)
+                } else {
+                    None
+                };
+                let start = if args.len() == 5 {
+                    self.scalar(&args[3])?
+                } else {
+                    0.
+                };
+                let end = if args.len() == 5 {
+                    self.scalar(&args[4])?
+                } else {
+                    self.output_len as f64 / self.output_freq as f64
+                };
+                let w =
+                    crate::sample_window_for_time(self.output_freq, self.output_len, start, end);
+                let fit = crate::distribution::linear_regression(
+                    (w.start_sample..w.end_sample)
+                        .filter(|i| {
+                            gate.as_ref()
+                                .is_none_or(|g| crate::component_gate_includes(g[*i]))
+                        })
+                        .map(|i| (x[i], y[i])),
+                );
+                let value = fit
+                    .and_then(|r| match name {
+                        "regression_slope" => Some(r.slope),
+                        "regression_intercept" => Some(r.intercept),
+                        _ => r.r_squared,
+                    })
+                    .unwrap_or(f64::NAN);
+                Ok(Arc::new(vec![value; self.output_len]))
+            }
             "smooth" | "smooth_samples" | "smooth_time" => {
                 if !(2..=3).contains(&args.len()) {
                     return Err(MathError {
@@ -1447,5 +1503,72 @@ mod tests {
             evaluate_expression_with_aliases("Speed_Value + Vehicle_Speed", &channels, &aliases)
                 .unwrap();
         assert_eq!(result, vec![2.0, 4.0, 6.0, 8.0]);
+    }
+}
+
+#[cfg(test)]
+mod regression_function_tests {
+    use super::*;
+    #[test]
+    fn reusable_regression_channels_honour_positive_gate_range_and_output_grid() {
+        let channels = HashMap::from([
+            (
+                "X".into(),
+                ChannelData {
+                    samples: vec![1., 2., 3.],
+                    freq: 1,
+                },
+            ),
+            (
+                "Y".into(),
+                ChannelData {
+                    samples: vec![5., 8., 11.],
+                    freq: 1,
+                },
+            ),
+            (
+                "Gate".into(),
+                ChannelData {
+                    samples: vec![-1., 1., 1.],
+                    freq: 1,
+                },
+            ),
+        ]);
+        let options = EvaluationOptions {
+            output_freq: Some(2),
+            duration: Some(3.),
+            input_interpolation: std::collections::BTreeMap::from([(
+                "Gate".into(),
+                crate::Interpolation::Previous,
+            )]),
+            ..Default::default()
+        };
+        for (name, expected) in [
+            ("regression_slope", 3.),
+            ("regression_intercept", 2.),
+            ("regression_r_squared", 1.),
+        ] {
+            let (data, hz) = evaluate_expression_with_options(
+                &format!("{name}(X,Y,Gate,1,2)"),
+                &channels,
+                &HashMap::new(),
+                &options,
+            )
+            .unwrap();
+            assert_eq!(hz, 2);
+            assert!(data.iter().all(|v| (*v - expected).abs() < 1e-12));
+        }
+        let (data, _) = evaluate_expression_with_options(
+            "regression_slope(X,Y,-1)",
+            &channels,
+            &HashMap::new(),
+            &options,
+        )
+        .unwrap();
+        assert!(data.iter().all(|v| v.is_nan()));
+        let (time, _) =
+            evaluate_expression_with_options("time()", &channels, &HashMap::new(), &options)
+                .unwrap();
+        assert_eq!(&time[..4], &[0., 0.5, 1., 1.5]);
     }
 }
