@@ -1181,7 +1181,11 @@ pub fn load_workspace(
     } else {
         None
     };
-    let main = incoming_main.or(saved_main);
+    let main = if workspace.carried_layout {
+        incoming_main
+    } else {
+        incoming_main.or(saved_main)
+    };
     let mut loader = GraphPanel::new(0, "comparison loader");
     for overlay in overlays {
         let source = if let Some(path) = &overlay.file_path {

@@ -25,7 +25,11 @@ pub struct OutputUi {
     query: String,
     folder: Option<PathBuf>,
     scan: Option<mpsc::Receiver<(LogIndex, Vec<String>)>>,
-    pending_main: Option<(PathBuf, i3rs_core::ranges::RecordingAnalysis, Option<usize>)>,
+    pending_main: Option<(
+        PathBuf,
+        i3rs_core::ranges::RecordingAnalysis,
+        Option<String>,
+    )>,
     initialized: bool,
     output_job: Option<mpsc::Receiver<OutputJobResult>>,
     pub capture_requested: bool,
@@ -163,11 +167,18 @@ impl OutputUi {
                 .is_some_and(|ld| ld.recording_id() == analysis.recording)
         {
             let analysis = analysis.clone();
-            let range = *range;
+            let range_id = range.clone();
             self.pending_main = None;
             if let Err(e) = shared.apply_recording_analysis(analysis) {
                 self.browser_status = e;
             } else {
+                let range = range_id.and_then(|id| {
+                    shared
+                        .current_analysis()?
+                        .ranges
+                        .iter()
+                        .position(|r| r.id == id)
+                });
                 shared.select_lap(range);
                 shared.comparisons.main_lap = range;
             }
@@ -327,17 +338,30 @@ impl OutputUi {
                     Err(e) => self.browser_status = e,
                 }
             } else {
-                let analysis = shared
-                    .snapshot_recording_analysis()
-                    .get(&log.analysis.recording)
-                    .cloned()
-                    .unwrap_or(log.analysis);
-                self.pending_main = Some((log.path.clone(), analysis, range));
-                main = Some(log.path);
+                match self.queue_main(shared, &log, range) {
+                    Ok(path) => main = Some(path),
+                    Err(error) => self.browser_status = error,
+                }
             }
         }
         self.export_window(ctx, shared);
         main
+    }
+    fn queue_main(
+        &mut self,
+        shared: &SharedState,
+        log: &i3rs_core::log_index::IndexedLog,
+        range: Option<usize>,
+    ) -> Result<PathBuf, String> {
+        let analysis = shared
+            .snapshot_recording_analysis()
+            .get(&log.analysis.recording)
+            .cloned()
+            .unwrap_or_else(|| log.analysis.clone());
+        let range = indexed_range(&log.analysis, &analysis, range)?;
+        let range_id = range.map(|i| analysis.ranges[i].id.clone());
+        self.pending_main = Some((log.path.clone(), analysis, range_id));
+        Ok(log.path.clone())
     }
     fn add_overlay(
         &self,
@@ -355,17 +379,7 @@ impl OutputUi {
             .entry(log.analysis.recording.clone())
             .or_insert_with(|| log.analysis.clone())
             .clone();
-        let range_id = &log
-            .analysis
-            .ranges
-            .get(range)
-            .ok_or("Selected range is unavailable")?
-            .id;
-        let range = analysis
-            .ranges
-            .iter()
-            .position(|r| &r.id == range_id)
-            .ok_or("This range was edited or removed; refresh the browser")?;
+        let range = indexed_range(&log.analysis, &analysis, Some(range))?.unwrap();
         let idx = if let Some(i) = shared
             .comparisons
             .sessions
@@ -809,6 +823,27 @@ fn source(shared: &SharedState, source: usize) -> Option<OutputSource> {
     Some((ld, a, Some((lap.start_time, lap.end_time))))
 }
 
+fn indexed_range(
+    indexed: &i3rs_core::ranges::RecordingAnalysis,
+    current: &i3rs_core::ranges::RecordingAnalysis,
+    range: Option<usize>,
+) -> Result<Option<usize>, String> {
+    range
+        .map(|i| {
+            let id = &indexed
+                .ranges
+                .get(i)
+                .ok_or("Selected range is unavailable")?
+                .id;
+            current
+                .ranges
+                .iter()
+                .position(|r| &r.id == id)
+                .ok_or_else(|| "This range was edited or removed; refresh the browser".into())
+        })
+        .transpose()
+}
+
 type PrintSnapshot = Arc<(String, Vec<Vec<String>>)>;
 /// One immutable CSV powers copy, export and printable preview for all result components.
 pub fn result_buttons(ui: &mut egui::Ui, csv: &str) {
@@ -1055,6 +1090,88 @@ mod contract_tests {
         analysis.recording = "another recording".into();
         assert!(make_device_reference(&shared, ld, &analysis, (0.125, 2.375)).is_err());
     }
+    #[test]
+    fn browser_main_resolves_cached_ranges_by_identity_and_rejects_removed_ranges() {
+        let mut shared = state();
+        let ld = shared.ld_file.clone().unwrap();
+        let laps = (0..2)
+            .map(|i| i3rs_core::Lap {
+                number: i,
+                name: format!("Range {i}"),
+                start_time: i as f64 + 1.,
+                end_time: i as f64 + 2.,
+            })
+            .collect::<Vec<_>>();
+        let indexed = i3rs_core::ranges::RecordingAnalysis::from_laps(
+            ld.recording_id().into(),
+            ld.duration_secs(),
+            &laps,
+        );
+        let log = i3rs_core::log_index::IndexedLog {
+            path: "recording.ld".into(),
+            size: 0,
+            modified: 0,
+            driver: String::new(),
+            venue: String::new(),
+            vehicle: String::new(),
+            date: String::new(),
+            time: String::new(),
+            event: String::new(),
+            duration: ld.duration_secs(),
+            channels: ld.channels.len(),
+            analysis: indexed.clone(),
+        };
+        let requested = indexed.ranges[1].id.clone();
+        shared.ld_path = Some(log.path.clone());
+        for edit in 0..4 {
+            let mut cached = indexed.clone();
+            match edit {
+                0 => {
+                    cached.ranges[0].start = 4.;
+                    cached.ranges[0].end = 5.;
+                }
+                1 => {
+                    let mut added = cached.ranges[0].clone();
+                    added.id = "inserted".into();
+                    added.start = 0.;
+                    added.end = 0.5;
+                    cached.ranges.push(added);
+                }
+                2 => {
+                    cached.ranges.remove(0);
+                }
+                _ => {
+                    cached.ranges.remove(1);
+                }
+            }
+            shared.apply_recording_analysis(cached).unwrap();
+            let mut output = OutputUi {
+                initialized: true,
+                ..Default::default()
+            };
+            let result = output.queue_main(&shared, &log, Some(1));
+            if edit == 3 {
+                assert!(result.is_err());
+                assert!(output.pending_main.is_none());
+            } else {
+                assert_eq!(result.unwrap(), log.path);
+                assert_eq!(
+                    output.pending_main.as_ref().unwrap().2.as_deref(),
+                    Some(requested.as_str())
+                );
+                let ctx = Context::default();
+                let mut frame = ctx.run_ui(Default::default(), |ui| {
+                    output.show(ui.ctx(), &mut shared);
+                });
+                frame.textures_delta.clear();
+                assert_eq!(shared.range_selection().range_id, Some(requested.clone()));
+            }
+            // Opening the entire recording has no range identity to remap.
+            output.queue_main(&shared, &log, None).unwrap();
+            assert!(output.pending_main.unwrap().2.is_none());
+        }
+    }
+
     #[test]
     fn selected_main_and_overlay_keep_their_own_range_and_recording() {
         use crate::panels::graph::{LapOverlay, OverlaySource};

@@ -2951,55 +2951,58 @@ mod tests {
 
     #[test]
     fn carried_workspace_waits_for_math_without_replacing_browser_selection() {
-        let ld = Arc::new(LdFile::open(TEST_LD).unwrap());
-        let mut shared = SharedState::new();
-        shared.ld_file = Some(ld.clone());
-        shared.ld_path = Some("previous.ld".into());
-        shared.data_duration = Some(ld.duration_secs());
-        let laps = (0..2)
-            .map(|i| i3rs_core::Lap {
-                number: i,
-                name: format!("Stage {i}"),
-                start_time: i as f64,
-                end_time: i as f64 + 1.,
-            })
-            .collect::<Vec<_>>();
-        shared.activate_recording_analysis(&laps);
-        shared.select_lap(Some(0));
-        shared.comparisons.main_lap = Some(0);
-        let mut math = shared.create_math_channel_def("Deferred".into(), "1".into(), "V".into(), 2);
-        math.evaluation_state = MathEvaluationState::WaitingForInputs;
-        shared.math_channels.push(math);
-        let mut app = test_app(
-            shared,
-            vec![worksheet_with_tabs(vec![
-                PanelTab::Graph(GraphPanel::new(1, "Saved graph")),
-                PanelTab::Histogram(HistogramPanel::new(2, "Saved histogram")),
-            ])],
-        );
-        let carried = app.workspace_snapshot_for_session_reload().unwrap();
-        assert!(carried.recording_analyses.contains_key(ld.recording_id()));
-        assert!(carried.carried_layout);
-        let explicit: crate::workspace::WorkspaceFile =
-            serde_json::from_slice(&serde_json::to_vec(&carried).unwrap()).unwrap();
-        assert!(!explicit.carried_layout);
-        app.shared.ld_path = Some("current.ld".into());
-        app.restore_workspace_when_ready(carried);
-        assert!(app.pending_workspace_restore.is_some());
-        // The browser's pending Main selection runs before math finishes.
-        app.shared.select_lap(Some(1));
-        app.shared.comparisons.main_lap = Some(1);
-        let selected_id = app.shared.range_selection().range_id;
-        app.shared.math_channels[0].evaluation_state = MathEvaluationState::Ready;
-        app.maybe_apply_pending_workspace_restore();
-        assert!(app.pending_workspace_restore.is_none());
-        assert_eq!(app.shared.selected_lap, Some(1));
-        assert_eq!(app.shared.comparisons.main_lap, Some(1));
-        assert_eq!(app.shared.range_selection().range_id, selected_id);
-        // An explicit workspace load still restores its saved Main selection.
-        app.restore_workspace_when_ready(explicit);
-        assert_eq!(app.shared.selected_lap, Some(0));
-        assert_eq!(app.shared.comparisons.main_lap, Some(0));
+        for selection in [Some(1), None] {
+            let ld = Arc::new(LdFile::open(TEST_LD).unwrap());
+            let mut shared = SharedState::new();
+            shared.ld_file = Some(ld.clone());
+            shared.ld_path = Some("previous.ld".into());
+            shared.data_duration = Some(ld.duration_secs());
+            let laps = (0..2)
+                .map(|i| i3rs_core::Lap {
+                    number: i,
+                    name: format!("Stage {i}"),
+                    start_time: i as f64,
+                    end_time: i as f64 + 1.,
+                })
+                .collect::<Vec<_>>();
+            shared.activate_recording_analysis(&laps);
+            shared.select_lap(Some(0));
+            shared.comparisons.main_lap = Some(0);
+            let mut math =
+                shared.create_math_channel_def("Deferred".into(), "1".into(), "V".into(), 2);
+            math.evaluation_state = MathEvaluationState::WaitingForInputs;
+            shared.math_channels.push(math);
+            let mut app = test_app(
+                shared,
+                vec![worksheet_with_tabs(vec![
+                    PanelTab::Graph(GraphPanel::new(1, "Saved graph")),
+                    PanelTab::Histogram(HistogramPanel::new(2, "Saved histogram")),
+                ])],
+            );
+            let carried = app.workspace_snapshot_for_session_reload().unwrap();
+            assert!(carried.recording_analyses.contains_key(ld.recording_id()));
+            assert!(carried.carried_layout);
+            let explicit: crate::workspace::WorkspaceFile =
+                serde_json::from_slice(&serde_json::to_vec(&carried).unwrap()).unwrap();
+            assert!(!explicit.carried_layout);
+            app.shared.ld_path = Some("current.ld".into());
+            app.restore_workspace_when_ready(carried);
+            assert!(app.pending_workspace_restore.is_some());
+            // The browser's pending Main selection runs before math finishes.
+            app.shared.select_lap(selection);
+            app.shared.comparisons.main_lap = selection;
+            let selected_id = app.shared.range_selection().range_id;
+            app.shared.math_channels[0].evaluation_state = MathEvaluationState::Ready;
+            app.maybe_apply_pending_workspace_restore();
+            assert!(app.pending_workspace_restore.is_none());
+            assert_eq!(app.shared.selected_lap, selection);
+            assert_eq!(app.shared.comparisons.main_lap, selection);
+            assert_eq!(app.shared.range_selection().range_id, selected_id);
+            // An explicit workspace load still restores its saved Main selection.
+            app.restore_workspace_when_ready(explicit);
+            assert_eq!(app.shared.selected_lap, Some(0));
+            assert_eq!(app.shared.comparisons.main_lap, Some(0));
+        }
     }
 
     #[test]

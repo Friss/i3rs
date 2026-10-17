@@ -174,7 +174,8 @@ pub fn earth_kml(
         xml(name)
     );
     let mut open = false;
-    let mut count = 0;
+    let mut first_point = None;
+    let mut segments = 0;
     for i in 0..plan.count()? {
         let t = plan.time(i);
         if t >= plan.end {
@@ -185,23 +186,32 @@ pub fn earth_kml(
             .zip(lon.value(t))
             .filter(|(a, b)| a.abs() <= 90. && b.abs() <= 180. && (*a, *b) != (0., 0.));
         if let Some((a, b)) = point {
-            if !open {
+            if open {
+                write!(out, "{b:.9},{a:.9},0 ").unwrap();
+            } else if let Some((first_lat, first_lon)) = first_point.take() {
                 out.push_str("<LineString><tessellate>1</tessellate><coordinates>");
+                write!(out, "{first_lon:.9},{first_lat:.9},0 {b:.9},{a:.9},0 ").unwrap();
                 open = true;
+                segments += 1;
+            } else {
+                first_point = Some((a, b));
             }
-            write!(out, "{b:.9},{a:.9},0 ").unwrap();
-            count += 1;
-        } else if open {
-            out.push_str("</coordinates></LineString>");
-            open = false;
+        } else {
+            if open {
+                out.push_str("</coordinates></LineString>");
+                open = false;
+            }
+            first_point = None;
         }
     }
     if open {
         out.push_str("</coordinates></LineString>");
     }
     out.push_str("</MultiGeometry></Placemark></Document></kml>");
-    if count < 2 {
-        return Err("Earth export requires at least two valid GPS positions in degrees".into());
+    if segments == 0 {
+        return Err(
+            "Earth export requires at least two consecutive valid GPS positions in degrees".into(),
+        );
     }
     Ok(out)
 }
@@ -279,14 +289,24 @@ mod tests {
         lat.unit = "deg".into();
         lat.scale = 1.;
         lat.offset = 0.;
-        lat.data = vec![36., f64::NAN, 36.1];
+        lat.data = vec![
+            35.,
+            f64::NAN,
+            36.,
+            36.1,
+            f64::NAN,
+            36.2,
+            36.3,
+            f64::NAN,
+            36.4,
+        ];
         let mut lon = lat.clone();
-        lon.data = vec![-79., -79., -79.1];
+        lon.data = vec![-78., -78., -79., -79.1, -79., -79.2, -79.3, -79., -79.4];
         let k = earth_kml(
             "A&B",
             OutputPlan {
                 start: 0.,
-                end: 3.,
+                end: 9.,
                 rate: 1.,
                 relative_time: true,
                 include_time: true,
@@ -297,6 +317,45 @@ mod tests {
         .unwrap();
         assert!(k.contains("A&amp;B"));
         assert_eq!(k.matches("<LineString>").count(), 2);
+        let coordinates = k
+            .split("<coordinates>")
+            .skip(1)
+            .map(|s| {
+                s.split("</coordinates>")
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(coordinates, vec![2, 2]);
+        assert!(!k.contains("-78.000000000,35.000000000"));
+        assert!(!k.contains("-79.400000000,36.400000000"));
+    }
+    #[test]
+    fn earth_rejects_disconnected_singletons_instead_of_empty_geometries() {
+        let mut lat = series(Interpolation::Previous);
+        lat.unit = "deg".into();
+        lat.scale = 1.;
+        lat.offset = 0.;
+        lat.data = vec![36., f64::NAN, 36.1];
+        let mut lon = lat.clone();
+        lon.data = vec![-79.; 3];
+        assert!(
+            earth_kml(
+                "Singletons",
+                OutputPlan {
+                    start: 0.,
+                    end: 3.,
+                    rate: 1.,
+                    relative_time: true,
+                    include_time: true,
+                },
+                &lat,
+                &lon
+            )
+            .is_err()
+        );
     }
 }
 
