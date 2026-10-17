@@ -37,6 +37,6 @@ Official elapsed times take precedence. Missing milestones use linearly interpol
 
 ## Sample clocks
 
-Channel rates are physical samples per second (`f64`). The legacy ADL clock value 1,024,000 at LD header +0x42 scales nominal rates by 1.024 (100 → 102.4 Hz; 20 → 20.48 Hz). Modern 1,000,000-clock files retain integer rates. Samples, validity masks and sample counts stay unchanged; graphs, corrections, maths, distributions, reports and exports use the native physical grid. Existing JSON files with integer output rates remain readable.
+Channel rates are physical samples per second (`f64`). The legacy ADL clock value 1,024,000 at LD header +0x42 scales nominal rates by 1.024 (100 → 102.4 Hz; 20 → 20.48 Hz). Modern 1,000,000-clock files retain integer rates. Samples, validity masks and sample counts stay unchanged; graphs, corrections, maths, distributions, reports and exports use the native physical grid. Existing JSON files with integer output rates remain readable. Saved analyses on the old nominal clock migrate in memory when both recording identity and nominal duration match. Range/marker timestamps and sample-alignment time offsets move to the physical clock; details, selections, spatial settings and official reaction/time-slip seconds are retained. Saving records the migrated duration, preventing a second conversion on reload.
 
 Matched reference results and GUI evidence are recorded in [the W08 validation record](testing/i3r-8-workspace-profiles-2026-10-16.md).

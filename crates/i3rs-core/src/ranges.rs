@@ -140,6 +140,55 @@ impl Default for RecordingAnalysis {
     }
 }
 impl RecordingAnalysis {
+    /// Restore analyses saved before legacy ADL rates used the physical clock.
+    /// Identity and the old duration must both match; unrelated or invalid
+    /// analyses are rejected without changing this value. Current-clock data
+    /// is left alone, so saving and reopening cannot scale timestamps twice.
+    pub fn migrate_sample_clock(&mut self, ld: &crate::LdFile) -> Result<bool, String> {
+        self.validate()?;
+        if self.recording != ld.recording_id() {
+            return Err("Analysis sidecar belongs to another recording".into());
+        }
+        let duration = ld.duration_secs();
+        if (self.duration - duration).abs() <= 1e-6 {
+            return Ok(false);
+        }
+        let scale = ld.sample_clock_scale();
+        if scale == 1.0 || (self.duration - duration * scale).abs() > 1e-6 {
+            return Err("Analysis duration differs from this recording".into());
+        }
+        let mut migrated = self.clone();
+        let time = |t: f64| {
+            if t == self.duration {
+                duration
+            } else {
+                t / scale
+            }
+        };
+        migrated.duration = duration;
+        for range in &mut migrated.ranges {
+            range.start = time(range.start);
+            range.end = time(range.end);
+        }
+        for marker in &mut migrated.markers {
+            marker.time = time(marker.time);
+        }
+        // These offsets were chosen against the old sample timeline. Spatial
+        // settings and official reaction/time-slip elapsed seconds are unchanged.
+        if let Some(wheel_lock) = &mut migrated.corrections.wheel_lock {
+            wheel_lock.lag_seconds /= scale;
+        }
+        if let crate::corrections::GpsShift::Manual(shift) = &mut migrated.corrections.gps_shift {
+            *shift /= scale;
+        }
+        if let Some(generation) = &mut migrated.gps_generation {
+            generation.minimum_interval /= scale;
+        }
+        migrated.validate()?;
+        *self = migrated;
+        Ok(true)
+    }
+
     pub fn from_laps(recording: String, duration: f64, laps: &[Lap]) -> Self {
         let ranges = laps
             .iter()

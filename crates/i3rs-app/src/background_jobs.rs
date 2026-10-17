@@ -104,13 +104,8 @@ pub(crate) fn read_analysis_sidecar(
     };
     let result = serde_json::from_str::<i3rs_core::ranges::RecordingAnalysis>(&json)
         .map_err(|e| e.to_string())
-        .and_then(|analysis| {
-            analysis.validate()?;
-            if analysis.recording != ld.recording_id()
-                || (analysis.duration - ld.duration_secs()).abs() > 1e-6
-            {
-                return Err("Sidecar belongs to another recording".into());
-            }
+        .and_then(|mut analysis| {
+            analysis.migrate_sample_clock(ld)?;
             Ok(analysis)
         });
     match result {
@@ -509,6 +504,100 @@ pub fn load_session_from_bytes(
 #[cfg(test)]
 mod sidecar_tests {
     use super::*;
+    #[test]
+    fn legacy_clock_analysis_restores_through_sidecar_workspace_activation_and_overlay() {
+        use crate::state::SharedState;
+        use i3rs_core::ranges::*;
+        let mut bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/VIR_LAP.ld"
+        ))
+        .unwrap();
+        bytes[0x42..0x46].copy_from_slice(&1_024_000u32.to_le_bytes());
+        let physical = Arc::new(LdFile::from_bytes(bytes.clone()).unwrap());
+        let mut nominal = LdFile::from_bytes(bytes).unwrap();
+        let scale = nominal.sample_clock_scale();
+        for channel in &mut nominal.channels {
+            channel.freq /= scale;
+        }
+        let mut analysis = RecordingAnalysis::from_laps(
+            nominal.recording_id().into(),
+            nominal.duration_secs(),
+            &[],
+        );
+        analysis.ranges = vec![AnalysisRange {
+            id: "edited".into(),
+            name: "Saved stage".into(),
+            start: 1.024,
+            end: 10.24,
+            kind: RangeKind::Stage,
+            trust: Trust::Trusted,
+            comment: "Saved comment".into(),
+            reaction_time: None,
+        }];
+        analysis.selected_range = Some("edited".into());
+        analysis.markers = vec![RangeMarker {
+            id: "user".into(),
+            time: 5.12,
+            name: "Saved marker".into(),
+            kind: MarkerKind::User,
+            trust: Trust::Unknown,
+            distance_m: None,
+        }];
+        analysis.details.driver = "Saved driver".into();
+        analysis.corrections.gps_enabled = false;
+        let path =
+            std::env::temp_dir().join(format!("i3r8-clock-sidecar-{}.ld", std::process::id()));
+        let sidecar = path.with_extension("i3rs.json");
+        let old_json = serde_json::to_string(&analysis).unwrap();
+        std::fs::write(&sidecar, &old_json).unwrap();
+        let (loaded, warning) = read_analysis_sidecar(&path, &physical);
+        assert!(warning.is_none(), "{warning:?}");
+        let expected = loaded.unwrap();
+        assert_eq!(
+            (expected.ranges[0].start, expected.ranges[0].end),
+            (1., 10.)
+        );
+        assert_eq!(expected.markers[0].time, 5.);
+        assert_eq!(expected.details.driver, "Saved driver");
+        assert!(!expected.corrections.gps_enabled);
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), old_json);
+        std::fs::remove_file(sidecar).unwrap();
+        let state = || {
+            let mut shared = SharedState::new();
+            shared.ld_file = Some(physical.clone());
+            shared.data_duration = Some(physical.duration_secs());
+            shared
+        };
+        let mut saved = state();
+        saved
+            .recording_analyses
+            .insert(analysis.recording.clone(), analysis.clone());
+        let workspace = crate::workspace::save_workspace(&[], 0, &saved);
+        let workspace = serde_json::from_str(&serde_json::to_string(&workspace).unwrap()).unwrap();
+        let mut restored = state();
+        crate::workspace::load_workspace(&workspace, &mut restored);
+        let check = |restored: &SharedState| {
+            let a = restored.current_analysis().unwrap();
+            assert_eq!(a.duration, physical.duration_secs());
+            assert_eq!(a.ranges, expected.ranges);
+            assert_eq!(a.markers, expected.markers);
+            assert_eq!(a.details, expected.details);
+            assert_eq!(a.corrections, expected.corrections);
+        };
+        check(&restored);
+        check(&crate::comparison::recording_context(
+            &saved,
+            physical.clone(),
+        ));
+        saved.activate_recording_analysis(&[]);
+        check(&saved);
+        assert_eq!(saved.range_selection().range_id.as_deref(), Some("edited"));
+        let roundtrip = crate::workspace::save_workspace(&[], 0, &saved);
+        crate::workspace::load_workspace(&roundtrip, &mut restored);
+        check(&restored);
+    }
+
     #[test]
     fn sidecar_loading_validates_identity_and_reports_invalid_json() {
         let ld = LdFile::open(concat!(

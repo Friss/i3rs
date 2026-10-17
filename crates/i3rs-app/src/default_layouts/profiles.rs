@@ -288,7 +288,7 @@ fn graph_sheet(
         PanelTab::Graph(graph(ld, shared, name, groups, gauges)),
     )
 }
-fn boost(ld: &LdFile, shared: &mut SharedState, drag: bool) -> (String, DockState<PanelTab>) {
+fn boost(ld: &LdFile, shared: &mut SharedState) -> (String, DockState<PanelTab>) {
     let mut p = ScatterPanel::new(next_panel_id(shared), "Boost");
     p.x_channel = named_slot(ld, shared, &["Engine Speed"], CHANNEL_COLORS[0], 0);
     p.y_channel = named_slot(
@@ -298,20 +298,10 @@ fn boost(ld: &LdFile, shared: &mut SharedState, drag: bool) -> (String, DockStat
         CHANNEL_COLORS[1],
         0,
     );
-    p.color_channel = named_slot(
-        ld,
-        shared,
-        &[if drag {
-            "Corr Speed"
-        } else {
-            "Throttle Position"
-        }],
-        CHANNEL_COLORS[2],
-        0,
-    );
+    p.color_channel = named_slot(ld, shared, &["Throttle Position"], CHANNEL_COLORS[2], 0);
     p.color_bands = ColorBands {
         min: 0.,
-        max: if drag { 250. } else { 100. },
+        max: 100.,
         count: 11,
         centered: true,
     };
@@ -634,7 +624,7 @@ fn drag(ld: &LdFile, shared: &mut SharedState) -> Vec<(String, DockState<PanelTa
             ],
             &[("G Force Long", GaugeStyle::Bar)],
         ),
-        boost(ld, shared, true),
+        boost(ld, shared),
     ];
     // An independent full-outing graph accompanies the run-focused acceleration view.
     let mut overview = graph(ld, shared, "Staging overview", &[&["Engine Speed"]], &[]);
@@ -742,7 +732,7 @@ fn rally(ld: &LdFile, shared: &mut SharedState) -> Vec<(String, DockState<PanelT
             FUEL_GAUGES,
         ),
         build_mixture_map_worksheet(ld, shared).unwrap(),
-        boost(ld, shared, false),
+        boost(ld, shared),
     ];
     sheets.push(specialty_rpm(ld, shared, false));
     sheets.push(graph_sheet(
@@ -827,6 +817,34 @@ mod tests {
         shared.activate_recording_analysis(&i3rs_core::detect_laps(&ld));
         (ld, shared)
     }
+    #[test]
+    fn drag_and_rally_boost_color_by_throttle_even_when_the_slot_is_missing() {
+        for missing in [false, true] {
+            for profile in [WorkspaceProfile::Drag, WorkspaceProfile::Rally] {
+                let (ld, mut shared) = state(missing);
+                let sheets = create_profile_worksheets(profile, &ld, &mut shared);
+                let (_, dock) = sheets.iter().find(|(name, _)| name == "Boost").unwrap();
+                let (_, PanelTab::Scatter(panel)) = dock.iter_all_tabs().next().unwrap() else {
+                    panic!()
+                };
+                assert_eq!(
+                    panel
+                        .color_channel
+                        .as_ref()
+                        .unwrap()
+                        .requested_reference
+                        .as_ref()
+                        .unwrap()
+                        .0,
+                    "Throttle Position"
+                );
+                assert_eq!((panel.color_bands.min, panel.color_bands.max), (0., 100.));
+                assert_eq!(panel.color_bands.count, 11);
+                assert!(panel.color_bands.centered);
+            }
+        }
+    }
+
     #[test]
     fn every_audited_sheet_renders_with_missing_specialty_inputs() {
         let (ld, mut shared) = state(false);

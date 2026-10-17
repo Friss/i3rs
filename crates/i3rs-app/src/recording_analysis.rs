@@ -81,9 +81,29 @@ impl SharedState {
             })
             .unwrap_or_else(|| self.laps.clone())
     }
+    /// Saved workspace entries for other recordings are checked when their file
+    /// becomes available, including when it is opened only as a comparison.
+    pub(crate) fn migrate_current_analysis(&mut self) {
+        let key = self.recording_key().to_string();
+        let Some(ld) = &self.ld_file else { return };
+        let Some(mut analysis) = self.recording_analyses.get(&key).cloned() else {
+            return;
+        };
+        match analysis.migrate_sample_clock(ld) {
+            Ok(true) => {
+                self.recording_analyses.insert(key, analysis);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.recording_analyses.remove(&key);
+                self.message(format!("Ignored saved recording analysis: {error}"));
+            }
+        }
+    }
     pub fn activate_recording_analysis(&mut self, detected: &[Lap]) {
         let key = self.recording_key().to_string();
         let duration = self.data_duration.unwrap_or(0.);
+        self.migrate_current_analysis();
         if !self.recording_analyses.contains_key(&key) {
             let mut a = RecordingAnalysis::from_laps(key.clone(), duration, detected);
             if let Some(ld) = &self.ld_file {
@@ -164,7 +184,11 @@ impl SharedState {
         &mut self,
         mut analysis: RecordingAnalysis,
     ) -> Result<(), String> {
-        analysis.validate()?;
+        if let Some(ld) = &self.ld_file {
+            analysis.migrate_sample_clock(ld)?;
+        } else {
+            analysis.validate()?;
+        }
         if analysis.recording != self.recording_key() {
             return Err("Analysis sidecar belongs to another recording".into());
         }

@@ -93,6 +93,7 @@ pub fn recording_context(shared: &SharedState, ld: Arc<i3rs_core::LdFile>) -> Sh
     context.channel_settings = shared.channel_settings.clone();
     context.channel_aliases = shared.channel_aliases.clone();
     context.recording_analyses = shared.recording_analyses.clone();
+    context.migrate_current_analysis();
     context.math_channels = shared
         .math_channels
         .iter()

@@ -93,3 +93,11 @@ Generated Drag maths use the shared evaluator and recording ownership; focused t
 ## Deliberate differences and limits
 
 Selecting a profile in i3rs keeps the file loaded, while the observed i2 workspace switch cleared it. Circuit Oversteer requires real road-wheel angle and wheelbase inputs; missing setup remains visible rather than assuming vehicle geometry. Gauge strips and report tables use i3rs' existing egui layout, so this validates component/slot composition and the stated numerical populations, not pixel-identical nested gauge geometry or every possible source-channel statistic. Pro-only behavior is outside this Standard comparison. The issue remains open for PR review; this record does not change its status automatically.
+
+## Review corrections — October 17
+
+All three initial review findings were addressed. Legacy saved analysis migrates through sidecar loading, workspace restore, deferred recording activation and comparison contexts, gated by file identity and the known nominal duration. Tests preserve edited ranges, markers, trust, selected identities, details, ratios and official time slips, migrate timeline offsets, reject unrelated/invalid data and verify repeated save/load is idempotent. The source sidecar is not rewritten during loading.
+
+Both Drag and Rally Boost now use Throttle Position with a 0–100 color scale, including when channels are missing. The recording editor prunes orphaned time slips before Apply and after range edits independently of collapsible section visibility. Deletion and Run-to-Stage changes succeed on the first apply; retained invalid slips still reject Apply without changing saved analysis.
+
+Updated validation: **320 tests passed, 18 ignored**; all **4 Circuit + 2 specialty** matched reference checks passed. Clippy with warnings denied, wasm32 check, release build, formatting and diff checks passed.
