@@ -70,19 +70,19 @@ pub struct ScatterPoint {
 /// Both boundaries round up: never include a sample before the start of a lap.
 /// Interpolated plots can separately retain adjacent samples for edge clipping.
 pub fn sample_window_for_time(
-    freq: u16,
+    freq: f64,
     data_len: usize,
     start_time: f64,
     end_time: f64,
 ) -> SampleWindow {
-    if freq == 0 || !start_time.is_finite() || !end_time.is_finite() || end_time <= start_time {
+    if freq == 0.0 || !start_time.is_finite() || !end_time.is_finite() || end_time <= start_time {
         return SampleWindow {
             start_sample: 0,
             end_sample: 0,
         };
     }
 
-    let hz = freq as f64;
+    let hz = freq;
     let boundary = |time: f64| {
         let mut index = ((time.max(0.0) * hz).ceil() as usize).min(data_len);
         // Multiplying a timestamp back onto its grid can land one floating-point
@@ -102,7 +102,7 @@ pub fn sample_window_for_time(
 }
 
 /// Compute finite-value statistics for a channel slice.
-pub fn compute_stats(data: &[f64], freq: Option<u16>) -> AnalysisStats {
+pub fn compute_stats(data: &[f64], freq: Option<f64>) -> AnalysisStats {
     let sample_count = data.len();
     let finite: Vec<f64> = data
         .iter()
@@ -176,12 +176,12 @@ fn percentile_sorted(sorted: &[f64], percentile: f64) -> Option<f64> {
     Some(sorted[lo] * (1.0 - frac) + sorted[hi] * frac)
 }
 
-fn integrate_trapezoidal(data: &[f64], freq: u16) -> Option<f64> {
-    if freq == 0 || data.len() < 2 {
+fn integrate_trapezoidal(data: &[f64], freq: f64) -> Option<f64> {
+    if freq == 0.0 || data.len() < 2 {
         return None;
     }
 
-    let dt = 1.0 / freq as f64;
+    let dt = 1.0 / freq;
     let mut area = 0.0;
     let mut finite_pairs = 0usize;
     for pair in data.windows(2) {
@@ -195,12 +195,12 @@ fn integrate_trapezoidal(data: &[f64], freq: u16) -> Option<f64> {
 }
 
 /// Sample a channel at an absolute session time with linear interpolation.
-pub fn sample_at_time(data: &[f64], freq: u16, time: f64) -> Option<f64> {
-    if data.is_empty() || freq == 0 || !time.is_finite() || time < 0.0 {
+pub fn sample_at_time(data: &[f64], freq: f64, time: f64) -> Option<f64> {
+    if data.is_empty() || freq == 0.0 || !time.is_finite() || time < 0.0 {
         return None;
     }
 
-    sample_at_position(data, time * freq as f64)
+    sample_at_position(data, time * freq)
 }
 
 /// Shared interpolation for time queries and exact frequency-to-frequency grids.
@@ -223,7 +223,7 @@ pub(crate) fn sample_at_position(data: &[f64], idx: f64) -> Option<f64> {
 }
 
 /// Resample a channel at explicit absolute session times.
-pub fn resample_at_times(data: &[f64], freq: u16, times: &[f64]) -> Vec<Option<f64>> {
+pub fn resample_at_times(data: &[f64], freq: f64, times: &[f64]) -> Vec<Option<f64>> {
     times
         .iter()
         .map(|time| sample_at_time(data, freq, *time))
@@ -233,9 +233,9 @@ pub fn resample_at_times(data: &[f64], freq: u16, times: &[f64]) -> Vec<Option<f
 /// Pair two channels at explicit absolute session times for scatter analysis.
 pub fn scatter_pairs_at_times(
     x_data: &[f64],
-    x_freq: u16,
+    x_freq: f64,
     y_data: &[f64],
-    y_freq: u16,
+    y_freq: f64,
     times: &[f64],
 ) -> Vec<ScatterPoint> {
     times
@@ -263,13 +263,13 @@ pub fn evenly_spaced_times(start: f64, end: f64, points: usize) -> Vec<f64> {
 }
 
 /// Produce fixed-Hz absolute times for a range. The end is exclusive.
-pub fn fixed_hz_times(start: f64, end: f64, hz: u16) -> Vec<f64> {
-    if hz == 0 || !start.is_finite() || !end.is_finite() || end <= start {
+pub fn fixed_hz_times(start: f64, end: f64, hz: f64) -> Vec<f64> {
+    if hz == 0.0 || !start.is_finite() || !end.is_finite() || end <= start {
         return Vec::new();
     }
 
-    let count = ((end - start) * hz as f64).ceil() as usize;
-    let dt = 1.0 / hz as f64;
+    let count = ((end - start) * hz).ceil() as usize;
+    let dt = 1.0 / hz;
     (0..count).map(|idx| start + idx as f64 * dt).collect()
 }
 
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn stats_ignore_non_finite_values() {
-        let stats = compute_stats(&[1.0, f64::NAN, 3.0, f64::INFINITY], Some(1));
+        let stats = compute_stats(&[1.0, f64::NAN, 3.0, f64::INFINITY], Some(1.0));
         assert_eq!(stats.sample_count, 4);
         assert_eq!(stats.finite_count, 2);
         assert_eq!(stats.missing_count, 2);
@@ -405,30 +405,30 @@ mod tests {
 
     #[test]
     fn sample_window_clamps_to_data_len() {
-        let window = sample_window_for_time(10, 50, 1.2, 9.0);
+        let window = sample_window_for_time(10.0, 50, 1.2, 9.0);
         assert_eq!(window.start_sample, 12);
         assert_eq!(window.end_sample, 50);
     }
 
     #[test]
     fn sample_windows_partition_laps_without_including_previous_samples() {
-        let left = sample_window_for_time(10, 100, 0.03, 0.25);
-        let right = sample_window_for_time(10, 100, 0.25, 0.43);
+        let left = sample_window_for_time(10.0, 100, 0.03, 0.25);
+        let right = sample_window_for_time(10.0, 100, 0.25, 0.43);
         assert_eq!((left.start_sample, left.end_sample), (1, 3));
         assert_eq!((right.start_sample, right.end_sample), (3, 5));
-        assert!(sample_window_for_time(10, 100, 0.21, 0.25).is_empty());
+        assert!(sample_window_for_time(10.0, 100, 0.21, 0.25).is_empty());
         for (freq, start, end) in [
-            (7, 29.0 / 7.0, 30.0 / 7.0),
-            (100, 0.29, 0.58),
-            (10, -1.0, 0.0),
-            (20, 0.03, 0.25),
-            (20, 30.0, 31.0),
+            (7.0, 29.0 / 7.0, 30.0 / 7.0),
+            (100.0, 0.29, 0.58),
+            (10.0, -1.0, 0.0),
+            (20.0, 0.03, 0.25),
+            (20.0, 30.0, 31.0),
         ] {
             let window = sample_window_for_time(freq, 100, start, end);
             let actual: Vec<_> = (window.start_sample..window.end_sample).collect();
             let expected: Vec<_> = (0..100)
                 .filter(|&i| {
-                    let t = i as f64 / freq as f64;
+                    let t = i as f64 / freq;
                     t >= start && t < end
                 })
                 .collect();
@@ -440,27 +440,27 @@ mod tests {
             (f64::NAN, 1.0),
             (0.0, f64::INFINITY),
         ] {
-            assert!(sample_window_for_time(10, 100, start, end).is_empty());
+            assert!(sample_window_for_time(10.0, 100, start, end).is_empty());
         }
-        assert!(sample_window_for_time(0, 100, 0.0, 1.0).is_empty());
+        assert!(sample_window_for_time(0.0, 100, 0.0, 1.0).is_empty());
     }
 
     #[test]
     fn sample_at_time_interpolates() {
         let data = [0.0, 10.0, 20.0];
-        assert_eq!(sample_at_time(&data, 10, 0.05), Some(5.0));
+        assert_eq!(sample_at_time(&data, 10.0, 0.05), Some(5.0));
     }
 
     #[test]
     fn interpolation_keeps_exact_valid_samples_and_does_not_bridge_outages() {
         let data = [1.0, f64::NAN, 3.0, 4.0];
-        assert_eq!(sample_at_time(&data, 1, 0.0), Some(1.0));
-        assert_eq!(sample_at_time(&data, 1, 0.5), None);
-        assert_eq!(sample_at_time(&data, 1, 1.0), None);
-        assert_eq!(sample_at_time(&data, 1, 1.5), None);
-        assert_eq!(sample_at_time(&data, 1, 2.0), Some(3.0));
-        assert_eq!(sample_at_time(&data, 1, 2.5), Some(3.5));
-        assert_eq!(sample_at_time(&data, 1, 4.0), None);
+        assert_eq!(sample_at_time(&data, 1.0, 0.0), Some(1.0));
+        assert_eq!(sample_at_time(&data, 1.0, 0.5), None);
+        assert_eq!(sample_at_time(&data, 1.0, 1.0), None);
+        assert_eq!(sample_at_time(&data, 1.0, 1.5), None);
+        assert_eq!(sample_at_time(&data, 1.0, 2.0), Some(3.0));
+        assert_eq!(sample_at_time(&data, 1.0, 2.5), Some(3.5));
+        assert_eq!(sample_at_time(&data, 1.0, 4.0), None);
     }
 
     #[test]
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn scatter_pairs_resample_both_axes() {
-        let pairs = scatter_pairs_at_times(&[0.0, 10.0], 10, &[100.0, 200.0], 20, &[0.05]);
+        let pairs = scatter_pairs_at_times(&[0.0, 10.0], 10.0, &[100.0, 200.0], 20.0, &[0.05]);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].x, Some(5.0));
         assert_eq!(pairs[0].y, Some(200.0));

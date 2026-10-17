@@ -14,13 +14,13 @@ pub struct TrackData {
     /// Time in seconds for each GPS sample.
     pub time: Vec<f64>,
     /// GPS sample frequency (Hz).
-    pub freq: u16,
+    pub freq: f64,
     pub distance_stretch_tolerance: Option<f64>,
     spatial_index: Option<TrackSpatialIndex>,
     origin: Option<(f64, f64, f64)>,
-    pub distance: Option<(Vec<f64>, u16)>,
+    pub distance: Option<(Vec<f64>, f64)>,
     /// Corrected speed in metres per second, shared with distance integration.
-    pub corrected_speed: Option<(Vec<f64>, u16)>,
+    pub corrected_speed: Option<(Vec<f64>, f64)>,
 }
 
 impl TrackData {
@@ -38,7 +38,7 @@ impl TrackData {
         )
     }
 
-    pub fn from_normalized_parts(x: Vec<f64>, y: Vec<f64>, time: Vec<f64>, freq: u16) -> Self {
+    pub fn from_normalized_parts(x: Vec<f64>, y: Vec<f64>, time: Vec<f64>, freq: f64) -> Self {
         let spatial_index = TrackSpatialIndex::build(&x, &y);
         Self {
             x,
@@ -302,17 +302,16 @@ pub fn gps_channels(ld: &LdFile) -> Option<(&crate::ChannelMeta, &crate::Channel
 /// the latitude rate.
 pub fn gps_track_from_samples(
     lat: &[f64],
-    lat_freq: u16,
+    lat_freq: f64,
     lon: &[f64],
-    lon_freq: u16,
+    lon_freq: f64,
 ) -> Option<TrackData> {
-    if lat_freq == 0 || lon_freq == 0 {
+    if lat_freq == 0.0 || lon_freq == 0.0 {
         return None;
     }
     let lon_at_lat_rate: Vec<f64> = (0..lat.len())
         .map(|i| {
-            crate::analysis::sample_at_time(lon, lon_freq, i as f64 / lat_freq as f64)
-                .unwrap_or(f64::NAN)
+            crate::analysis::sample_at_time(lon, lon_freq, i as f64 / lat_freq).unwrap_or(f64::NAN)
         })
         .collect();
     normalize_gps_samples(lat, &lon_at_lat_rate, lat_freq)
@@ -326,7 +325,7 @@ pub fn attach_corrected_distance(track: &mut TrackData, ld: &LdFile) {
     });
 }
 
-fn normalize_gps_samples(lat: &[f64], lon: &[f64], freq: u16) -> Option<TrackData> {
+fn normalize_gps_samples(lat: &[f64], lon: &[f64], freq: f64) -> Option<TrackData> {
     let valid = |a: f64, b: f64| {
         a.is_finite() && b.is_finite() && a.abs() <= 90.0 && b.abs() <= 180.0
             // A paired zero is the receiver's no-fix sentinel. Either coordinate
@@ -343,7 +342,7 @@ fn normalize_gps_samples(lat: &[f64], lon: &[f64], freq: u16) -> Option<TrackDat
             count += 1;
         }
     }
-    if count == 0 || freq == 0 {
+    if count == 0 || freq == 0.0 {
         return None;
     }
     let mean_lat = sum_lat / count as f64;
@@ -361,7 +360,7 @@ fn normalize_gps_samples(lat: &[f64], lon: &[f64], freq: u16) -> Option<TrackDat
             f64::NAN
         });
         y.push(if valid(a, b) { a - mean_lat } else { f64::NAN });
-        time.push(i as f64 / freq as f64);
+        time.push(i as f64 / freq);
     }
     let mut track = TrackData::from_normalized_parts(x, y, time, freq);
     track.origin = Some((mean_lat, mean_lon, cos_lat));
@@ -525,7 +524,7 @@ fn distance_section_interval(
         if width <= 0.0 {
             return None;
         }
-        Some(((i - 1) as f64 + (target - data[i - 1]) / width) / *freq as f64)
+        Some(((i - 1) as f64 + (target - data[i - 1]) / width) / *freq)
     };
     Some((crossing(section.start_mm)?, crossing(section.end_mm)?))
 }
@@ -782,7 +781,7 @@ pub fn find_nearest_sample(track: &TrackData, x: f64, y: f64) -> usize {
 pub fn compute_color_map(
     track: &TrackData,
     channel_data: &[f64],
-    channel_freq: u16,
+    channel_freq: f64,
 ) -> (Vec<[u8; 4]>, f64, f64) {
     let n = track.x.len();
     let mut colors = Vec::with_capacity(n);
@@ -831,12 +830,12 @@ pub fn color_channel_range(channel_data: &[f64]) -> (f64, f64) {
 }
 
 /// Resample channel data to match GPS track sample times via linear interpolation.
-fn resample_to_track(track: &TrackData, data: &[f64], freq: u16) -> Vec<f64> {
+fn resample_to_track(track: &TrackData, data: &[f64], freq: f64) -> Vec<f64> {
     track
         .time
         .iter()
         .map(|&t| {
-            let sample_f = t * freq as f64;
+            let sample_f = t * freq;
             let idx = sample_f.floor() as usize;
             let frac = sample_f - idx as f64;
             if idx + 1 < data.len() {
@@ -989,9 +988,9 @@ mod tests {
             vec![0.; 101],
             vec![0.; 101],
             (0..101).map(|i| i as f64).collect(),
-            1,
+            1.0,
         );
-        track.distance = Some(((0..101).map(|i| i as f64 * 10.).collect(), 1));
+        track.distance = Some(((0..101).map(|i| i as f64 * 10.).collect(), 1.0));
         let lap = Lap {
             number: 1,
             name: "Lap 1".into(),
@@ -1060,7 +1059,7 @@ mod tests {
     fn geographic_sections_survive_a_different_recording_origin_and_indices() {
         let lat = [36.0, 36.001, 36.001, 36.0, 36.0];
         let lon = [-79.0, -79.0, -78.999, -78.999, -79.0];
-        let first = normalize_gps_samples(&lat, &lon, 1).unwrap();
+        let first = normalize_gps_samples(&lat, &lon, 1.0).unwrap();
         let lap = Lap {
             number: 1,
             name: "Lap 1".into(),
@@ -1079,7 +1078,7 @@ mod tests {
         lat2.extend(lat);
         let mut lon2 = vec![0.0, -79.0005];
         lon2.extend(lon);
-        let second = normalize_gps_samples(&lat2, &lon2, 1).unwrap();
+        let second = normalize_gps_samples(&lat2, &lon2, 1.0).unwrap();
         let restored = import_track_definition(&second, &definition).unwrap();
         assert_eq!(restored.len(), 4);
         for (a, b) in sectors.iter().zip(restored) {
@@ -1087,7 +1086,7 @@ mod tests {
             assert_eq!(a.start_index + 2, b.start_index);
             assert_eq!(a.end_index + 2, b.end_index);
         }
-        let distant = normalize_gps_samples(&[37.0, 37.001], &[-80.0, -80.001], 1).unwrap();
+        let distant = normalize_gps_samples(&[37.0, 37.001], &[-80.0, -80.001], 1.0).unwrap();
         assert!(import_track_definition(&distant, &definition).is_err());
     }
 
@@ -1095,9 +1094,9 @@ mod tests {
     fn decoded_gps_builder_aligns_rates_and_preserves_origin_and_missing_fixes() {
         let track = gps_track_from_samples(
             &[36.0, 36.001, 0.0, 36.003],
-            1,
+            1.0,
             &[-79.0, -79.0, -78.999, -78.999, 0.0, 0.0, -78.997],
-            2,
+            2.0,
         )
         .unwrap();
         assert_eq!(track.time, [0.0, 1.0, 2.0, 3.0]);
@@ -1113,7 +1112,7 @@ mod tests {
         let definition = export_track_definition(&track, &sections, "Test".into()).unwrap();
         assert_eq!(definition.sections[0].start, [36.0, -79.0]);
         assert_eq!(definition.sections[0].end, [36.003, -78.997]);
-        assert!(gps_track_from_samples(&[36.0], 0, &[-79.0], 1).is_none());
+        assert!(gps_track_from_samples(&[36.0], 0.0, &[-79.0], 1.0).is_none());
     }
 
     #[test]
@@ -1121,7 +1120,7 @@ mod tests {
         let track = normalize_gps_samples(
             &[f64::NAN, 36.56, 0.0, 36.57],
             &[f64::NAN, -79.21, 0.0, -79.20],
-            20,
+            20.0,
         )
         .unwrap();
         assert!(track.x[0].is_nan() && track.x[2].is_nan());
@@ -1129,8 +1128,8 @@ mod tests {
         assert_eq!(track.time, [0.0, 0.05, 0.1, 0.15]);
         assert!(track.x[1].abs() < 0.01 && track.y[3].abs() < 0.01);
         assert_eq!(find_nearest_sample(&track, track.x[3], track.y[3]), 3);
-        assert!(normalize_gps_samples(&[0.0], &[0.0], 20).is_none());
-        assert!(normalize_gps_samples(&[0.0, 1.0], &[1.0, 0.0], 20).is_some());
+        assert!(normalize_gps_samples(&[0.0], &[0.0], 20.0).is_none());
+        assert!(normalize_gps_samples(&[0.0, 1.0], &[1.0, 0.0], 20.0).is_some());
     }
 
     #[test]
@@ -1139,7 +1138,7 @@ mod tests {
             vec![f64::NAN, 0.0, 1.0, 0.0, 1.0],
             vec![f64::NAN, 0.0, 0.0, 0.0, 0.0],
             vec![0.0, 1.0, 2.0, 3.0, 4.0],
-            1,
+            1.0,
         );
         assert_eq!(
             find_nearest_sample_in_range(&track, 0.0, 0.0, (3.0, 5.0)),
@@ -1157,7 +1156,7 @@ mod tests {
             vec![0.00005, 0.00015, f64::NAN, 0.0, 0.0001, 0.0002],
             vec![0.0, 0.0, f64::NAN, 0.0, 0.0, 0.0],
             vec![0.0, 0.05, 0.1, 0.15, 0.2, 0.25],
-            20,
+            20.0,
         );
         let lap = Lap {
             number: 1,
@@ -1206,7 +1205,7 @@ mod tests {
             vec![0.0, 1.0, 2.0, 3.0],
             vec![0.0, 0.0, 1.0, 1.0],
             vec![0.0, 0.05, 0.1, 0.15],
-            20,
+            20.0,
         );
         assert_eq!(find_nearest_sample(&track, 0.1, 0.1), 0);
         assert_eq!(find_nearest_sample(&track, 2.1, 0.9), 2);
@@ -1216,10 +1215,10 @@ mod tests {
     #[test]
     fn test_resample_to_track() {
         let track =
-            TrackData::from_normalized_parts(vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.5], 2);
+            TrackData::from_normalized_parts(vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.5], 2.0);
         // 10 Hz source data
         let data: Vec<f64> = (0..10).map(|i| i as f64 * 10.0).collect();
-        let resampled = resample_to_track(&track, &data, 10);
+        let resampled = resample_to_track(&track, &data, 10.0);
         assert_eq!(resampled.len(), 2);
         assert!((resampled[0] - 0.0).abs() < 1e-10);
         assert!((resampled[1] - 50.0).abs() < 1e-10);

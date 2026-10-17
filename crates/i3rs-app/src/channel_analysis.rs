@@ -286,7 +286,7 @@ mod tests {
             comment: "Measured".into(),
         });
         let id = add_math(&mut shared, "Wheelbase copy", "'Wheelbase'[m]");
-        shared.math_channels[0].options.output_freq = Some(4);
+        shared.math_channels[0].options.output_freq = Some(4.0);
         assert_eq!(evaluate(&mut shared, id), vec![2.7; 8]);
         let key = shared.math_evaluation_key(id);
         shared.math_channels[0].options.interpolation = Interpolation::Previous;
@@ -300,7 +300,7 @@ mod tests {
             &job.evaluation_key,
             Ok(EvaluatedMathChannel {
                 samples: vec![2.7; 8],
-                freq: 4,
+                freq: 4.0,
                 stats: Default::default()
             })
         ));
@@ -483,7 +483,7 @@ mod tests {
         shared.math_channels[0].dec_places = 2;
         shared.math_channels[0].options.quantity = "Angle".into();
         shared.math_channels[0].options.display_unit = Some("deg".into());
-        shared.math_channels[0].options.output_freq = Some(2);
+        shared.math_channels[0].options.output_freq = Some(2.0);
         assert_eq!(evaluate(&mut shared, id), vec![0.1; 4]);
         let mut pc = create_plotted_channel(ChannelId::Math(0), &shared, 0).unwrap();
         let info = build_plotted_channel_info(&pc, &shared);
@@ -566,7 +566,7 @@ mod tests {
         options.comment = "User-labelled gears".into();
         options.quantity = "State".into();
         options.enum_labels.insert(1, "First".into());
-        options.output_freq = Some(2);
+        options.output_freq = Some(2.0);
         evaluate(&mut shared, id);
         let info = crate::panels::utils::build_plotted_channel_info(
             &crate::panels::utils::create_plotted_channel(ChannelId::Math(0), &shared, 0).unwrap(),

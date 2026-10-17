@@ -23,6 +23,8 @@ use crate::state::{CHANNEL_COLORS, ChannelId, GraphMode, GraphXAxis, SharedState
 #[derive(Serialize, Deserialize)]
 pub struct WorkspaceFile {
     #[serde(default)]
+    pub profile: Option<crate::default_layouts::WorkspaceProfile>,
+    #[serde(default)]
     pub version: u32,
     #[serde(default)]
     pub comparisons: Option<ComparisonConfig>,
@@ -1027,6 +1029,7 @@ pub fn save_workspace(
     let sectors: Vec<Sector> = shared.sectors.clone();
 
     WorkspaceFile {
+        profile: shared.workspace_profile,
         version: 2,
         comparisons: Some(ComparisonConfig {
             main_lap: shared.comparisons.main_lap,
@@ -1133,6 +1136,7 @@ pub fn load_workspace(
     workspace: &WorkspaceFile,
     shared: &mut SharedState,
 ) -> Vec<(String, DockState<PanelTab>)> {
+    shared.workspace_profile = workspace.profile;
     shared.comparisons = Default::default();
     let legacy = workspace
         .worksheets
@@ -1652,7 +1656,7 @@ mod tests {
         let mut shared = SharedState::new();
         let mut mc = shared.create_math_channel_def("Angle".into(), "0.1".into(), "rad".into(), 2);
         mc.options.display_unit = Some("deg".into());
-        mc.freq = 1;
+        mc.freq = 1.0;
         mc.data = Some(Arc::from(vec![0.1]));
         shared.math_channels.push(mc);
         let mut graph = GraphPanel::new(1, "Angle");
@@ -1698,7 +1702,7 @@ mod tests {
             let mut mc =
                 shared.create_math_channel_def("Same".into(), value.to_string(), "".into(), 0);
             mc.options.source = source.into();
-            mc.freq = 1;
+            mc.freq = 1.0;
             mc.data = Some(Arc::from(vec![value]));
             shared.math_channels.push(mc);
         }
@@ -1735,7 +1739,7 @@ mod tests {
         let mut shared = SharedState::new();
         let mut channel =
             shared.create_math_channel_def("Engine test".into(), "1".into(), "rpm".into(), 1);
-        channel.freq = 2;
+        channel.freq = 2.0;
         channel.data = Some(Arc::from(vec![1000.0, 2000.0, 3000.0]));
         shared.math_channels.push(channel);
         let mut report = crate::panels::report::ReportPanel::new(1, "Independent report");
@@ -1919,7 +1923,7 @@ mod configuration_tests {
         let mut shared = SharedState::new();
         let mut def = shared.create_math_channel_def("Test".into(), "1".into(), "rpm".into(), 2);
         def.data = Some(Arc::from(vec![1., 2.]));
-        def.freq = 1;
+        def.freq = 1.0;
         shared.math_channels.push(def);
         let mut gauge = GaugePanel::new(1, "Gauge");
         let mut channel = create_plotted_channel(ChannelId::Math(0), &shared, 0).unwrap();
@@ -1966,7 +1970,7 @@ mod legacy_math_display_tests {
         let mut def = shared.create_math_channel_def("Angle".into(), "1".into(), "rad".into(), 2);
         def.options.display_unit = Some("deg".into());
         def.data = Some(std::sync::Arc::from(vec![1., 2.]));
-        def.freq = 1;
+        def.freq = 1.0;
         shared.math_channels.push(def);
         let json = r#"{"worksheets":[{"name":"Angles","panels":[{"Graph":{"id":1,"title":"Angle","channel_names":["Angle"],"colors":[[255,0,0]],"graph_mode":"Tiled","is_math":[true]}}]}],"active_worksheet":0,"last_file_path":null}"#;
         let workspace: WorkspaceFile = serde_json::from_str(json).unwrap();

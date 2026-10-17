@@ -15,7 +15,7 @@ use super::utils::{
     segmented_channel_button, show_plotted_channel_display_menu,
 };
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq)]
 struct HeatmapFingerprint {
     filter: String,
     policies: [i3rs_core::Interpolation; 3],
@@ -26,7 +26,7 @@ struct HeatmapFingerprint {
     bins: usize,
     delay: u64,
     minimum_y: Option<u64>,
-    frequencies: [u16; 3],
+    frequencies: [f64; 3],
     x_transform: DisplayTransformFingerprint,
     y_transform: DisplayTransformFingerprint,
     value_transform: DisplayTransformFingerprint,
@@ -293,7 +293,7 @@ impl MixtureMapPanel {
             }
         });
         let target_freq = x_freq;
-        if target_freq == 0 {
+        if target_freq == 0.0 {
             ui.label("Channel frequency is 0");
             return;
         }
@@ -373,7 +373,7 @@ impl MixtureMapPanel {
                         && (!self.gear_filter.enabled
                             || (rpm_unit
                                 && mask
-                                    .get((t * x_freq as f64).round() as usize)
+                                    .get((t * x_freq).round() as usize)
                                     .copied()
                                     .unwrap_or(false)))
                 },
@@ -410,7 +410,7 @@ impl MixtureMapPanel {
                                 x.unit.to_lowercase().as_str(),
                                 "rpm" | "r/min" | "1/min"
                             ) && mask
-                                .get((t * x.freq as f64).round() as usize)
+                                .get((t * x.freq).round() as usize)
                                 .copied()
                                 .unwrap_or(false)))
                 },
@@ -766,7 +766,7 @@ impl MixtureMapPanel {
                     .into_iter()
                     .flatten()
                     .filter_map(|i| heatmap.triples.get(i))
-                    .any(|p| (p.3 - cursor_time).abs() <= 0.5 / x_freq.max(1) as f64)
+                    .any(|p| (p.3 - cursor_time).abs() <= 0.5 / x_freq.max(1.0))
             }
             && let Some((x_val, y_val, _)) = mixture_sample_with_policies(
                 x_series,
@@ -828,7 +828,7 @@ pub(crate) fn normalized_sensor_delay(delay: f64) -> f64 {
 }
 
 /// A channel's samples, frequency, display scale and display offset.
-type Series<'a> = (&'a [f64], u16, f64, f64);
+type Series<'a> = (&'a [f64], f64, f64, f64);
 
 /// Selection is in lambda time: X/load at t pair with lambda at t + delay.
 /// Therefore an interior selection can use RPM/load preceding its start.
@@ -875,7 +875,7 @@ fn mixture_sample_with_policies(
         return None;
     }
     let sample = |(data, freq, scale, offset): Series, t: f64, policy| {
-        if freq == 0 || t >= data.len() as f64 / freq as f64 {
+        if freq == 0.0 || t >= data.len() as f64 / freq {
             return None;
         }
         let v = i3rs_core::channels::sample_with_policy(data, freq, t, policy)? * scale + offset;
@@ -898,7 +898,7 @@ fn compute_heatmap(
     x: Series,
     y: Series,
     value: Series,
-    target_freq: u16,
+    target_freq: f64,
     range: (f64, f64),
     bins: usize,
     y_fixed_range: Option<(f64, f64)>,
@@ -925,7 +925,7 @@ fn compute_heatmap_filtered(
     x: Series,
     y: Series,
     value: Series,
-    target_freq: u16,
+    target_freq: f64,
     (t0, t1): (f64, f64),
     bins: usize,
     y_fixed_range: Option<(f64, f64)>,
@@ -952,7 +952,7 @@ fn compute_heatmap_filtered_with_policies(
     x: Series,
     y: Series,
     value: Series,
-    target_freq: u16,
+    target_freq: f64,
     (t0, t1): (f64, f64),
     bins: usize,
     y_fixed_range: Option<(f64, f64)>,
@@ -972,17 +972,18 @@ fn compute_heatmap_filtered_with_policies(
         .collect();
 
     let sensor_delay = normalized_sensor_delay(sensor_delay);
-    let start = ((t0 - sensor_delay).max(0.) * target_freq as f64).ceil() as usize;
-    let duration = (x_data.len() as f64 / x_freq.max(1) as f64)
-        .min(v_data.len() as f64 / v_freq.max(1) as f64)
-        .min(y_data.len() as f64 / y_freq.max(1) as f64 - sensor_delay);
-    let end =
-        if [x_freq, y_freq, v_freq, target_freq].contains(&0) || !t0.is_finite() || !t1.is_finite()
-        {
-            0
-        } else {
-            ((t1 - sensor_delay).min(duration).max(0.) * target_freq as f64).ceil() as usize
-        };
+    let start = ((t0 - sensor_delay).max(0.) * target_freq).ceil() as usize;
+    let duration = (x_data.len() as f64 / x_freq.max(1.0))
+        .min(v_data.len() as f64 / v_freq.max(1.0))
+        .min(y_data.len() as f64 / y_freq.max(1.0) - sensor_delay);
+    let end = if [x_freq, y_freq, v_freq, target_freq].contains(&0.0)
+        || !t0.is_finite()
+        || !t1.is_finite()
+    {
+        0
+    } else {
+        ((t1 - sensor_delay).min(duration).max(0.) * target_freq).ceil() as usize
+    };
 
     let mut triples = Vec::new();
     let mut x_min = f64::MAX;
@@ -994,7 +995,7 @@ fn compute_heatmap_filtered_with_policies(
 
     // Count every valid sample; display aggregation must not alter statistics.
     for i in start..end {
-        let t = i as f64 / target_freq as f64;
+        let t = i as f64 / target_freq;
         if !includes(t) {
             continue;
         }
@@ -1183,10 +1184,10 @@ mod tests {
         let y = [1.0, 2.0, 3.0, 4.0];
         let v = [0.0, 10.0, 20.0, 30.0];
         let map = super::compute_heatmap(
-            (&x, 1, 1.0, 0.0),
-            (&y, 1, 2.0, 10.0),
-            (&v, 1, 1.0, 0.0),
-            1,
+            (&x, 1.0, 1.0, 0.0),
+            (&y, 1.0, 2.0, 10.0),
+            (&v, 1.0, 1.0, 0.0),
+            1.0,
             (0.0, 4.0),
             2,
             None,
@@ -1195,9 +1196,9 @@ mod tests {
         );
         let cursor = |time, range| {
             super::mixture_sample(
-                (&x, 1, 1.0, 0.0),
-                (&y, 1, 2.0, 10.0),
-                (&v, 1, 1.0, 0.0),
+                (&x, 1.0, 1.0, 0.0),
+                (&y, 1.0, 2.0, 10.0),
+                (&v, 1.0, 1.0, 0.0),
                 time,
                 range,
                 1.0,
@@ -1217,9 +1218,9 @@ mod tests {
         assert_eq!(cursor(f64::NAN, (0.0, 4.0)), None);
         assert_eq!(
             super::mixture_sample(
-                (&x, 1, 1.0, 0.0),
-                (&[1.0, f64::NAN, 3.0, 4.0], 1, 1.0, 0.0),
-                (&v, 1, 1.0, 0.0),
+                (&x, 1.0, 1.0, 0.0),
+                (&[1.0, f64::NAN, 3.0, 4.0], 1.0, 1.0, 0.0),
+                (&v, 1.0, 1.0, 0.0),
                 0.0,
                 (0.0, 4.0),
                 1.0,
@@ -1252,7 +1253,7 @@ mod tests {
                 (&rpm, rf, 1., 0.),
                 (&lambda, lf, 1., 0.),
                 (&throttle, tf, 1., 0.),
-                20,
+                20.0,
                 (0., 351.680),
                 32,
                 Some((0.7, 1.2)),
@@ -1271,10 +1272,10 @@ mod tests {
     #[test]
     fn display_bounds_do_not_filter_statistics_and_delay_stays_inside_range() {
         let map = super::compute_heatmap(
-            (&[1000.; 4], 1, 1., 0.),
-            (&[1., 2., 3., 4.], 1, 1., 0.),
-            (&[0., 10., 20., 30.], 1, 1., 0.),
-            1,
+            (&[1000.; 4], 1.0, 1., 0.),
+            (&[1., 2., 3., 4.], 1.0, 1., 0.),
+            (&[0., 10., 20., 30.], 1.0, 1., 0.),
+            1.0,
             (0., 4.),
             2,
             Some((0.7, 1.2)),
@@ -1352,7 +1353,7 @@ mod shift_reference_tests {
                     0.15,
                     Some(0.5),
                     |t| {
-                        mask.get((t * hz as f64).round() as usize)
+                        mask.get((t * hz).round() as usize)
                             .copied()
                             .unwrap_or(false)
                     },
@@ -1376,10 +1377,10 @@ mod shift_reference_tests {
         let y = [1., 2., 3., 4., 5.];
         let load = [0.; 5];
         let map = compute_heatmap(
-            (&x, 1, 1., 0.),
-            (&y, 1, 1., 0.),
-            (&load, 1, 1., 0.),
-            1,
+            (&x, 1.0, 1., 0.),
+            (&y, 1.0, 1., 0.),
+            (&load, 1.0, 1., 0.),
+            1.0,
             (1., 3.),
             5,
             None,
@@ -1399,10 +1400,10 @@ mod rate_policy_tests {
         let y = [1., f64::NAN, 1., 1.];
         let load = [0., 100.];
         let map = compute_heatmap_filtered_with_policies(
-            (&x, 4, 1., 0.),
-            (&y, 2, 1., 0.),
-            (&load, 1, 1., 0.),
-            4,
+            (&x, 4.0, 1., 0.),
+            (&y, 2.0, 1., 0.),
+            (&load, 1.0, 1., 0.),
+            4.0,
             (0., 2.),
             2,
             None,
@@ -1450,10 +1451,10 @@ mod band_trend_tests {
         let y = [1., 3., 5., 7., 9.];
         let load = [0., 0., 100., 100., 100.];
         let map = compute_heatmap(
-            (&x, 1, 1., 0.),
-            (&y, 1, 1., 0.),
-            (&load, 1, 1., 0.),
-            1,
+            (&x, 1.0, 1., 0.),
+            (&y, 1.0, 1., 0.),
+            (&load, 1.0, 1., 0.),
+            1.0,
             (0., 5.),
             5,
             None,

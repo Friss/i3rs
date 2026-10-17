@@ -20,7 +20,7 @@ struct VelocitySeries {
     name: String,
     unit: String,
     color: egui::Color32,
-    hz: u16,
+    hz: f64,
     range: (f64, f64),
     values: Vec<f64>,
 }
@@ -145,7 +145,7 @@ impl CalculationsPanel {
                     remove = Some(index);
                 }
             });
-            if info.freq == 0 || info.data.is_empty() {
+            if info.freq == 0.0 || info.data.is_empty() {
                 ui.weak("Channel unavailable or loading");
                 continue;
             }
@@ -206,7 +206,7 @@ impl CalculationsPanel {
                     );
                 }
                 for (i, v) in data.iter_mut().enumerate() {
-                    if !filter.includes(i as f64 / info.freq as f64) {
+                    if !filter.includes(i as f64 / info.freq) {
                         *v = f64::NAN;
                     }
                 }
@@ -339,7 +339,7 @@ impl CalculationsPanel {
                         let value = |n: usize| match self.suspension_output {
                             DistributionOutput::Count => n as f64,
                             DistributionOutput::Percent => 100. * n as f64 / total.max(1) as f64,
-                            DistributionOutput::Seconds => n as f64 / series.hz.max(1) as f64,
+                            DistributionOutput::Seconds => n as f64 / series.hz.max(1.0),
                         };
                         let label = format!("{} · {} samples", series.name, total);
                         if self.suspension_line {
@@ -399,7 +399,7 @@ fn append_results(
     name: &str,
     unit: &str,
     data: &[f64],
-    hz: u16,
+    hz: f64,
     range: (f64, f64),
     mode: CalculationMode,
     width: f64,
@@ -513,7 +513,7 @@ mod tests {
             "A,\"B",
             "mm",
             &[0., f64::NAN, 2., 3., 4., 5.],
-            2,
+            2.0,
             (0.25, 2.5),
             CalculationMode::IntervalAverages,
             1.,
@@ -537,8 +537,8 @@ mod panel_population_tests {
         shared.data_duration = Some(4.);
         shared.zoom_range = Some((0., 4.));
         for (name, data, freq) in [
-            ("Position", vec![0., 1., 3., 2., 0., f64::NAN, 2., 3.], 2),
-            ("Gate", vec![1., 1., 0., 1.], 1),
+            ("Position", vec![0., 1., 3., 2., 0., f64::NAN, 2., 3.], 2.0),
+            ("Gate", vec![1., 1., 0., 1.], 1.0),
         ] {
             let mut m = shared.create_math_channel_def(name.into(), "0".into(), "mm".into(), 1);
             m.freq = freq;

@@ -187,7 +187,8 @@ pub struct ChannelMeta {
     pub name: String,
     pub short_name: String,
     pub unit: String,
-    pub freq: u16,
+    /// Physical samples per second, including legacy ADL clock scaling.
+    pub freq: f64,
     pub n_data: u32,
     pub data_type: DataType,
     pub shift: i16,
@@ -221,8 +222,8 @@ impl ChannelMeta {
 
     /// Duration of this channel's data in seconds.
     pub fn duration_secs(&self) -> f64 {
-        if self.freq > 0 {
-            self.n_data as f64 / self.freq as f64
+        if self.freq > 0.0 {
+            self.n_data as f64 / self.freq
         } else {
             0.0
         }
@@ -263,6 +264,11 @@ impl LdBacking {
 }
 
 impl LdFile {
+    /// Physical-to-nominal sample rate ratio, also used to migrate saved timelines.
+    pub fn sample_clock_scale(&self) -> f64 {
+        sample_clock_scale(self.data())
+    }
+
     /// Stable content identity, computed lazily when recording-scoped analysis is used.
     /// FNV-1a 128 is an identity fingerprint, not a cryptographic integrity check.
     pub fn recording_id(&self) -> &str {
@@ -352,17 +358,19 @@ impl LdFile {
         let channels = self
             .channels
             .iter()
-            .filter(|ch| ch.freq > 0 && ch.n_data > 0);
-        let max_freq = channels.clone().map(|ch| ch.freq).max().unwrap_or(0);
-        if max_freq == 0 {
+            .filter(|ch| ch.freq > 0.0 && ch.n_data > 0);
+        let max_freq = channels.clone().map(|ch| ch.freq).fold(0.0_f64, f64::max);
+        if max_freq <= 0.0 {
             return 0.0;
         }
-        // Integer arithmetic avoids rounding down a sample already on the grid.
         let end_tick = channels
-            .map(|ch| (ch.n_data - 1) as u64 * max_freq as u64 / ch.freq as u64 + 1)
-            .max()
-            .unwrap_or(0);
-        end_tick as f64 / max_freq as f64
+            .map(|ch| {
+                let tick = (ch.n_data - 1) as f64 * (max_freq / ch.freq);
+                // Avoid rounding a sample already on the finest grid down one tick.
+                (tick + 1e-8).floor() + 1.0
+            })
+            .fold(0.0_f64, f64::max);
+        end_tick / max_freq
     }
 
     pub fn find_channel_by_name(&self, name: &str) -> Option<&ChannelMeta> {
@@ -651,12 +659,23 @@ fn channel_invalid_ranges(
     ranges
 }
 
+fn sample_clock_scale(data: &[u8]) -> f64 {
+    if read_u32(data, 0x42) == 1_024_000 {
+        1.024
+    } else {
+        1.0
+    }
+}
+
 fn parse_channel_metadata(
     data: &[u8],
     mut meta_ptr: u32,
     enum_tables: &HashMap<u16, Arc<HashMap<i64, String>>>,
 ) -> Vec<ChannelMeta> {
     let mut channels = Vec::new();
+    // Older ADL files use the 1,024,000 clock value at header +0x42,
+    // rather than the modern 1,000,000. Keep samples on their native grid.
+    let clock_scale = sample_clock_scale(data);
     let mut visited = HashSet::new();
 
     while meta_ptr != 0 && !visited.contains(&meta_ptr) {
@@ -749,7 +768,7 @@ fn parse_channel_metadata(
             name,
             short_name,
             unit,
-            freq: rec_freq,
+            freq: rec_freq as f64 * clock_scale,
             n_data,
             data_type,
             shift,
@@ -889,6 +908,158 @@ mod tests {
         bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
 
+    #[test]
+    fn legacy_adl_clock_preserves_native_samples_and_validity() {
+        let modern = LdFile::from_bytes(extended_fixture()).unwrap();
+        let mut bytes = extended_fixture();
+        put_u32(&mut bytes, 0x42, 1_024_000);
+        let legacy = LdFile::from_bytes(bytes).unwrap();
+        assert_eq!(legacy.channels[0].freq, 2.048);
+        assert!((legacy.duration_secs() * 1.024 - modern.duration_secs()).abs() < 1e-9);
+        let a = modern.read_channel_data(&modern.channels[0]).unwrap();
+        let b = legacy.read_channel_data(&legacy.channels[0]).unwrap();
+        assert_eq!(a.len(), b.len());
+        assert!(
+            a.iter()
+                .zip(&b)
+                .all(|(a, b)| a == b || a.is_nan() && b.is_nan())
+        );
+        let mut bytes = extended_fixture();
+        put_u32(&mut bytes, 0x42, 1_000_000);
+        assert_eq!(LdFile::from_bytes(bytes).unwrap().channels[0].freq, 2.0);
+    }
+
+    #[test]
+    fn saved_nominal_analysis_migrates_once_without_losing_edits() {
+        use crate::corrections::{GpsShift, WheelLockCorrection};
+        use crate::ranges::*;
+        let mut bytes = extended_fixture();
+        put_u32(&mut bytes, 0x42, 1_024_000);
+        let ld = LdFile::from_bytes(bytes).unwrap();
+        let mut analysis = RecordingAnalysis::from_laps(ld.recording_id().into(), 4.0, &[]);
+        analysis.ranges = vec![AnalysisRange {
+            id: "run".into(),
+            name: "Edited run".into(),
+            start: 1.024,
+            end: 4.0,
+            kind: RangeKind::Run,
+            trust: Trust::Trusted,
+            comment: "Keep me".into(),
+            reaction_time: Some(0.4),
+        }];
+        analysis.selected_range = Some("run".into());
+        analysis.markers = vec![
+            RangeMarker {
+                id: "marker".into(),
+                time: 2.048,
+                name: "Edited marker".into(),
+                kind: MarkerKind::User,
+                trust: Trust::Untrusted,
+                distance_m: Some(100.),
+            },
+            RangeMarker {
+                id: "end".into(),
+                time: 4.0,
+                name: "End".into(),
+                kind: MarkerKind::User,
+                trust: Trust::Unknown,
+                distance_m: None,
+            },
+        ];
+        analysis.details.driver = "Saved driver".into();
+        analysis
+            .details
+            .custom
+            .insert("Tyres".into(), "Soft".into());
+        analysis.drag_setup.ratios = vec![1.6, 1.28, 1.];
+        analysis.drag_runs.insert(
+            "run".into(),
+            crate::drag::RunDetails {
+                elapsed: [Some(0.5), Some(1.), Some(1.5), Some(2.), Some(2.5)],
+            },
+        );
+        analysis.corrections.gps_shift = GpsShift::Manual(1.024);
+        analysis.corrections.wheel_lock = Some(WheelLockCorrection {
+            acceleration_channel: "G Force Long".into(),
+            lag_seconds: 0.512,
+            braking_threshold_mps2: -1.,
+            speed_threshold_mps: 0.5,
+        });
+        analysis.corrections.track_length_m = Some(5000.);
+        analysis.gps_generation = Some(GpsGeneration {
+            gate: [[1., 1.], [2., 2.]],
+            minimum_interval: 30.72,
+            kind: RangeKind::Lap,
+        });
+        let original = analysis.clone();
+        assert!(analysis.migrate_sample_clock(&ld).unwrap());
+        assert_eq!(analysis.duration, ld.duration_secs());
+        assert_eq!(analysis.ranges[0].start, 1.);
+        assert_eq!(analysis.ranges[0].end, analysis.duration);
+        assert_eq!(analysis.ranges[0].id, "run");
+        assert_eq!(analysis.ranges[0].name, "Edited run");
+        assert_eq!(analysis.ranges[0].comment, "Keep me");
+        assert_eq!(analysis.ranges[0].trust, Trust::Trusted);
+        assert_eq!(analysis.ranges[0].reaction_time, Some(0.4));
+        assert_eq!(analysis.markers[0].time, 2.);
+        assert_eq!(analysis.markers[1].time, analysis.duration);
+        assert_eq!(analysis.markers[0].distance_m, Some(100.));
+        assert_eq!(analysis.details, original.details);
+        assert_eq!(analysis.selected_range, original.selected_range);
+        assert_eq!(analysis.drag_setup, original.drag_setup);
+        assert_eq!(analysis.drag_runs, original.drag_runs);
+        assert_eq!(analysis.corrections.gps_shift, GpsShift::Manual(1.));
+        assert_eq!(
+            analysis
+                .corrections
+                .wheel_lock
+                .as_ref()
+                .unwrap()
+                .lag_seconds,
+            0.5
+        );
+        assert_eq!(analysis.corrections.track_length_m, Some(5000.));
+        assert!((analysis.gps_generation.as_ref().unwrap().minimum_interval - 30.).abs() < 1e-9);
+        let json = serde_json::to_string(&analysis).unwrap();
+        let mut reopened: RecordingAnalysis = serde_json::from_str(&json).unwrap();
+        assert!(!reopened.migrate_sample_clock(&ld).unwrap());
+        assert_eq!(serde_json::to_string(&reopened).unwrap(), json);
+    }
+
+    #[test]
+    fn analysis_clock_migration_rejects_other_recordings_clocks_and_invalid_data() {
+        use crate::ranges::*;
+        let modern = LdFile::from_bytes(extended_fixture()).unwrap();
+        let mut bytes = extended_fixture();
+        put_u32(&mut bytes, 0x42, 1_024_000);
+        let legacy = LdFile::from_bytes(bytes).unwrap();
+        let valid = RecordingAnalysis::from_laps(legacy.recording_id().into(), 4., &[]);
+        for mut bad in [
+            RecordingAnalysis {
+                recording: "other".into(),
+                ..valid.clone()
+            },
+            RecordingAnalysis {
+                duration: 4.1,
+                ..valid.clone()
+            },
+            RecordingAnalysis {
+                version: 2,
+                ..valid.clone()
+            },
+        ] {
+            let before = serde_json::to_string(&bad).unwrap();
+            assert!(bad.migrate_sample_clock(&legacy).is_err());
+            assert_eq!(serde_json::to_string(&bad).unwrap(), before);
+        }
+        let mut wrong_clock = RecordingAnalysis::from_laps(
+            modern.recording_id().into(),
+            modern.duration_secs() * 1.024,
+            &[],
+        );
+        assert!(wrong_clock.migrate_sample_clock(&modern).is_err());
+    }
+
     fn extended_fixture() -> Vec<u8> {
         let mut bytes = vec![0; 4096];
         bytes[0] = MAGIC_BYTE;
@@ -992,10 +1163,10 @@ mod tests {
     #[test]
     fn session_endpoint_uses_finest_grid_instead_of_slow_channel_padding() {
         let mut ld = LdFile::from_bytes(extended_fixture()).unwrap();
-        ld.channels[0].freq = 100;
+        ld.channels[0].freq = 100.0;
         ld.channels[0].n_data = 401;
         let mut slow = ld.channels[0].clone();
-        slow.freq = 1;
+        slow.freq = 1.0;
         slow.n_data = 5;
         ld.channels.push(slow);
         assert_eq!(ld.duration_secs(), 4.01);
@@ -1003,7 +1174,7 @@ mod tests {
         // A different sample grid may end within the final finest-grid period.
         // Round to the next boundary rather than adding another whole period.
         let mut beacon = ld.channels[0].clone();
-        beacon.freq = 68;
+        beacon.freq = 68.0;
         beacon.n_data = 266439; // last sample at 3918.205882... seconds
         ld.channels[0].n_data = 391821;
         ld.channels.push(beacon);
@@ -1013,10 +1184,10 @@ mod tests {
     #[test]
     fn session_endpoint_includes_channels_that_outlast_the_fastest_channel() {
         let mut ld = LdFile::from_bytes(extended_fixture()).unwrap();
-        ld.channels[0].freq = 100;
+        ld.channels[0].freq = 100.0;
         ld.channels[0].n_data = 1000;
         let mut slow = ld.channels[0].clone();
-        slow.freq = 1;
+        slow.freq = 1.0;
         slow.n_data = 100;
         ld.channels.push(slow);
         assert_eq!(ld.duration_secs(), 99.01);
@@ -1024,7 +1195,7 @@ mod tests {
         // Empty and zero-frequency channels cannot supply a timestamp or grid.
         ld.channels[0].n_data = 0;
         assert_eq!(ld.duration_secs(), 100.0);
-        ld.channels[1].freq = 0;
+        ld.channels[1].freq = 0.0;
         assert_eq!(ld.duration_secs(), 0.0);
     }
 
@@ -1060,7 +1231,7 @@ mod tests {
             name: String::new(),
             short_name: String::new(),
             unit: String::new(),
-            freq: 10,
+            freq: 10.0,
             n_data: 0,
             data_type: DataType::Int16,
             shift,

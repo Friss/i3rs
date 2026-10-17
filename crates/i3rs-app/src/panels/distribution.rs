@@ -289,7 +289,7 @@ mod population_tests {
             channel_id: crate::state::ChannelId::Math(0),
             name: "gate".into(),
             unit: String::new(),
-            freq: 1,
+            freq: 1.0,
             dec_places: 0,
             color: egui::Color32::WHITE,
             data: std::sync::Arc::from(vec![-1., 0., 0.5, f64::NAN, 1.]),

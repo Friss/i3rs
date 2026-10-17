@@ -137,7 +137,7 @@ pub fn options(
     ui.horizontal_wrapped(|ui| {
         let mut fixed = opts.output_freq.is_some();
         if ui.checkbox(&mut fixed, "Fixed output rate").changed() {
-            opts.output_freq = fixed.then_some(100);
+            opts.output_freq = fixed.then_some(100.0);
         }
         if let Some(freq) = &mut opts.output_freq {
             ui.add(egui::DragValue::new(freq).range(1..=2000).suffix(" Hz"));

@@ -121,7 +121,7 @@ fn circuit_gps_bounds_and_outlap_rpm_count() {
     assert!(track.x.iter().any(|v| v.is_nan()));
     let rpm = ld.find_channel_by_name("Engine Speed").unwrap();
     let data = ld.read_channel_data(rpm).unwrap();
-    let end = (351.680 * rpm.freq as f64).ceil() as usize;
+    let end = (351.680 * rpm.freq).ceil() as usize;
     assert_eq!(data[..end].iter().filter(|v| v.is_finite()).count(), 7031);
 }
 

@@ -61,6 +61,25 @@ impl RecordingEditor {
             self.generation_kind = g.kind;
         }
     }
+    fn apply_draft(&mut self, shared: &mut SharedState) -> Result<(), String> {
+        let mut analysis = self.draft.clone().ok_or("No recording analysis draft")?;
+        prune_run_time_slips(&mut analysis);
+        // Track edits can change independently while this draft is open.
+        if let Some(current) = shared
+            .snapshot_recording_analysis()
+            .get(shared.recording_key())
+        {
+            let name = analysis.track.as_ref().map(|t| t.name.clone());
+            analysis.track = current.track.clone();
+            if let (Some(name), Some(track)) = (name, analysis.track.as_mut()) {
+                track.name = name;
+            }
+            analysis.sectors = current.sectors.clone();
+        }
+        shared.apply_recording_analysis(analysis)?;
+        self.reset(shared);
+        Ok(())
+    }
     pub fn show(&mut self, ctx: &egui::Context, shared: &mut SharedState) {
         if !shared.show_recording_editor {
             return;
@@ -72,10 +91,11 @@ impl RecordingEditor {
         egui::Window::new("Ranges, corrections and log details").open(&mut open).default_size([900.,700.]).show(ctx,|ui|{
             if shared.ld_file.is_none(){ui.label("Open a recording to edit its analysis settings.");return;}
             ui.horizontal(|ui|{
-                if ui.button("Apply edits").clicked()&&let Some(mut a)=self.draft.clone(){
-                    // Current track edits are owned by the same recording, independently of this draft.
-                    if let Some(current)=shared.snapshot_recording_analysis().get(shared.recording_key()){let name=a.track.as_ref().map(|t|t.name.clone());a.track=current.track.clone();if let (Some(name),Some(track))=(name,a.track.as_mut()){track.name=name;}a.sectors=current.sectors.clone();}
-                    self.status=Some(match shared.apply_recording_analysis(a){Ok(())=>{self.reset(shared);"Edits applied; save the project, workspace or sidecar to retain them.".into()},Err(e)=>e});
+                if ui.button("Apply edits").clicked() {
+                    self.status = Some(match self.apply_draft(shared) {
+                        Ok(()) => "Edits applied; save the project, workspace or sidecar to retain them.".into(),
+                        Err(error) => error,
+                    });
                 }
                 if ui.button("Reload draft").clicked(){self.reset(shared);}
                 if ui.button("Copy saved analysis JSON").clicked()&&let Some(a)=shared.snapshot_recording_analysis().get(shared.recording_key()){
@@ -101,6 +121,42 @@ if let Some(name)=file.file_name(){dialog=dialog.set_file_name(name.to_string_lo
                     let mut remove=None;for (name,value) in &mut a.details.custom {ui.horizontal(|ui|{ui.label(name);ui.text_edit_singleline(value);if ui.small_button("Remove").clicked(){remove=Some(name.clone());}});}
 if let Some(key)=remove{a.details.custom.remove(&key);}
                     ui.horizontal(|ui|{ui.text_edit_singleline(&mut self.custom_name);ui.text_edit_singleline(&mut self.custom_value);if ui.button("Add custom field").clicked()&&!self.custom_name.trim().is_empty(){a.details.custom.insert(self.custom_name.trim().into(),self.custom_value.clone());}});
+                });
+                ui.collapsing("Drag: transmission and clutch slip", |ui| {
+                    ui.label("Recording-specific transmission input/output ratios. Configure measured ratios; no vehicle ratios are assumed.");
+                    text(ui, "Engine RPM channel", &mut a.drag_setup.engine);
+                    text(ui, "Drive shaft RPM channel", &mut a.drag_setup.drive_shaft);
+                    text(ui, "Gear channel", &mut a.drag_setup.gear);
+                    ui.checkbox(&mut a.drag_setup.generate_input_shaft, "Generate Input Shaft Speed");
+                    ui.checkbox(&mut a.drag_setup.generate_clutch_slip, "Generate Clutch Slip");
+                    let mut remove = None;
+                    for (i, ratio) in a.drag_setup.ratios.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Gear {} ratio", i + 1));
+                            ui.add(egui::DragValue::new(ratio).speed(0.001).range(0.001..=100.));
+                            if ui.small_button("Remove gear").clicked() { remove = Some(i); }
+                        });
+                    }
+                    if let Some(i) = remove { a.drag_setup.ratios.remove(i); }
+                    if a.drag_setup.ratios.len() < 16 && ui.button("Add gear ratio").clicked() { a.drag_setup.ratios.push(1.); }
+                    if let Err(e) = a.drag_setup.expressions() { ui.weak(e); }
+                    ui.label("Apply edits to update the shared maths; save the workspace, project or sidecar to retain setup.");
+                });
+                ui.collapsing("Drag: run time-slip details", |ui| {
+                    ui.label("Create a Run range in the range editor first. Enter cumulative elapsed seconds from launch, excluding reaction time. Empty milestones use corrected-distance crossings when available.");
+                    for r in a.ranges.iter().filter(|r| r.kind == RangeKind::Run) {
+                        ui.push_id((&r.id, "slip"), |ui| {
+                            ui.label(&r.name);
+                            let slip = a.drag_runs.entry(r.id.clone()).or_default();
+                            for (ft, elapsed) in i3rs_core::drag::MILESTONES_FT.iter().zip(&mut slip.elapsed) {
+                                ui.horizontal(|ui| {
+                                    let mut enabled = elapsed.is_some();
+                                    if ui.checkbox(&mut enabled, format!("{ft} ft elapsed")).changed() { *elapsed = enabled.then_some(0.); }
+                                    if let Some(t) = elapsed { ui.add(egui::DragValue::new(t).speed(0.001).suffix(" s")); }
+                                });
+                            }
+                        });
+                    }
                 });
                 ui.collapsing("Ranges (lap / run / stage / transport)",|ui|{
                     ui.label("Ranges are [start, end). Types and trust remain separate from their editable names.");
@@ -129,6 +185,7 @@ if let Some(t)=&mut r.reaction_time{ui.add(egui::DragValue::new(t).speed(0.001).
                     if ui.button("Generate GPS markers").clicked(){let result=shared.track_data_if_ready().ok_or("Corrected GPS track is unavailable".to_string()).and_then(|track|track.geographic_fixes().ok_or("GPS origin is unavailable".to_string()).and_then(|fixes|gps_crossing_markers(&fixes,&track.time,self.gate,self.minimum_interval)));match result{Ok(markers)=>{self.status=Some(format!("{} directed crossings generated",markers.len()));a.markers=markers;a.gps_generation=Some(GpsGeneration{gate:self.gate,minimum_interval:self.minimum_interval,kind:self.generation_kind});},Err(e)=>self.status=Some(e)}}
                 });
                 ui.collapsing("Corrected speed, distance and GPS",|ui|{correction_controls(ui,&mut a.corrections);});
+                prune_run_time_slips(a);
                 if let Err(error)=a.validate(){ui.colored_label(egui::Color32::LIGHT_RED,error);}
             });
             ui.collapsing("Import analysis JSON",|ui|{
@@ -141,6 +198,15 @@ if let Some(t)=&mut r.reaction_time{ui.add(egui::DragValue::new(t).speed(0.001).
         shared.show_recording_editor = open;
     }
 }
+fn prune_run_time_slips(analysis: &mut RecordingAnalysis) {
+    analysis.drag_runs.retain(|id, _| {
+        analysis
+            .ranges
+            .iter()
+            .any(|r| &r.id == id && r.kind == RangeKind::Run)
+    });
+}
+
 fn text(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -383,5 +449,84 @@ fn correction_controls(ui: &mut egui::Ui, s: &mut CorrectionSettings) {
     }
     if let Some(v) = &mut s.gps_zero_below_mps {
         ui.add(egui::DragValue::new(v).range(0.0..=500.).suffix(" m/s"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    fn editor_with_runs() -> (RecordingEditor, SharedState) {
+        let ld = Arc::new(
+            i3rs_core::LdFile::open(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../test_data/VIR_LAP.ld"
+            ))
+            .unwrap(),
+        );
+        let mut shared = SharedState::new();
+        shared.data_duration = Some(ld.duration_secs());
+        shared.ld_file = Some(ld);
+        shared.activate_recording_analysis(&[]);
+        let mut analysis = shared.current_analysis().unwrap().clone();
+        for (id, start, end) in [("remove", 0., 5.), ("keep", 5., 10.)] {
+            analysis.ranges.push(AnalysisRange {
+                id: id.into(),
+                name: id.into(),
+                start,
+                end,
+                kind: RangeKind::Run,
+                trust: Trust::Unknown,
+                comment: String::new(),
+                reaction_time: None,
+            });
+            analysis.drag_runs.insert(
+                id.into(),
+                i3rs_core::drag::RunDetails {
+                    elapsed: [Some(1.), None, None, None, None],
+                },
+            );
+        }
+        shared.apply_recording_analysis(analysis).unwrap();
+        let mut editor = RecordingEditor::default();
+        editor.reset(&shared);
+        (editor, shared)
+    }
+    #[test]
+    fn deleting_a_run_applies_on_first_attempt_without_opening_the_slip_section() {
+        let (mut editor, mut shared) = editor_with_runs();
+        editor.draft.as_mut().unwrap().ranges.remove(0);
+        editor.apply_draft(&mut shared).unwrap();
+        let a = shared.current_analysis().unwrap();
+        assert!(!a.drag_runs.contains_key("remove"));
+        assert_eq!(a.drag_runs["keep"].elapsed[0], Some(1.));
+        assert_eq!(a.ranges.len(), 1);
+    }
+    #[test]
+    fn changing_a_run_kind_prunes_only_its_slip_on_first_apply() {
+        let (mut editor, mut shared) = editor_with_runs();
+        editor.draft.as_mut().unwrap().ranges[0].kind = RangeKind::Stage;
+        editor.apply_draft(&mut shared).unwrap();
+        let a = shared.current_analysis().unwrap();
+        assert_eq!(a.ranges[0].kind, RangeKind::Stage);
+        assert!(!a.drag_runs.contains_key("remove"));
+        assert!(a.drag_runs.contains_key("keep"));
+    }
+    #[test]
+    fn invalid_retained_slip_is_still_rejected_without_changing_saved_analysis() {
+        let (mut editor, mut shared) = editor_with_runs();
+        editor
+            .draft
+            .as_mut()
+            .unwrap()
+            .drag_runs
+            .get_mut("keep")
+            .unwrap()
+            .elapsed[0] = Some(6.);
+        assert!(editor.apply_draft(&mut shared).is_err());
+        assert_eq!(
+            shared.current_analysis().unwrap().drag_runs["keep"].elapsed[0],
+            Some(1.)
+        );
     }
 }

@@ -71,8 +71,8 @@ pub fn detect_laps(ld: &LdFile) -> Vec<Lap> {
 /// The third word records milliseconds within the second. The first word is
 /// stored in the sample immediately after the event's time bucket. This also
 /// works for cropped logs, whose packed ECU tick counter keeps its old origin.
-fn beacon_boundaries(data: &[f64], freq: u16, session_end: f64) -> Vec<f64> {
-    if freq == 0 {
+fn beacon_boundaries(data: &[f64], freq: f64, session_end: f64) -> Vec<f64> {
+    if freq == 0.0 {
         return Vec::new();
     }
     let mut boundaries = Vec::new();
@@ -89,8 +89,8 @@ fn beacon_boundaries(data: &[f64], freq: u16, session_end: f64) -> Vec<f64> {
         if millis >= 1000 {
             continue;
         }
-        let lower = (i - 1) as f64 / freq as f64;
-        let upper = i as f64 / freq as f64;
+        let lower = (i - 1) as f64 / freq;
+        let upper = i as f64 / freq;
         let fraction = millis as f64 / 1000.0;
         // Allow half a millisecond for quantization of the event timestamp.
         let time = (lower - fraction - 0.0005).ceil() + fraction;
@@ -109,11 +109,11 @@ fn detect_from_lap_time_running(ld: &LdFile) -> Option<Vec<Lap>> {
     let ch = find_channel(ld, &["lap time running", "lap.time.running"])?;
     let data = ld.read_channel_data(ch)?;
 
-    if data.len() < 2 || ch.freq == 0 {
+    if data.len() < 2 || ch.freq == 0.0 {
         return None;
     }
 
-    let freq = ch.freq as f64;
+    let freq = ch.freq;
     let session_end = ld.duration_secs();
 
     // Find resets: a large drop in the running timer indicates a beacon crossing
@@ -146,11 +146,11 @@ fn detect_from_lap_number(ld: &LdFile) -> Vec<Lap> {
         None => return vec![],
     };
 
-    if data.is_empty() || ch.freq == 0 {
+    if data.is_empty() || ch.freq == 0.0 {
         return vec![];
     }
 
-    let freq = ch.freq as f64;
+    let freq = ch.freq;
     let session_end = ld.duration_secs();
 
     let mut boundaries = Vec::new();
@@ -248,7 +248,10 @@ mod tests {
         put_beacon(&mut data, 36, 515);
         put_beacon(&mut data, 40, 574);
         put_beacon(&mut data, 68, 999);
-        assert_eq!(beacon_boundaries(&data, 68, 3.0), vec![0.515, 0.574, 0.999]);
+        assert_eq!(
+            beacon_boundaries(&data, 68.0, 3.0),
+            vec![0.515, 0.574, 0.999]
+        );
     }
 
     #[test]
@@ -257,8 +260,8 @@ mod tests {
         put_beacon(&mut data, 1, 101);
         put_beacon(&mut data, 129, 493);
         put_beacon(&mut data, 135, 1001);
-        assert_eq!(beacon_boundaries(&data, 1, 140.0), vec![0.101, 128.493]);
+        assert_eq!(beacon_boundaries(&data, 1.0, 140.0), vec![0.101, 128.493]);
         data[2] = 0.0;
-        assert_eq!(beacon_boundaries(&data, 1, 140.0), vec![128.493]);
+        assert_eq!(beacon_boundaries(&data, 1.0, 140.0), vec![128.493]);
     }
 }

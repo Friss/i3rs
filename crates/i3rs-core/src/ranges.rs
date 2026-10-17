@@ -58,7 +58,7 @@ pub struct AnalysisRange {
     pub trust: Trust,
     #[serde(default)]
     pub comment: String,
-    /// Optional reaction time for a drag run, in seconds. W08 adds time-slip reports.
+    /// Optional reaction time for a drag run, in seconds; excluded from elapsed times.
     #[serde(default)]
     pub reaction_time: Option<f64>,
 }
@@ -106,6 +106,8 @@ pub struct GpsGeneration {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecordingAnalysis {
+    pub drag_setup: crate::drag::DragSetup,
+    pub drag_runs: BTreeMap<String, crate::drag::RunDetails>,
     pub version: u32,
     pub recording: String,
     pub duration: f64,
@@ -121,6 +123,8 @@ pub struct RecordingAnalysis {
 impl Default for RecordingAnalysis {
     fn default() -> Self {
         Self {
+            drag_setup: Default::default(),
+            drag_runs: Default::default(),
             version: 1,
             recording: String::new(),
             duration: 0.,
@@ -136,6 +140,55 @@ impl Default for RecordingAnalysis {
     }
 }
 impl RecordingAnalysis {
+    /// Restore analyses saved before legacy ADL rates used the physical clock.
+    /// Identity and the old duration must both match; unrelated or invalid
+    /// analyses are rejected without changing this value. Current-clock data
+    /// is left alone, so saving and reopening cannot scale timestamps twice.
+    pub fn migrate_sample_clock(&mut self, ld: &crate::LdFile) -> Result<bool, String> {
+        self.validate()?;
+        if self.recording != ld.recording_id() {
+            return Err("Analysis sidecar belongs to another recording".into());
+        }
+        let duration = ld.duration_secs();
+        if (self.duration - duration).abs() <= 1e-6 {
+            return Ok(false);
+        }
+        let scale = ld.sample_clock_scale();
+        if scale == 1.0 || (self.duration - duration * scale).abs() > 1e-6 {
+            return Err("Analysis duration differs from this recording".into());
+        }
+        let mut migrated = self.clone();
+        let time = |t: f64| {
+            if t == self.duration {
+                duration
+            } else {
+                t / scale
+            }
+        };
+        migrated.duration = duration;
+        for range in &mut migrated.ranges {
+            range.start = time(range.start);
+            range.end = time(range.end);
+        }
+        for marker in &mut migrated.markers {
+            marker.time = time(marker.time);
+        }
+        // These offsets were chosen against the old sample timeline. Spatial
+        // settings and official reaction/time-slip elapsed seconds are unchanged.
+        if let Some(wheel_lock) = &mut migrated.corrections.wheel_lock {
+            wheel_lock.lag_seconds /= scale;
+        }
+        if let crate::corrections::GpsShift::Manual(shift) = &mut migrated.corrections.gps_shift {
+            *shift /= scale;
+        }
+        if let Some(generation) = &mut migrated.gps_generation {
+            generation.minimum_interval /= scale;
+        }
+        migrated.validate()?;
+        *self = migrated;
+        Ok(true)
+    }
+
     pub fn from_laps(recording: String, duration: f64, laps: &[Lap]) -> Self {
         let ranges = laps
             .iter()
@@ -166,6 +219,15 @@ impl RecordingAnalysis {
         }
     }
     pub fn validate(&self) -> Result<(), String> {
+        self.drag_setup.validate()?;
+        for (id, slip) in &self.drag_runs {
+            let run = self
+                .ranges
+                .iter()
+                .find(|r| &r.id == id && r.kind == RangeKind::Run)
+                .ok_or("Time-slip details must belong to a Run range")?;
+            slip.validate(run.end - run.start)?;
+        }
         if self.version != 1 {
             return Err("Unsupported recording analysis version".into());
         }

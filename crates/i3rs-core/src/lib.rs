@@ -8,6 +8,7 @@ pub mod channels;
 pub mod distance;
 pub mod distribution;
 mod downsample;
+pub mod drag;
 pub mod export;
 pub mod fft;
 mod lap_detect;
@@ -33,7 +34,7 @@ pub use export::{ExportChannel, export_csv};
 pub use fft::{FftResult, compute_fft, compute_fft_with_planner};
 pub use lap_detect::{Lap, detect_laps, format_duration, recorded_beacon_times};
 pub use ld_parser::{ChannelMeta, DataType, Event, LdFile, Session, normalize_channel_name};
-pub use ldx_parser::{LdxFile, LdxLap, find_ldx_for_ld};
+pub use ldx_parser::{LdxFile, LdxLap, LdxMarker, find_ldx_for_ld};
 pub use math_engine::{
     ChannelData, EvaluationOptions, MathError, evaluate_expression,
     evaluate_expression_with_aliases, evaluate_expression_with_options, lowpass,

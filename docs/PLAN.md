@@ -1,5 +1,9 @@
 # Plan: Open-Source MoTeC i2 Pro Alternative
 
+The [i2 parity implementation plan](i2-parity-implementation-plan.md) groups and orders the remaining gaps identified in the October 2026 Standard audit and Pro documentation review. Use it for the next implementation work; the milestones below retain the original build history and do not establish full i2 behavior parity.
+
+Workspace profiles (W08) now include the 33 audited Circuit, Drag, configured Engine and Rally worksheets, recording-specific Drag setup and milestone reports. See [usage](workspace-profiles.md) and [verification limits](testing/i3r-8-workspace-profiles-2026-10-16.md).
+
 ## Context
 
 MoTeC i2 Pro is the industry-standard motorsport telemetry analysis tool, but it's Windows-only, expensive, and locked to MoTeC's licensing model. We're building a cross-platform (Windows/macOS/Linux) open-source alternative that can open MoTeC .ld log files and provide the same core analysis workflow: time-series graphs, lap overlays, track maps, math channels, and statistical reports.
