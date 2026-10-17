@@ -70,12 +70,12 @@ pub fn track_annotations(
     track: &TrackData,
     lap: &Lap,
     sectors: &[Sector],
-    gear: Option<(&[f64], u16)>,
+    gear: Option<(&[f64], f64)>,
     settings: &AnnotationSettings,
 ) -> Vec<TrackAnnotation> {
     let mut result = vec![];
     if let Some((speed, freq)) = &track.corrected_speed
-        && *freq > 0
+        && *freq > 0.0
     {
         for sector in sectors {
             let maximum = match sector.semantics.kind {
@@ -101,7 +101,7 @@ pub fn track_annotations(
                     .skip(window.start_sample)
                 {
                     if v.is_finite() {
-                        candidates.push((i as f64 / *freq as f64, v));
+                        candidates.push((i as f64 / *freq, v));
                     }
                 }
                 // Continuous extrema include the exact section start, not a sample before it.
@@ -136,11 +136,11 @@ pub fn track_annotations(
     }
     if settings.gear_changes
         && let Some((data, freq)) = gear
-        && freq > 0
+        && freq > 0.0
     {
         for i in 1..data.len() {
             let (a, b) = (data[i - 1], data[i]);
-            let time = i as f64 / freq as f64;
+            let time = i as f64 / freq;
             if time < lap.start_time
                 || time >= lap.end_time
                 || !a.is_finite()
@@ -178,10 +178,10 @@ mod tests {
             (0..9).map(|v| v as f64).collect(),
             vec![0.; 9],
             (0..9).map(|v| v as f64).collect(),
-            1,
+            1.0,
         );
-        track.distance = Some(((0..9).map(|v| v as f64 * 10.).collect(), 1));
-        track.corrected_speed = Some((vec![10., 20., 40., 30., 10., 5., 8., 25., 10.], 1));
+        track.distance = Some(((0..9).map(|v| v as f64 * 10.).collect(), 1.0));
+        track.corrected_speed = Some((vec![10., 20., 40., 30., 10., 5., 8., 25., 10.], 1.0));
         let sector = |id: &str, kind, start, end| Sector {
             name: id.into(),
             semantics: SectionSemantics {
@@ -212,7 +212,7 @@ mod tests {
             &track,
             &lap,
             &sectors,
-            Some((&[1., 1., 2., 2., f64::NAN, 3., 3., 4., 4.], 1)),
+            Some((&[1., 1., 2., 2., f64::NAN, 3., 3., 4., 4.], 1.0)),
             &Default::default(),
         );
         assert!(

@@ -12,7 +12,7 @@ use super::utils::{
     show_plotted_channel_display_menu, transform_channel_value,
 };
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq)]
 struct ScatterFingerprint {
     filter: String,
     policies: [i3rs_core::Interpolation; 2],
@@ -20,7 +20,7 @@ struct ScatterFingerprint {
     x_data_len: usize,
     y_data_ptr: usize,
     y_data_len: usize,
-    frequencies: (u16, u16),
+    frequencies: (f64, f64),
     zoom_key: Option<(u64, u64)>,
     x_transform: DisplayTransformFingerprint,
     y_transform: DisplayTransformFingerprint,
@@ -897,16 +897,16 @@ fn clamp_axis_bounds(
 /// Build scatter plot points by resampling both channels to a common frequency.
 fn build_scatter_points(
     x_channel: &PlottedChannel,
-    x_freq: u16,
+    x_freq: f64,
     y_channel: &PlottedChannel,
-    y_freq: u16,
-    target_freq: u16,
+    y_freq: f64,
+    target_freq: f64,
     t0: f64,
     t1: f64,
 ) -> Vec<ScatterPoint> {
-    if target_freq == 0
-        || x_freq == 0
-        || y_freq == 0
+    if target_freq == 0.0
+        || x_freq == 0.0
+        || y_freq == 0.0
         || !t0.is_finite()
         || !t1.is_finite()
         || t1 <= t0
@@ -914,15 +914,15 @@ fn build_scatter_points(
         return Vec::new();
     }
 
-    let start_sample = (t0.max(0.0) * target_freq as f64).ceil() as usize;
-    let end_sample = (t1 * target_freq as f64).ceil() as usize;
+    let start_sample = (t0.max(0.0) * target_freq).ceil() as usize;
+    let end_sample = (t1 * target_freq).ceil() as usize;
     let end_sample = end_sample
-        .min((x_channel.data.len() as f64 * target_freq as f64 / x_freq as f64) as usize)
-        .min((y_channel.data.len() as f64 * target_freq as f64 / y_freq as f64) as usize);
+        .min((x_channel.data.len() as f64 * target_freq / x_freq) as usize)
+        .min((y_channel.data.len() as f64 * target_freq / y_freq) as usize);
 
     (start_sample..end_sample)
         .filter_map(|i| {
-            let time = i as f64 / target_freq as f64;
+            let time = i as f64 / target_freq;
             let x =
                 transform_channel_value(x_channel, interp_at_time(&x_channel.data, x_freq, time)?);
             let y =
@@ -984,15 +984,15 @@ mod tests {
     fn faster_samples_are_preserved_and_empty_ranges_are_safe() {
         let x = sample_channel(Arc::from(vec![0., 1., 2.]));
         let y = sample_channel(Arc::from(vec![0., 9., 0., 8., 0., 7.]));
-        let points = build_scatter_points(&x, 1, &y, 2, 2, 0., 3.);
+        let points = build_scatter_points(&x, 1.0, &y, 2.0, 2.0, 0., 3.);
         assert_eq!(points.len(), 6);
         assert_eq!(points[1].x, 0.5);
         assert_eq!(points[1].y, 9.);
-        assert!(build_scatter_points(&x, 1, &y, 2, 2, 10., 11.).is_empty());
-        assert!(build_scatter_points(&x, 0, &y, 2, 2, 0., 1.).is_empty());
+        assert!(build_scatter_points(&x, 1.0, &y, 2.0, 2.0, 10., 11.).is_empty());
+        assert!(build_scatter_points(&x, 0.0, &y, 2.0, 2.0, 0., 1.).is_empty());
         let long = sample_channel(Arc::from(vec![1.; 120_001]));
         assert_eq!(
-            build_scatter_points(&long, 1, &long, 1, 1, 0., 120_001.).len(),
+            build_scatter_points(&long, 1.0, &long, 1.0, 1.0, 0., 120_001.).len(),
             120_001
         );
     }
@@ -1085,22 +1085,22 @@ fn draw_density(
 fn scatter_info_points(
     x: &crate::state::PlottedChannelInfo,
     y: &crate::state::PlottedChannelInfo,
-    hz: u16,
+    hz: f64,
     range: (f64, f64),
 ) -> Vec<ScatterPoint> {
-    if hz == 0 || x.freq == 0 || y.freq == 0 {
+    if hz == 0.0 || x.freq == 0.0 || y.freq == 0.0 {
         return Vec::new();
     }
-    let duration = (x.data.len() as f64 / x.freq as f64).min(y.data.len() as f64 / y.freq as f64);
+    let duration = (x.data.len() as f64 / x.freq).min(y.data.len() as f64 / y.freq);
     let window = i3rs_core::sample_window_for_time(
         hz,
-        (duration * hz as f64).ceil() as usize,
+        (duration * hz).ceil() as usize,
         range.0,
         range.1.min(duration),
     );
     (window.start_sample..window.end_sample)
         .filter_map(|i| {
-            let time = i as f64 / hz as f64;
+            let time = i as f64 / hz;
             let sample = |info: &crate::state::PlottedChannelInfo| {
                 i3rs_core::channels::sample_with_policy(
                     &info.data,

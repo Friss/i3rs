@@ -393,6 +393,7 @@ impl App {
             self.shared.message(warning);
         }
         self.shared.activate_recording_analysis(&detected);
+        self.shared.sync_drag_math();
         if let Some(selected) = self.shared.selected_lap {
             self.shared.select_lap(Some(selected));
         }
@@ -422,7 +423,8 @@ impl App {
         math_editor::evaluate_all_math_channels(&mut self.shared);
 
         // Auto-populate default worksheets if current layout is empty
-        let is_empty_default = is_startup_default_layout(&self.worksheets);
+        let is_empty_default =
+            workspace_snapshot.is_none() && is_startup_default_layout(&self.worksheets);
 
         if is_empty_default {
             let ld_ref = self.shared.ld_file.clone().unwrap();
@@ -1677,6 +1679,30 @@ impl App {
         }
     }
 
+    fn use_workspace_profile(&mut self, profile: crate::default_layouts::WorkspaceProfile) {
+        self.shared.workspace_profile = Some(profile);
+        let Some(ld) = self.shared.ld_file.clone() else {
+            return;
+        };
+        self.pending_workspace_restore = None;
+        self.popped_out_track_maps.clear();
+        self.worksheets =
+            crate::default_layouts::create_profile_worksheets(profile, &ld, &mut self.shared)
+                .into_iter()
+                .map(|(name, dock_state)| Worksheet {
+                    name,
+                    dock_state,
+                    window: Default::default(),
+                })
+                .collect();
+        self.active_worksheet = 0;
+        let snapshot = self.workspace_snapshot_for_session_reload();
+        if let Some(load) = &mut self.pending_session_load {
+            load.workspace_snapshot = snapshot;
+        }
+        self.egui_ctx.request_repaint();
+    }
+
     fn load_workspace(&mut self) {
         if let Some(path) = crate::platform::pick_workspace_file() {
             match std::fs::read_to_string(&path) {
@@ -1756,6 +1782,20 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
+                    ui.menu_button("Workspace Profile", |ui| {
+                        for profile in crate::default_layouts::WorkspaceProfile::ALL {
+                            if ui
+                                .selectable_label(
+                                    self.shared.workspace_profile == Some(profile),
+                                    profile.label(),
+                                )
+                                .clicked()
+                            {
+                                self.use_workspace_profile(profile);
+                                ui.close();
+                            }
+                        }
+                    });
                     if ui.button("Save Workspace...").clicked() {
                         self.save_workspace();
                         ui.close();
@@ -1938,6 +1978,10 @@ impl App {
                         &mut self.shared.show_recording_editor,
                         "Ranges / Corrections / Details",
                     );
+                    if ui.button("Drag setup / Run time slips…").clicked() {
+                        self.shared.show_recording_editor = true;
+                        ui.close();
+                    }
                     if ui.button("Session Details").clicked() {
                         self.show_session_details = true;
                         ui.close();
@@ -2776,6 +2820,32 @@ mod tests {
     }
 
     #[test]
+    fn switching_profiles_keeps_the_recording_selection_and_analysis_edits() {
+        let mut app = test_app(SharedState::new(), vec![]);
+        app.open_file(PathBuf::from(TEST_LD));
+        let ld = app.shared.ld_file.clone().unwrap();
+        let key = app.shared.recording_key().to_string();
+        let mut analysis = app.shared.current_analysis().unwrap().clone();
+        analysis.details.notes = "Retain this recording across profiles".into();
+        app.shared.apply_recording_analysis(analysis).unwrap();
+        app.shared.select_lap(Some(1));
+        app.shared.cursor_time = Some(12.5);
+        let range = app.shared.zoom_range;
+        for profile in crate::default_layouts::WorkspaceProfile::ALL {
+            app.use_workspace_profile(profile);
+            assert!(Arc::ptr_eq(app.shared.ld_file.as_ref().unwrap(), &ld));
+            assert_eq!(app.shared.recording_key(), key);
+            assert_eq!(app.shared.selected_lap, Some(1));
+            assert_eq!(app.shared.cursor_time, Some(12.5));
+            assert_eq!(app.shared.zoom_range, range);
+            assert_eq!(
+                app.shared.current_analysis().unwrap().details.notes,
+                "Retain this recording across profiles"
+            );
+        }
+    }
+
+    #[test]
     fn opening_new_file_reapplies_current_workspace_channels() {
         let path = PathBuf::from(TEST_LD);
         let ld = Arc::new(LdFile::open(&path).expect("failed to open test .ld"));
@@ -2891,7 +2961,7 @@ mod tests {
         let mut math_channel =
             shared.create_math_channel_def("Derived".into(), "1".into(), String::new(), 2);
         math_channel.data = Some(Arc::from(vec![1.0]));
-        math_channel.freq = 1;
+        math_channel.freq = 1.0;
         math_channel.evaluation_state = MathEvaluationState::Ready;
         shared.math_channels.push(math_channel);
 
@@ -2950,7 +3020,7 @@ mod tests {
         assert!(pending_graph.plotted_channels.is_empty());
 
         app.shared.math_channels[0].data = Some(Arc::from(vec![2.0]));
-        app.shared.math_channels[0].freq = 1;
+        app.shared.math_channels[0].freq = 1.0;
         app.shared.math_channels[0].error = None;
         app.shared.math_channels[0].evaluation_state = MathEvaluationState::Ready;
 

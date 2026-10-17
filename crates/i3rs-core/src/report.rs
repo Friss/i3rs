@@ -53,7 +53,7 @@ pub enum ReportBoundary {
 
 pub struct ReportSeries<'a> {
     pub data: &'a [f64],
-    pub freq: u16,
+    pub freq: f64,
     pub interpolation: Interpolation,
     pub scale: f64,
     pub offset: f64,
@@ -144,7 +144,7 @@ pub fn report_statistics(
     boundary: ReportBoundary,
 ) -> ReportSummary {
     let mut result = ReportSummary::default();
-    if series.freq == 0 || series.data.is_empty() {
+    if series.freq == 0.0 || series.data.is_empty() {
         return result;
     }
     let mut mean = 0.;
@@ -168,15 +168,15 @@ pub fn report_statistics(
             m2 += delta * (v - mean);
         }
     };
-    let last_time = (series.data.len() - 1) as f64 / series.freq as f64;
+    let last_time = (series.data.len() - 1) as f64 / series.freq;
     let sample = |t: f64| {
         if t > last_time {
             None
         } else {
             // Preserve exact grid values beside missing samples even when the
             // timestamp's multiplication back onto its grid rounds slightly.
-            let nearest = (t * series.freq as f64).round() as usize;
-            if nearest < series.data.len() && nearest as f64 / series.freq as f64 == t {
+            let nearest = (t * series.freq).round() as usize;
+            if nearest < series.data.len() && nearest as f64 / series.freq == t {
                 Some(series.data[nearest]).filter(|v| v.is_finite())
             } else {
                 sample_with_policy(series.data, series.freq, t, series.interpolation)
@@ -187,11 +187,11 @@ pub fn report_statistics(
         let window = sample_window_for_time(series.freq, series.data.len(), start, end);
         if boundary == ReportBoundary::Interpolate {
             let on_grid = window.start_sample < window.end_sample
-                && window.start_sample as f64 / series.freq as f64 == start;
+                && window.start_sample as f64 / series.freq == start;
             push(sample(start), on_grid);
         }
         for i in window.start_sample..window.end_sample {
-            let time = i as f64 / series.freq as f64;
+            let time = i as f64 / series.freq;
             if boundary != ReportBoundary::Interpolate || time != start {
                 push(Some(series.data[i]), true);
             }
@@ -215,7 +215,7 @@ mod tests {
     fn series(data: &[f64]) -> ReportSeries<'_> {
         ReportSeries {
             data,
-            freq: 1,
+            freq: 1.0,
             interpolation: Interpolation::Linear,
             scale: 1.,
             offset: 0.,
@@ -297,7 +297,7 @@ mod tests {
     }
     #[test]
     fn native_boundaries_preserve_off_grid_membership_at_different_rates() {
-        for hz in [1, 3, 10, 100] {
+        for hz in [1.0, 3.0, 10.0, 100.0] {
             let data: Vec<_> = (0..hz as usize * 2).map(|i| i as f64).collect();
             let s = ReportSeries {
                 freq: hz,
@@ -308,7 +308,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| {
-                    let t = *i as f64 / hz as f64;
+                    let t = *i as f64 / hz;
                     (0.51..1.01).contains(&t)
                 })
                 .map(|(_, v)| *v)
@@ -324,7 +324,7 @@ mod tests {
         data[15] = 10.;
         data[16] = 20.;
         let s = ReportSeries {
-            freq: 13,
+            freq: 13.0,
             ..series(&data)
         };
         let r = report_statistics(&s, &[(15. / 13., 16. / 13.)], ReportBoundary::Interpolate);

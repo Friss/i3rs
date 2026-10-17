@@ -162,7 +162,7 @@ fn channels_have_valid_metadata() {
     let ld = LdFile::open(TEST_LD).unwrap();
     for ch in &ld.channels {
         assert!(!ch.name.is_empty(), "channel {} has empty name", ch.index);
-        assert!(ch.freq > 0, "channel {} has zero frequency", ch.index);
+        assert!(ch.freq > 0.0, "channel {} has zero frequency", ch.index);
         assert!(ch.n_data > 0, "channel {} has zero samples", ch.index);
     }
 }
@@ -310,7 +310,7 @@ fn downsample_real_channel() {
     let ch = ld
         .channels
         .iter()
-        .find(|c| c.freq >= 100)
+        .find(|c| c.freq >= 100.0)
         .expect("no high-freq channel found");
     let data = ld.read_channel_data(ch).unwrap();
     let target = 200;
@@ -407,7 +407,7 @@ fn extract_gps_track_from_test_data() {
     );
     assert_eq!(track.x.len(), track.y.len());
     assert_eq!(track.x.len(), track.time.len());
-    assert_eq!(track.freq, 20);
+    assert_eq!(track.freq, 20.0);
 
     // Coordinates should be centered near zero (mean subtracted)
     let mean_x: f64 = track.x.iter().sum::<f64>() / track.x.len() as f64;

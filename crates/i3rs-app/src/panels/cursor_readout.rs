@@ -336,7 +336,7 @@ fn value_row(ui: &mut egui::Ui, info: &crate::state::PlottedChannelInfo, time: O
 }
 
 /// Read a channel value at a given time, using sample-hold semantics for discrete channels.
-pub fn value_at_time(data: &[f64], freq: u16, time: f64, discrete: bool) -> f64 {
+pub fn value_at_time(data: &[f64], freq: f64, time: f64, discrete: bool) -> f64 {
     if discrete {
         sample_hold_at_time(data, freq, time)
     } else {
@@ -345,17 +345,17 @@ pub fn value_at_time(data: &[f64], freq: u16, time: f64, discrete: bool) -> f64 
 }
 
 /// Linearly interpolate a channel value at a given time.
-pub fn interpolate_at_time(data: &[f64], freq: u16, time: f64) -> f64 {
+pub fn interpolate_at_time(data: &[f64], freq: f64, time: f64) -> f64 {
     i3rs_core::analysis::sample_at_time(data, freq, time).unwrap_or(f64::NAN)
 }
 
 /// Read the most recent sample at or before the given time.
-pub fn sample_hold_at_time(data: &[f64], freq: u16, time: f64) -> f64 {
-    if data.is_empty() || freq == 0 || !time.is_finite() || time < 0.0 {
+pub fn sample_hold_at_time(data: &[f64], freq: f64, time: f64) -> f64 {
+    if data.is_empty() || freq == 0.0 || !time.is_finite() || time < 0.0 {
         return f64::NAN;
     }
 
-    let idx = (time * freq as f64).floor() as usize;
+    let idx = (time * freq).floor() as usize;
     if idx >= data.len() {
         return f64::NAN;
     }
@@ -370,13 +370,13 @@ mod tests {
     #[test]
     fn interpolation_blends_between_samples() {
         let data = [0.0, 10.0];
-        assert_eq!(interpolate_at_time(&data, 1, 0.5), 5.0);
+        assert_eq!(interpolate_at_time(&data, 1.0, 0.5), 5.0);
     }
 
     #[test]
     fn sample_hold_uses_current_sample_for_discrete_channels() {
         let data = [0.0, 10.0];
-        assert_eq!(sample_hold_at_time(&data, 1, 0.5), 0.0);
-        assert_eq!(value_at_time(&data, 1, 0.5, true), 0.0);
+        assert_eq!(sample_hold_at_time(&data, 1.0, 0.5), 0.0);
+        assert_eq!(value_at_time(&data, 1.0, 0.5, true), 0.0);
     }
 }

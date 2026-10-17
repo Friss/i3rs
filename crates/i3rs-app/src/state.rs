@@ -75,7 +75,7 @@ pub struct PlottedChannelInfo {
     pub channel_id: ChannelId,
     pub name: String,
     pub unit: String,
-    pub freq: u16,
+    pub freq: f64,
     pub dec_places: i16,
     pub color: egui::Color32,
     pub data: Arc<[f64]>,
@@ -124,7 +124,7 @@ pub struct MathChannelDef {
     pub evaluation_key: Option<String>,
     pub unit: String,
     pub dec_places: i16,
-    pub freq: u16,
+    pub freq: f64,
     /// Cached evaluation result.
     pub data: Option<Arc<[f64]>>,
     /// Parse or evaluation error.
@@ -154,7 +154,7 @@ impl MathChannelDef {
             evaluation_key: None,
             unit,
             dec_places,
-            freq: 0,
+            freq: 0.0,
             data: None,
             error: None,
             evaluation_state: MathEvaluationState::Queued,
@@ -259,7 +259,7 @@ pub fn channel_preference_key(name: &str) -> String {
 #[derive(Clone)]
 pub struct DistanceAxisCache {
     pub data: Arc<[f64]>,
-    pub freq: u16,
+    pub freq: f64,
 }
 
 pub const CHANNEL_COLORS: &[egui::Color32] = &[
@@ -277,6 +277,7 @@ type AnalysisConstantCache = HashMap<usize, (u64, usize, Arc<[f64]>)>;
 
 /// State shared across all panels.
 pub struct SharedState {
+    pub workspace_profile: Option<crate::default_layouts::WorkspaceProfile>,
     analysis_constant_cache: RefCell<AnalysisConstantCache>,
     pub unresolved_references: RefCell<Vec<(String, bool)>>,
     pub comparisons: crate::comparison::Comparisons,
@@ -289,9 +290,9 @@ pub struct SharedState {
     // Lap data
     pub recording_analyses:
         std::collections::BTreeMap<String, i3rs_core::ranges::RecordingAnalysis>,
-    pub correction_gps_speed: Option<(Arc<[f64]>, u16)>,
-    pub correction_speed: Option<(Arc<[f64]>, u16)>,
-    pub correction_distance: Option<(Arc<[f64]>, u16)>,
+    pub correction_gps_speed: Option<(Arc<[f64]>, f64)>,
+    pub correction_speed: Option<(Arc<[f64]>, f64)>,
+    pub correction_distance: Option<(Arc<[f64]>, f64)>,
     pub correction_error: Option<String>,
     pub correction_revision: u64,
     pub show_recording_editor: bool,
@@ -377,7 +378,7 @@ impl SharedState {
         };
         ChannelId::Analysis(index)
     }
-    pub fn analysis_series(&self, index: usize) -> Option<(Arc<[f64]>, u16)> {
+    pub fn analysis_series(&self, index: usize) -> Option<(Arc<[f64]>, f64)> {
         let reference = self.unresolved_references.borrow().get(index)?.0.clone();
         match self.resolve_analysis_reference(&reference) {
             i3rs_core::ChannelResolution::Resolved {
@@ -393,7 +394,7 @@ impl SharedState {
                 if entry.0 != c.value.to_bits() || entry.1 != len {
                     *entry = (c.value.to_bits(), len, Arc::from(vec![c.value; len]));
                 }
-                Some((entry.2.clone(), 1))
+                Some((entry.2.clone(), 1.0))
             }
             i3rs_core::ChannelResolution::Resolved {
                 key: i3rs_core::ChannelKey::Generated(name),
@@ -432,6 +433,7 @@ impl SharedState {
 
     pub fn new() -> Self {
         Self {
+            workspace_profile: None,
             analysis_constant_cache: Default::default(),
             unresolved_references: Default::default(),
             comparisons: Default::default(),
@@ -572,6 +574,13 @@ impl SharedState {
         unit: String,
         dec_places: i16,
     ) -> MathChannelDef {
+        self.next_math_channel_id = self.next_math_channel_id.max(
+            self.math_channels
+                .iter()
+                .map(|m| m.id + 1)
+                .max()
+                .unwrap_or(1),
+        );
         let id = self.next_math_channel_id;
         self.next_math_channel_id += 1;
         MathChannelDef::new(id, name, expression, unit, dec_places)
@@ -775,7 +784,7 @@ mod tests {
         let mut shared = SharedState::new();
         let mut definition =
             shared.create_math_channel_def("Temperature".into(), "0".into(), "C".into(), 1);
-        definition.freq = 1;
+        definition.freq = 1.0;
         definition.dec_places = 1;
         definition.data = Some(std::sync::Arc::from([0.0, 100.0, f64::NAN]));
         shared.math_channels.push(definition);

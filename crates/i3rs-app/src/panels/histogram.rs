@@ -16,7 +16,7 @@ use super::distribution::ColorBands;
 
 /// Cached histogram bin counts for a single channel.
 struct HistogramBins {
-    freq: u16,
+    freq: f64,
     min: f64,
     bin_width: f64,
     counts: Vec<u64>,
@@ -431,12 +431,12 @@ impl HistogramPanel {
                     let main = ranges
                         .iter()
                         .flat_map(|(_, range)| sample_range(pc.data.len(), freq, *range))
-                        .filter(|i| filter.includes(*i as f64 / freq as f64))
+                        .filter(|i| filter.includes(*i as f64 / freq))
                         .map(|i| transform_channel_value(pc, pc.data[i]));
                     let comparison = overlays.iter().flat_map(|overlay| {
                         let info = &overlay.channels[ch_idx];
                         sample_range(info.data.len(), info.freq, overlay.range)
-                            .filter(move |i| overlay.filter.includes(*i as f64 / info.freq as f64))
+                            .filter(move |i| overlay.filter.includes(*i as f64 / info.freq))
                             .map(move |i| info.transform_value(info.data[i]))
                     });
                     finite_bounds(main.chain(comparison))
@@ -444,7 +444,7 @@ impl HistogramPanel {
                 common_bounds.push(bounds);
                 for (lap_idx, (lap_name, range)) in ranges.into_iter().enumerate() {
                     let samples: Vec<_> = sample_range(pc.data.len(), freq, range)
-                        .filter(|i| filter.includes(*i as f64 / freq as f64))
+                        .filter(|i| filter.includes(*i as f64 / freq))
                         .map(|i| {
                             let value = transform_channel_value(pc, pc.data[i]);
                             let band_value = self
@@ -455,7 +455,7 @@ impl HistogramPanel {
                                     i3rs_core::channels::sample_with_policy(
                                         &c.data,
                                         meta.2,
-                                        i as f64 / freq as f64,
+                                        i as f64 / freq,
                                         color_policy,
                                     )
                                     .map(|v| transform_channel_value(c, v))
@@ -515,7 +515,7 @@ impl HistogramPanel {
             {
                 let bounds = self.cache.as_ref().unwrap().bounds[i];
                 let samples: Vec<_> = sample_range(info.data.len(), info.freq, overlay.range)
-                    .filter(|i| overlay.filter.includes(*i as f64 / info.freq as f64))
+                    .filter(|i| overlay.filter.includes(*i as f64 / info.freq))
                     .map(|i| {
                         let color = overlay
                             .channels
@@ -524,7 +524,7 @@ impl HistogramPanel {
                                 i3rs_core::channels::sample_with_policy(
                                     &c.data,
                                     c.freq,
-                                    i as f64 / info.freq as f64,
+                                    i as f64 / info.freq,
                                     c.interpolation,
                                 )
                                 .map(|v| c.transform_value(v))
@@ -589,7 +589,7 @@ impl HistogramPanel {
                 .flat_map(|(bins, _, _)| {
                     bins.counts.iter().zip(&bins.base).map(move |(n, base)| {
                         histogram_height(n + base, bins.denominator, percentage)
-                            / if seconds { bins.freq.max(1) as f64 } else { 1. }
+                            / if seconds { bins.freq.max(1.0) } else { 1. }
                     })
                 })
                 .fold(0.0_f64, f64::max);
@@ -678,7 +678,7 @@ impl HistogramPanel {
 #[cfg(test)]
 fn selected_bounds(
     data: &[f64],
-    freq: u16,
+    freq: f64,
     ranges: impl Iterator<Item = (f64, f64)>,
     scale: f64,
     offset: f64,
@@ -765,7 +765,7 @@ fn histogram_bins_configured(
     let width = (bounds.1 - bounds.0) / count as f64;
     let mut result: Vec<_> = (0..bands.map_or(1, ColorBands::len))
         .map(|_| HistogramBins {
-            freq: 1,
+            freq: 1.0,
             min: bounds.0 - if extra > 0 { width } else { 0. },
             bin_width: width,
             counts: vec![0; count + extra],
@@ -838,11 +838,11 @@ fn bins_to_bar_chart(
             Bar::new(
                 center,
                 histogram_height(count, bins.denominator, percentage)
-                    / if seconds { bins.freq.max(1) as f64 } else { 1. },
+                    / if seconds { bins.freq.max(1.0) } else { 1. },
             )
             .base_offset(
                 histogram_height(bins.base[i], bins.denominator, percentage)
-                    / if seconds { bins.freq.max(1) as f64 } else { 1. },
+                    / if seconds { bins.freq.max(1.0) } else { 1. },
             )
             .width(bins.bin_width * 0.9)
             .fill(color)
@@ -879,8 +879,7 @@ mod tests {
                 .map(|i| {
                     (
                         rpm_data[i],
-                        interp_at_time(&throttle_data, throttle.freq, i as f64 / rpm.freq as f64)
-                            .unwrap(),
+                        interp_at_time(&throttle_data, throttle.freq, i as f64 / rpm.freq).unwrap(),
                     )
                 })
                 .collect();
@@ -907,8 +906,7 @@ mod tests {
                 .map(|i| {
                     (
                         rpm_data[i],
-                        interp_at_time(&throttle_data, throttle.freq, i as f64 / rpm.freq as f64)
-                            .unwrap(),
+                        interp_at_time(&throttle_data, throttle.freq, i as f64 / rpm.freq).unwrap(),
                     )
                 })
                 .collect();
@@ -975,16 +973,16 @@ mod tests {
     #[test]
     fn automatic_bounds_follow_selected_samples_and_share_edges_across_laps() {
         let data = [-1000.0, 1.0, 2.0, f64::NAN, 1000.0, 3.0, 4.0, 2000.0];
-        let bounds = selected_bounds(&data, 1, [(1.0, 3.0)].into_iter(), 2.0, 10.0);
+        let bounds = selected_bounds(&data, 1.0, [(1.0, 3.0)].into_iter(), 2.0, 10.0);
         assert_eq!(bounds, (12.0, 14.0));
-        let bounds = selected_bounds(&data, 1, [(1.0, 4.0), (5.0, 7.0)].into_iter(), 2.0, 10.0);
+        let bounds = selected_bounds(&data, 1.0, [(1.0, 4.0), (5.0, 7.0)].into_iter(), 2.0, 10.0);
         assert_eq!(bounds, (12.0, 18.0));
         let first = histogram_bins(&[(12.0, 0.0), (14.0, 0.0)], 2, bounds, None);
         let second = histogram_bins(&[(16.0, 0.0), (18.0, 0.0)], 2, bounds, None);
         assert_eq!(first[0].counts, [2, 0]);
         assert_eq!(second[0].counts, [0, 2]);
         assert_eq!(
-            selected_bounds(&data, 1, [(3.0, 4.0)].into_iter(), 1.0, 0.0),
+            selected_bounds(&data, 1.0, [(3.0, 4.0)].into_iter(), 1.0, 0.0),
             (0.0, 1.0)
         );
     }
@@ -1042,8 +1040,8 @@ mod policy_tests {
         let mut b = histogram_bins_configured(&samples, 20, (0., 10.), None, settings).remove(0);
         assert_eq!(b.counts, [1, 2, 3, 1]);
         assert_eq!(b.denominator, 7);
-        b.freq = 2;
-        assert_eq!(b.counts.iter().sum::<u64>() as f64 / b.freq as f64, 3.5);
+        b.freq = 2.0;
+        assert_eq!(b.counts.iter().sum::<u64>() as f64 / b.freq, 3.5);
         let percent: f64 = b
             .counts
             .iter()

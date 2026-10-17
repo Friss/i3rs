@@ -134,6 +134,28 @@ const PREDEFINED_CALCS: &[PredefinedCalc] = &[
     },
 ];
 
+/// Reuse the validated calculation and metadata in workspace profiles.
+pub(crate) fn install_oversteer_template(shared: &mut SharedState) {
+    if shared.resolve_slot("Oversteer", false).is_some() {
+        return;
+    }
+    let calc = PREDEFINED_CALCS
+        .iter()
+        .find(|c| c.name == "Oversteer")
+        .unwrap();
+    let mut mc = shared.create_math_channel_def(
+        calc.name.into(),
+        calc.expression.into(),
+        calc.unit.into(),
+        2,
+    );
+    mc.options.source = "MoTeC".into();
+    mc.options.quantity = calc.quantity.into();
+    mc.options.display_unit = calc.display_unit.map(str::to_string);
+    mc.options.comment = calc.description.into();
+    shared.math_channels.push(mc);
+}
+
 /// State for the "new channel" entry form.
 pub struct MathEditorState {
     pub new_name: String,
@@ -715,7 +737,7 @@ fn build_channel_data_map(
                     reference,
                     ChannelData {
                         samples: vec![constant.value; len],
-                        freq: 1,
+                        freq: 1.0,
                     },
                 );
             }
@@ -813,7 +835,7 @@ fn mark_math_channel_status(
 ) {
     mc.data = None;
     mc.evaluation_key = None;
-    mc.freq = 0;
+    mc.freq = 0.0;
     mc.error = message.map(str::to_string);
     mc.evaluation_state = evaluation_state;
     mc.cached_min = 0.0;
@@ -1041,7 +1063,7 @@ pub fn apply_math_evaluation_result(
         Err(err) => {
             mc.evaluation_key = Some(evaluation_key.into());
             mc.data = None;
-            mc.freq = 0;
+            mc.freq = 0.0;
             mc.error = Some(err);
             mc.evaluation_state = MathEvaluationState::Error;
             mc.cached_min = 0.0;

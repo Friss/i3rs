@@ -30,19 +30,19 @@ use super::utils::{
 };
 
 /// Build a freq map for a set of plotted channels (used to pass into closures).
-fn build_freq_map(channels: &[&PlottedChannel], shared: &SharedState) -> HashMap<ChannelId, u16> {
+fn build_freq_map(channels: &[&PlottedChannel], shared: &SharedState) -> HashMap<ChannelId, f64> {
     channels
         .iter()
         .map(|pc| {
             let freq = match pc.channel_id {
                 ChannelId::Analysis(_) => resolve_channel_meta(pc.channel_id, shared).2,
-                ChannelId::Unresolved(_) => 0,
+                ChannelId::Unresolved(_) => 0.0,
                 ChannelId::Physical(idx) => shared
                     .ld_file
                     .as_ref()
                     .and_then(|ld| ld.channels.get(idx))
-                    .map_or(0, |ch| ch.freq),
-                ChannelId::Math(idx) => shared.math_channels.get(idx).map_or(0, |mc| mc.freq),
+                    .map_or(0.0, |ch| ch.freq),
+                ChannelId::Math(idx) => shared.math_channels.get(idx).map_or(0.0, |mc| mc.freq),
             };
             (pc.channel_id, freq)
         })
@@ -157,7 +157,7 @@ struct PlotTransform {
 struct LapSeriesRenderParams<'a> {
     full_resolution: bool,
     data: &'a Arc<[f64]>,
-    freq: u16,
+    freq: f64,
     lap: &'a Lap,
     axis: &'a ActiveGraphXAxis,
     transform: PlotTransform,
@@ -180,7 +180,7 @@ impl PlotTransform {
 /// without materializing every visible point first.
 fn visible_plot_points<'a>(
     data: &'a [f64],
-    freq: u16,
+    freq: f64,
     samples: SampleRange,
     axis: &'a ActiveGraphXAxis,
     x_range: PlotXRange,
@@ -188,8 +188,7 @@ fn visible_plot_points<'a>(
 ) -> impl ExactSizeIterator<Item = egui_plot::PlotPoint> + 'a {
     let end = samples.end.min(data.len());
     let x_at = move |idx: usize| {
-        (axis.axis_value_at_time(idx as f64 / freq as f64) - transform.origin_axis)
-            * transform.x_scale
+        (axis.axis_value_at_time(idx as f64 / freq) - transform.origin_axis) * transform.x_scale
             + transform.x_offset
     };
     // Time and validated distance axes are monotonic. Cull offscreen samples by
@@ -208,7 +207,7 @@ fn visible_plot_points<'a>(
         }
         lo
     };
-    let visible = if freq == 0 || samples.is_empty() || samples.start >= data.len() {
+    let visible = if freq == 0.0 || samples.is_empty() || samples.start >= data.len() {
         0..0
     } else {
         let visible_start = partition(x_range.min, false)
@@ -273,7 +272,7 @@ pub struct LapOverlay {
 
 pub struct OverlayChannelCacheEntry {
     pub data: Arc<[f64]>,
-    pub freq: u16,
+    pub freq: f64,
 }
 
 pub struct OverlaySession {
@@ -288,20 +287,20 @@ pub struct OverlaySession {
     pub channel_cache: HashMap<String, OverlayChannelCacheEntry>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 enum GraphAxisFingerprint {
     Time,
     Distance {
         data_ptr: usize,
         data_len: usize,
-        freq: u16,
+        freq: f64,
     },
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 struct GraphRenderFingerprint {
     pixel_columns: usize,
-    freq: u16,
+    freq: f64,
     data_ptr: usize,
     data_len: usize,
     x_bounds: (u64, u64),
@@ -323,10 +322,10 @@ enum LapRenderCacheKey {
     },
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 struct LapRenderFingerprint {
     pixel_columns: usize,
-    freq: u16,
+    freq: f64,
     data_ptr: usize,
     data_len: usize,
     lap_bounds: (u64, u64),
@@ -641,7 +640,13 @@ impl GraphPanel {
         }
 
         let ld_file = Arc::new(LdFile::open(&path).ok()?);
-        let laps = detect_laps(&ld_file);
+        let laps = i3rs_core::find_ldx_for_ld(&path)
+            .and_then(|ldx| {
+                ldx.specialty_analysis(ld_file.recording_id().into(), ld_file.duration_secs())
+                    .ok()
+                    .flatten()
+            })
+            .map_or_else(|| detect_laps(&ld_file), |a| a.laps());
         let file_name = path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
@@ -1308,7 +1313,7 @@ impl GraphPanel {
                             continue;
                         }
                         self.visible_markers.push((
-                            i as f64 / info.freq.max(1) as f64,
+                            i as f64 / info.freq.max(1.0),
                             format!(
                                 "{}: {}",
                                 info.name,
@@ -2050,7 +2055,7 @@ impl GraphPanel {
 
             let lap_render_cache = &mut self.lap_render_cache;
             for pc in &plotted {
-                let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
+                let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0.0);
 
                 let reference_key = LapRenderCacheKey::Reference(pc.channel_id);
                 ensure_lap_series_cache(
@@ -2266,7 +2271,7 @@ impl GraphPanel {
 
                     let lap_render_cache = &mut self.lap_render_cache;
                     for pc in &grouped {
-                        let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
+                        let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0.0);
 
                         let reference_key = LapRenderCacheKey::Reference(pc.channel_id);
                         ensure_lap_series_cache(
@@ -2496,7 +2501,7 @@ impl GraphPanel {
     fn draw_channels<'a>(
         plot_ui: &mut egui_plot::PlotUi<'a>,
         channels: &[&PlottedChannel],
-        freq_map: &HashMap<ChannelId, u16>,
+        freq_map: &HashMap<ChannelId, f64>,
         x_axis: &ActiveGraphXAxis,
         full_resolution: bool,
         render_cache: &'a mut HashMap<ChannelId, GraphRenderCacheEntry>,
@@ -2515,8 +2520,8 @@ impl GraphPanel {
         };
 
         for pc in channels {
-            let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0);
-            if freq == 0 {
+            let freq = freq_map.get(&pc.channel_id).copied().unwrap_or(0.0);
+            if freq == 0.0 {
                 continue;
             }
 
@@ -2810,7 +2815,7 @@ impl GraphPanel {
         pc: &PlottedChannel,
         name: &str,
         enum_labels: &HashMap<i64, String>,
-        freq: u16,
+        freq: f64,
         visible_time_range: Option<(f64, f64)>,
     ) -> Option<DisplayStats> {
         let stats = visible_time_range
@@ -2831,10 +2836,10 @@ impl GraphPanel {
 
     fn channel_stats_in_time_range(
         data: &[f64],
-        freq: u16,
+        freq: f64,
         visible_time_range: (f64, f64),
     ) -> Option<crate::state::ChannelStats> {
-        if data.is_empty() || freq == 0 {
+        if data.is_empty() || freq == 0.0 {
             return None;
         }
         let (time_min, time_max) = if visible_time_range.0 <= visible_time_range.1 {
@@ -2842,8 +2847,8 @@ impl GraphPanel {
         } else {
             (visible_time_range.1, visible_time_range.0)
         };
-        let start = ((time_min.max(0.0) * freq as f64).floor() as usize).min(data.len());
-        let end = ((time_max.max(0.0) * freq as f64).ceil() as usize + 1).min(data.len());
+        let start = ((time_min.max(0.0) * freq).floor() as usize).min(data.len());
+        let end = ((time_max.max(0.0) * freq).ceil() as usize + 1).min(data.len());
         (start < end).then(|| compute_channel_stats(&data[start..end]))
     }
 
@@ -4410,13 +4415,13 @@ struct OverlayAxisHandle {
 
 struct ResolvedOverlayRenderData {
     data: Arc<[f64]>,
-    freq: u16,
+    freq: f64,
     lap: Lap,
 }
 
 struct PreparedLapOverlay {
     data: Arc<[f64]>,
-    freq: u16,
+    freq: f64,
     lap: Lap,
     axis: ActiveGraphXAxis,
     origin_axis: f64,
@@ -4430,7 +4435,7 @@ struct PreparedLapOverlay {
 #[derive(Clone)]
 enum ActiveGraphXAxis {
     Time,
-    Distance { data: Arc<[f64]>, freq: u16 },
+    Distance { data: Arc<[f64]>, freq: f64 },
 }
 
 impl ActiveGraphXAxis {
@@ -4566,12 +4571,12 @@ fn ensure_lap_series_cache(
         transform,
     } = params;
 
-    if freq == 0 || data.is_empty() {
+    if freq == 0.0 || data.is_empty() {
         return;
     }
 
-    let start_sample = ((lap.start_time * freq as f64).floor() as usize).min(data.len());
-    let end_sample = ((lap.end_time * freq as f64).ceil() as usize + 1).min(data.len());
+    let start_sample = ((lap.start_time * freq).floor() as usize).min(data.len());
+    let end_sample = ((lap.end_time * freq).ceil() as usize + 1).min(data.len());
     if start_sample >= end_sample {
         return;
     }
@@ -4678,7 +4683,7 @@ fn time_variance_curve(
     let ActiveGraphXAxis::Distance { data, freq } = overlay_axis else {
         return Vec::new();
     };
-    if *freq == 0 || !is_monotonic_non_decreasing(data) {
+    if *freq == 0.0 || !is_monotonic_non_decreasing(data) {
         return Vec::new();
     }
     let origin = lap_axis_origin(overlay_axis, lap);
@@ -4698,7 +4703,7 @@ fn time_variance_curve(
         ActiveGraphXAxis::Distance { freq, .. } => *freq,
         ActiveGraphXAxis::Time => *freq,
     }
-    .max(1) as f64;
+    .max(1.0);
     let start = (main.start_time * native_hz).floor() as usize + 1;
     let end = (main.end_time * native_hz).ceil() as usize;
     std::iter::once(main.start_time)
@@ -4738,7 +4743,7 @@ pub(crate) fn resolve_recording_channel(
     shared: &SharedState,
     reference: &str,
     target_unit: &str,
-) -> Option<(Arc<[f64]>, u16)> {
+) -> Option<(Arc<[f64]>, f64)> {
     let settings_key =
         serde_json::to_string(&(shared.math_evaluation_key(0), &shared.recording_analyses))
             .expect("analysis settings");
@@ -4787,7 +4792,11 @@ pub(crate) fn resolve_recording_channel(
         }
         return None;
     }
-    let context = crate::comparison::recording_context(shared, session.ld_file.clone());
+    let context = crate::comparison::recording_context_from_path(
+        shared,
+        session.ld_file.clone(),
+        &session.path,
+    );
     let reference = reference.to_owned();
     let target_unit = target_unit.to_owned();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -4888,7 +4897,7 @@ fn derive_distance_axis_cache(shared: &SharedState) -> (Option<DistanceAxisCache
 
 struct OwnedDistanceAxisCache {
     data: Vec<f64>,
-    freq: u16,
+    freq: f64,
 }
 
 fn derive_distance_axis_cache_for_ld(ld: &LdFile) -> Option<OwnedDistanceAxisCache> {
@@ -4910,7 +4919,7 @@ fn find_distance_channel(shared: &SharedState) -> (Option<DistanceAxisCache>, bo
     for mc in &shared.math_channels {
         if normalized_name(&mc.name).as_str().eq_any(&distance_names)
             && let Some(data) = &mc.data
-            && mc.freq > 0
+            && mc.freq > 0.0
             && let Some(scale) = distance_unit_to_meters(&mc.unit)
             && is_monotonic_non_decreasing(data)
         {
@@ -4931,7 +4940,7 @@ fn find_distance_channel(shared: &SharedState) -> (Option<DistanceAxisCache>, bo
     };
     for ch in &ld.channels {
         if normalized_name(&ch.name).as_str().eq_any(&distance_names)
-            && ch.freq > 0
+            && ch.freq > 0.0
             && let Some(scale) = distance_unit_to_meters(&ch.unit)
         {
             if let Some(decoded) = shared.decoded_physical_channel_if_ready(ch.index) {
@@ -4969,7 +4978,7 @@ fn find_distance_channel_in_ld(ld: &LdFile) -> Option<OwnedDistanceAxisCache> {
         if normalized_name(&channel.name)
             .as_str()
             .eq_any(&distance_names)
-            && channel.freq > 0
+            && channel.freq > 0.0
             && let Some(scale) = distance_unit_to_meters(&channel.unit)
             && let Some(data) = ld.read_channel_data(channel)
             && is_monotonic_non_decreasing(&data)
@@ -4983,7 +4992,7 @@ fn find_distance_channel_in_ld(ld: &LdFile) -> Option<OwnedDistanceAxisCache> {
     None
 }
 
-type SpeedChannelLookup = Option<(Arc<[f64]>, u16, String)>;
+type SpeedChannelLookup = Option<(Arc<[f64]>, f64, String)>;
 
 fn find_speed_channel(shared: &SharedState) -> (SpeedChannelLookup, bool) {
     let speed_names = [
@@ -4998,7 +5007,7 @@ fn find_speed_channel(shared: &SharedState) -> (SpeedChannelLookup, bool) {
     for mc in &shared.math_channels {
         if normalized_name(&mc.name).as_str().eq_any(&speed_names)
             && let Some(data) = &mc.data
-            && mc.freq > 0
+            && mc.freq > 0.0
         {
             return (Some((Arc::clone(data), mc.freq, mc.unit.clone())), false);
         } else if normalized_name(&mc.name).as_str().eq_any(&speed_names) && mc.error.is_none() {
@@ -5038,7 +5047,7 @@ fn find_speed_channel(shared: &SharedState) -> (SpeedChannelLookup, bool) {
     }
 }
 
-fn find_speed_channel_in_ld(ld: &LdFile) -> Option<(Vec<f64>, u16, String)> {
+fn find_speed_channel_in_ld(ld: &LdFile) -> Option<(Vec<f64>, f64, String)> {
     i3rs_core::distance::corrected_speed_from_ld(ld).map(|(data, freq)| (data, freq, "m/s".into()))
 }
 
@@ -5050,15 +5059,15 @@ fn normalized_name(name: &str) -> String {
         .join(" ")
 }
 
-fn time_from_monotonic_axis(data: &[f64], freq: u16, axis_value: f64) -> Option<f64> {
-    if freq == 0 || data.is_empty() || !is_monotonic_non_decreasing(data) {
+fn time_from_monotonic_axis(data: &[f64], freq: f64, axis_value: f64) -> Option<f64> {
+    if freq == 0.0 || data.is_empty() || !is_monotonic_non_decreasing(data) {
         return None;
     }
 
     time_from_valid_axis(data, freq, axis_value)
 }
 
-fn time_from_valid_axis(data: &[f64], freq: u16, axis_value: f64) -> Option<f64> {
+fn time_from_valid_axis(data: &[f64], freq: f64, axis_value: f64) -> Option<f64> {
     let first = data.first().copied()?;
     let last = data.last().copied()?;
     let clamped = axis_value.clamp(first.min(last), first.max(last));
@@ -5068,13 +5077,13 @@ fn time_from_valid_axis(data: &[f64], freq: u16, axis_value: f64) -> Option<f64>
         return Some(0.0);
     }
     if idx >= data.len() {
-        return Some((data.len().saturating_sub(1)) as f64 / freq as f64);
+        return Some((data.len().saturating_sub(1)) as f64 / freq);
     }
 
     let x0 = data[idx - 1];
     let x1 = data[idx];
-    let t0 = (idx - 1) as f64 / freq as f64;
-    let t1 = idx as f64 / freq as f64;
+    let t0 = (idx - 1) as f64 / freq;
+    let t1 = idx as f64 / freq;
 
     if (x1 - x0).abs() < f64::EPSILON {
         Some(t1)
@@ -5120,7 +5129,7 @@ mod tests {
 
     fn native_plot_points_for_range(
         data: &[f64],
-        freq: u16,
+        freq: f64,
         samples: SampleRange,
         axis: &ActiveGraphXAxis,
         x_range: PlotXRange,
@@ -5274,22 +5283,22 @@ mod tests {
     #[test]
     fn integrates_kmh_speed_into_distance() {
         let speed = vec![36.0, 36.0, 36.0];
-        let distance = integrate_speed_series(&speed, 1, "km/h").unwrap();
+        let distance = integrate_speed_series(&speed, 1.0, "km/h").unwrap();
         assert_eq!(distance, vec![0.0, 10.0, 20.0]);
     }
 
     #[test]
     fn distance_resumes_after_startup_and_mid_session_outages() {
         let speed = [f64::NAN, 36.0, 36.0, f64::NAN, 72.0, 72.0];
-        let distance = integrate_speed_series(&speed, 1, "km/h").unwrap();
+        let distance = integrate_speed_series(&speed, 1.0, "km/h").unwrap();
         assert_eq!(distance, [0.0, 0.0, 10.0, 10.0, 10.0, 30.0]);
-        assert_eq!(time_from_monotonic_axis(&distance, 1, 20.0), Some(4.5));
+        assert_eq!(time_from_monotonic_axis(&distance, 1.0, 20.0), Some(4.5));
     }
 
     #[test]
     fn distance_never_runs_backward_on_negative_speed_noise() {
         assert_eq!(
-            integrate_speed_series(&[-1.0, 1.0, 1.0], 1, "m/s").unwrap(),
+            integrate_speed_series(&[-1.0, 1.0, 1.0], 1.0, "m/s").unwrap(),
             [0.0, 0.5, 1.5]
         );
     }
@@ -5297,7 +5306,7 @@ mod tests {
     #[test]
     fn maps_distance_back_to_time() {
         let distance = vec![0.0, 10.0, 20.0, 30.0];
-        let time = time_from_monotonic_axis(&distance, 2, 15.0).unwrap();
+        let time = time_from_monotonic_axis(&distance, 2.0, 15.0).unwrap();
         assert!((time - 0.75).abs() < 1e-6);
     }
 
@@ -5305,11 +5314,11 @@ mod tests {
     fn zoom_between_samples_retains_edge_segments_on_distance_axis() {
         let points = native_plot_points_for_range(
             &[0.0, 10.0, 20.0, 30.0],
-            1,
+            1.0,
             SampleRange { start: 0, end: 4 },
             &ActiveGraphXAxis::Distance {
                 data: Arc::from(vec![0.0, 100.0, 200.0, 300.0]),
-                freq: 1,
+                freq: 1.0,
             },
             PlotXRange {
                 min: 110.0,
@@ -5324,11 +5333,11 @@ mod tests {
         );
         let stationary = native_plot_points_for_range(
             &[0.0, 10.0, 20.0, 30.0, 40.0],
-            1,
+            1.0,
             SampleRange { start: 0, end: 5 },
             &ActiveGraphXAxis::Distance {
                 data: Arc::from(vec![0.0, 100.0, 100.0, 100.0, 200.0]),
-                freq: 1,
+                freq: 1.0,
             },
             PlotXRange {
                 min: 100.0,
@@ -5367,7 +5376,7 @@ mod tests {
                         GraphPanel::draw_channels(
                             plot_ui,
                             &[&channel],
-                            &std::collections::HashMap::from([(channel.channel_id, 100)]),
+                            &std::collections::HashMap::from([(channel.channel_id, 100.0)]),
                             &ActiveGraphXAxis::Time,
                             false,
                             &mut cache,
@@ -5409,7 +5418,7 @@ mod tests {
                             super::LapSeriesRenderParams {
                                 full_resolution: false,
                                 data: &data,
-                                freq: 100,
+                                freq: 100.0,
                                 lap: &lap,
                                 axis: &ActiveGraphXAxis::Time,
                                 transform: super::PlotTransform {
@@ -5465,7 +5474,7 @@ mod tests {
                                 GraphPanel::draw_channels(
                                     plot_ui,
                                     &[&channel],
-                                    &std::collections::HashMap::from([(channel.channel_id, 100)]),
+                                    &std::collections::HashMap::from([(channel.channel_id, 100.0)]),
                                     &ActiveGraphXAxis::Time,
                                     full_resolution,
                                     &mut cache,
@@ -5477,7 +5486,7 @@ mod tests {
                                     super::LapSeriesRenderParams {
                                         full_resolution,
                                         data: &channel.data,
-                                        freq: 100,
+                                        freq: 100.0,
                                         lap: &lap,
                                         axis: &ActiveGraphXAxis::Time,
                                         transform: super::PlotTransform {
@@ -5523,9 +5532,9 @@ mod tests {
         let mut channels = ld
             .channels
             .iter()
-            .filter(|ch| ch.freq > 0)
+            .filter(|ch| ch.freq > 0.0)
             .collect::<Vec<_>>();
-        channels.sort_by_key(|ch| std::cmp::Reverse(ch.freq));
+        channels.sort_by(|a, b| b.freq.total_cmp(&a.freq));
         let channels = channels
             .into_iter()
             .take(6)
@@ -5541,7 +5550,7 @@ mod tests {
                 let series = channels
                     .iter()
                     .map(|(data, freq)| {
-                        let end = ((duration * *freq as f64).ceil() as usize).min(data.len());
+                        let end = ((duration * *freq).ceil() as usize).min(data.len());
                         if native {
                             let axis = ActiveGraphXAxis::Time;
                             let points = visible_plot_points(
@@ -5623,7 +5632,7 @@ mod tests {
     fn native_plot_points_preserve_short_enum_events() {
         let points = native_plot_points_for_range(
             &[0.0, 1.0, 1.0, 0.0],
-            10,
+            10.0,
             SampleRange { start: 0, end: 4 },
             &ActiveGraphXAxis::Time,
             PlotXRange { min: 0.0, max: 1.0 },
@@ -5639,7 +5648,7 @@ mod tests {
     fn rejects_non_monotonic_distance_axis() {
         let distance = vec![0.0, 10.0, 5.0, 15.0];
         assert!(!is_monotonic_non_decreasing(&distance));
-        assert!(time_from_monotonic_axis(&distance, 1, 7.0).is_none());
+        assert!(time_from_monotonic_axis(&distance, 1.0, 7.0).is_none());
     }
 
     #[test]
@@ -5652,7 +5661,7 @@ mod tests {
         };
         let axis = ActiveGraphXAxis::Distance {
             data: Arc::from(vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]),
-            freq: 1,
+            freq: 1.0,
         };
 
         assert!((overlay_axis_offset(&axis, &lap, 8.0, 1.0) - 10.0).abs() < 1e-6);
@@ -5688,7 +5697,7 @@ mod tests {
         let channel = sample_channel(Arc::from(vec![0.0, 1.0, 2.0]));
         let base = GraphRenderFingerprint {
             pixel_columns: 320,
-            freq: 10,
+            freq: 10.0,
             data_ptr: channel.data.as_ptr() as usize,
             data_len: channel.data.len(),
             x_bounds: (0.0f64.to_bits(), 5.0f64.to_bits()),
@@ -5709,7 +5718,7 @@ mod tests {
         );
         assert!(
             base != GraphRenderFingerprint {
-                freq: 20,
+                freq: 20.0,
                 ..base.clone()
             }
         );
@@ -5734,7 +5743,7 @@ mod tests {
     fn lap_render_fingerprint_invalidates_for_zoom_and_overlay_offset() {
         let base = LapRenderFingerprint {
             pixel_columns: 320,
-            freq: 10,
+            freq: 10.0,
             data_ptr: 11,
             data_len: 64,
             lap_bounds: (1.0f64.to_bits(), 2.0f64.to_bits()),
@@ -5809,7 +5818,7 @@ mod tests {
             super::GraphRenderCacheEntry {
                 fingerprint: GraphRenderFingerprint {
                     pixel_columns: 320,
-                    freq: 10,
+                    freq: 10.0,
                     data_ptr: 1,
                     data_len: 2,
                     x_bounds: (0, 1),
@@ -5831,7 +5840,7 @@ mod tests {
             super::LapRenderCacheEntry {
                 fingerprint: LapRenderFingerprint {
                     pixel_columns: 320,
-                    freq: 10,
+                    freq: 10.0,
                     data_ptr: 1,
                     data_len: 2,
                     lap_bounds: (0, 1),
@@ -5925,11 +5934,11 @@ mod comparison_contract_tests {
     fn variance_matches_distance_alignment_with_offset_and_stretch() {
         let main_axis = ActiveGraphXAxis::Distance {
             data: Arc::from((0..=20).map(|i| i as f64 * 10.).collect::<Vec<_>>()),
-            freq: 1,
+            freq: 1.0,
         };
         let slow_axis = ActiveGraphXAxis::Distance {
             data: Arc::from((0..=20).map(|i| i as f64 * 5.).collect::<Vec<_>>()),
-            freq: 1,
+            freq: 1.0,
         };
         let main = lap(0., 10.);
         let slow = lap(0., 20.);
@@ -6049,7 +6058,11 @@ pub(crate) fn gps_alignment_offset(
         }
         OverlaySource::External(i) => {
             let session = sessions.get_mut(i).ok_or("Overlay recording unavailable")?;
-            let context = crate::comparison::recording_context(shared, session.ld_file.clone());
+            let context = crate::comparison::recording_context_from_path(
+                shared,
+                session.ld_file.clone(),
+                &session.path,
+            );
             if matches!(
                 context.resolve_analysis_reference(reference),
                 i3rs_core::ChannelResolution::Unresolved { .. }
@@ -6122,7 +6135,7 @@ mod gps_clock_tests {
         assert!(gps_alignment_offset(&shared, &mut [], &overlay, Some(0)).is_err());
         let mut clock =
             shared.create_math_channel_def("GPS Time".into(), "0".into(), "ms".into(), 0);
-        clock.freq = 1;
+        clock.freq = 1.0;
         clock.data = Some(Arc::from(
             (0..=20)
                 .map(|i| 100_000_000. + 1000. * i as f64)

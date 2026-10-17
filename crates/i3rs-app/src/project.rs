@@ -215,6 +215,7 @@ mod tests {
 
     fn sample_workspace() -> WorkspaceFile {
         WorkspaceFile {
+            profile: None,
             version: 2,
             comparisons: None,
             worksheets: vec![WorksheetConfig {

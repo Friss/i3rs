@@ -2,6 +2,42 @@
 use crate::state::SharedState;
 use i3rs_core::{Lap, corrections::CorrectionSettings, ranges::RecordingAnalysis};
 impl SharedState {
+    /// Generated drag maths are recording-owned and run through the ordinary
+    /// evaluator, so graphs, Values, reports and overlays use the same values.
+    pub fn sync_drag_math(&mut self) {
+        let recording = self.recording_key().to_string();
+        let setup = self.current_analysis().map(|a| a.drag_setup.clone());
+        let Some(setup) = setup else { return };
+        let expressions = setup.expressions().unwrap_or_default();
+        self.math_channels.retain(|mc| {
+            !(mc.options.recording.as_deref() == Some(&recording)
+                && mc.options.generator.as_deref() == Some("drag")
+                && !expressions.iter().any(|(name, _, _)| *name == mc.name))
+        });
+        for (name, expression, unit) in expressions {
+            if let Some(mc) = self.math_channels.iter_mut().find(|mc| {
+                mc.options.recording.as_deref() == Some(&recording)
+                    && mc.options.generator.as_deref() == Some("drag")
+                    && mc.name == name
+            }) {
+                if mc.expression != expression || mc.unit != unit {
+                    mc.expression = expression;
+                    mc.unit = unit.into();
+                    mc.data = None;
+                    mc.evaluation_key = None;
+                }
+                continue;
+            }
+            let mut mc = self.create_math_channel_def(name.into(), expression, unit.into(), 2);
+            mc.options.source = "Log File".into();
+            mc.options.recording = Some(recording.clone());
+            mc.options.interpolation = i3rs_core::Interpolation::Linear;
+            mc.options.generator = Some("drag".into());
+            mc.options.comment = "Generated drag setup".into();
+            self.math_channels.push(mc);
+        }
+    }
+
     pub fn range_selection(&self) -> i3rs_core::ranges::RangeSelection {
         let range = self
             .selected_lap
@@ -138,6 +174,9 @@ impl SharedState {
         let corrections_changed = self.current_analysis().is_none_or(|old| {
             old.corrections != analysis.corrections || old.ranges != analysis.ranges
         });
+        let drag_changed = self
+            .current_analysis()
+            .is_none_or(|old| old.drag_setup != analysis.drag_setup);
         analysis.ranges.sort_by(|a, b| a.start.total_cmp(&b.start));
         analysis.mark_missed_beacons();
         let selected = self
@@ -154,6 +193,9 @@ impl SharedState {
         self.sectors = analysis.sectors.clone();
         self.recording_analyses
             .insert(analysis.recording.clone(), analysis);
+        if drag_changed {
+            self.sync_drag_math();
+        }
         self.reference_lap = None;
         if let Some(lap) = self.selected_lap {
             self.select_lap(Some(lap));
@@ -163,6 +205,9 @@ impl SharedState {
             self.invalidate_math_results();
         } else {
             self.apply_pending_track_definition();
+            if drag_changed {
+                self.invalidate_math_results();
+            }
         }
         Ok(())
     }
@@ -186,6 +231,48 @@ mod tests {
         shared.activate_recording_analysis(&laps);
         shared
     }
+    #[test]
+    fn drag_setup_survives_sidecar_and_updates_generated_ids_without_cross_recording_leaks() {
+        let mut shared = state();
+        let mut a = shared.current_analysis().unwrap().clone();
+        a.drag_setup.ratios = vec![2., 1.];
+        shared.apply_recording_analysis(a.clone()).unwrap();
+        let ids: Vec<_> = shared.math_channels.iter().map(|m| m.id).collect();
+        assert_eq!(ids.len(), 2);
+        let saved: RecordingAnalysis =
+            serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(saved.drag_setup, a.drag_setup);
+        a.drag_setup.ratios[0] = 2.5;
+        shared.apply_recording_analysis(a.clone()).unwrap();
+        assert_eq!(
+            shared
+                .math_channels
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(shared.math_channels[0].expression.contains("2.5"));
+        shared.sync_drag_math();
+        assert_eq!(shared.math_channels.len(), 2);
+        assert!(
+            shared
+                .math_channels
+                .iter()
+                .all(|m| m.options.recording.as_deref() == Some(shared.recording_key()))
+        );
+        // An overlay context can reconstruct setup maths from recording settings,
+        // even if that recording has never been the main session.
+        shared.math_channels.clear();
+        let context =
+            crate::comparison::recording_context(&shared, shared.ld_file.clone().unwrap());
+        assert_eq!(context.math_channels.len(), 2);
+        assert_ne!(context.math_channels[0].id, context.math_channels[1].id);
+        a.drag_setup.generate_clutch_slip = false;
+        shared.apply_recording_analysis(a).unwrap();
+        assert!(shared.math_channels.iter().all(|m| m.name != "Clutch Slip"));
+    }
+
     #[test]
     fn ranges_details_trust_categories_and_scope_round_trip_and_select_by_identity() {
         let mut shared = state();

@@ -90,7 +90,7 @@ impl ReportPanel {
             );
             return;
         };
-        if info.freq == 0 || info.data.is_empty() {
+        if info.freq == 0.0 || info.data.is_empty() {
             ui.weak("Speed channel is unavailable or loading");
             ui.ctx().request_repaint();
             return;
@@ -329,7 +329,7 @@ impl ReportPanel {
                                     indices.sort();
                                     for i in indices {
                                         run.push([
-                                            i as f64 / info.freq as f64,
+                                            i as f64 / info.freq,
                                             info.transform_value(info.data[i]) * scale * 3.6
                                                 + offset * 3.6,
                                         ]);

@@ -10,7 +10,7 @@ use crate::state::{
     YAxis, channel_preference_key,
 };
 
-pub type ChannelDisplayMeta = (String, String, u16, i16, Arc<HashMap<i64, String>>);
+pub type ChannelDisplayMeta = (String, String, f64, i16, Arc<HashMap<i64, String>>);
 
 static EMPTY_ENUM_LABELS: LazyLock<Arc<HashMap<i64, String>>> =
     LazyLock::new(|| Arc::new(HashMap::new()));
@@ -84,7 +84,7 @@ pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> Chan
             (
                 name,
                 unit,
-                shared.analysis_series(index).map_or(0, |(_, hz)| hz),
+                shared.analysis_series(index).map_or(0.0, |(_, hz)| hz),
                 3,
                 Arc::clone(&EMPTY_ENUM_LABELS),
             )
@@ -97,7 +97,7 @@ pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> Chan
             (
                 format!("{name} (unavailable)"),
                 String::new(),
-                0,
+                0.0,
                 0,
                 Arc::clone(&EMPTY_ENUM_LABELS),
             )
@@ -130,7 +130,7 @@ pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> Chan
                 (
                     "???".into(),
                     String::new(),
-                    0,
+                    0.0,
                     0,
                     Arc::clone(&EMPTY_ENUM_LABELS),
                 )
@@ -155,7 +155,7 @@ pub fn resolve_channel_display_meta(id: ChannelId, shared: &SharedState) -> Chan
                 (
                     "???".into(),
                     String::new(),
-                    0,
+                    0.0,
                     0,
                     Arc::clone(&EMPTY_ENUM_LABELS),
                 )
@@ -177,7 +177,7 @@ pub fn resolve_plotted_channel_display_meta(
 }
 
 /// Resolve channel metadata (name, unit, freq, dec_places) from a ChannelId.
-pub fn resolve_channel_meta(id: ChannelId, shared: &SharedState) -> (String, String, u16, i16) {
+pub fn resolve_channel_meta(id: ChannelId, shared: &SharedState) -> (String, String, f64, i16) {
     let (name, unit, freq, dec_places, _) = resolve_channel_display_meta(id, shared);
     (name, unit, freq, dec_places)
 }
@@ -253,7 +253,7 @@ pub fn display_transform_fingerprint(channel: &PlottedChannel) -> DisplayTransfo
 }
 
 /// Interpolate a channel value at a given time using linear interpolation.
-pub fn interp_at_time(data: &[f64], freq: u16, time: f64) -> Option<f64> {
+pub fn interp_at_time(data: &[f64], freq: f64, time: f64) -> Option<f64> {
     i3rs_core::analysis::sample_at_time(data, freq, time)
 }
 
@@ -334,7 +334,7 @@ pub fn channel_picker(
 }
 
 /// Sample positions in [start, end). Never include a position before a beacon.
-pub fn sample_range(len: usize, freq: u16, range: (f64, f64)) -> std::ops::Range<usize> {
+pub fn sample_range(len: usize, freq: f64, range: (f64, f64)) -> std::ops::Range<usize> {
     let window = i3rs_core::analysis::sample_window_for_time(freq, len, range.0, range.1);
     window.start_sample..window.end_sample
 }
@@ -1113,7 +1113,7 @@ mod portable_unit_tests {
         let mut m = shared.create_math_channel_def("Temperature".into(), "0".into(), "C".into(), 1);
         m.options.display_unit = Some("F".into());
         m.data = Some(Arc::from(vec![0.]));
-        m.freq = 1;
+        m.freq = 1.0;
         shared.math_channels.push(m);
         let mut pc = create_plotted_channel(ChannelId::Math(0), &shared, 0).unwrap();
         refresh_plotted_channel(&mut pc, &shared);
@@ -1148,11 +1148,11 @@ mod generated_slot_tests {
     fn generated_channels_and_scoped_constants_rebind_and_reuse_native_buffers() {
         let mut shared = SharedState::new();
         shared.data_duration = Some(3.);
-        shared.correction_speed = Some((Arc::from(vec![1., 2., 3., 4., 5., 6.]), 2));
+        shared.correction_speed = Some((Arc::from(vec![1., 2., 3., 4., 5., 6.]), 2.0));
         let id = shared.resolve_slot("MoTeC::Corr Speed", false).unwrap();
         let mut pc = create_plotted_channel(id, &shared, 0).unwrap();
         assert!(matches!(id, ChannelId::Analysis(_)));
-        assert_eq!(resolve_channel_meta(id, &shared).2, 2);
+        assert_eq!(resolve_channel_meta(id, &shared).2, 2.0);
         assert_eq!(pc.data.len(), 6);
         assert_eq!((pc.cached_min, pc.cached_max), (1., 6.));
         assert!(!refresh_plotted_channel(&mut pc, &shared));

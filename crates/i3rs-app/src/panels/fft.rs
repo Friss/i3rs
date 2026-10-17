@@ -12,10 +12,10 @@ use super::utils::{
 };
 
 /// Return the sub-slice of data visible in the current zoom range (no copy).
-fn visible_subslice<'a>(data: &'a [f64], freq: u16, shared: &SharedState) -> &'a [f64] {
+fn visible_subslice<'a>(data: &'a [f64], freq: f64, shared: &SharedState) -> &'a [f64] {
     if let Some((t0, t1)) = shared.zoom_range {
-        let start = (t0 * freq as f64).floor() as usize;
-        let end = (t1 * freq as f64).ceil() as usize;
+        let start = (t0 * freq).floor() as usize;
+        let end = (t1 * freq).ceil() as usize;
         &data[start.min(data.len())..end.min(data.len())]
     } else {
         data
@@ -152,7 +152,7 @@ impl FftPanel {
 
         for (i, pc) in self.channels.iter().enumerate() {
             let (name, _, freq, _) = resolve_channel_meta(pc.channel_id, shared);
-            if freq == 0 {
+            if freq == 0.0 {
                 continue;
             }
 
@@ -165,7 +165,7 @@ impl FftPanel {
 
             if needs_recompute {
                 let data_slice = visible_subslice(&pc.data, freq, shared);
-                let result = compute_fft_with_planner(data_slice, freq as f64, &mut self.planner);
+                let result = compute_fft_with_planner(data_slice, freq, &mut self.planner);
                 let plot_points = result
                     .frequencies
                     .iter()

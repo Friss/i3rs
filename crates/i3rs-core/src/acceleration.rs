@@ -87,10 +87,10 @@ pub fn acceleration_report(
         selection: selection.clone(),
         ..Default::default()
     };
-    if series.freq == 0 || series.data.len() < 2 {
+    if series.freq == 0.0 || series.data.len() < 2 {
         return Ok(result);
     }
-    let last = (series.data.len() - 1) as f64 / series.freq as f64;
+    let last = (series.data.len() - 1) as f64 / series.freq;
     let padded: Vec<_> = selection
         .iter()
         .map(|(a, b)| {
@@ -106,12 +106,12 @@ pub fn acceleration_report(
         report_windows(&padded)
     };
     for &(a, b) in &result.search_windows {
-        let first = (a * series.freq as f64).floor() as usize;
-        let end = ((b * series.freq as f64).ceil() as usize).min(series.data.len() - 1);
+        let first = (a * series.freq).floor() as usize;
+        let end = ((b * series.freq).ceil() as usize).min(series.data.len() - 1);
         let mut points = Vec::new();
         for i in first..end {
-            let t0 = i as f64 / series.freq as f64;
-            let t1 = (i + 1) as f64 / series.freq as f64;
+            let t0 = i as f64 / series.freq;
+            let t1 = (i + 1) as f64 / series.freq;
             let v0 = series.data[i] * series.scale + series.offset;
             let v1 = series.data[i + 1] * series.scale + series.offset;
             if !v0.is_finite() || !v1.is_finite() || v0 < 0. || v1 < 0. {
@@ -283,7 +283,7 @@ mod tests {
         acceleration_report(
             &ReportSeries {
                 data,
-                freq: 1,
+                freq: 1.0,
                 scale: 1.,
                 offset: 0.,
                 interpolation: crate::Interpolation::Linear,
@@ -362,7 +362,7 @@ mod tests {
             acceleration_report(
                 &ReportSeries {
                     data: &[0., 30.],
-                    freq: 1,
+                    freq: 1.0,
                     scale: 1.,
                     offset: 0.,
                     interpolation: crate::Interpolation::Linear
@@ -384,7 +384,7 @@ mod tests {
         let kmh: Vec<_> = (0..=30).map(|i| i as f64 * 3.6).collect();
         let series = ReportSeries {
             data: &kmh,
-            freq: 10,
+            freq: 10.0,
             scale: 1. / 3.6,
             offset: 0.,
             interpolation: crate::Interpolation::Linear,

@@ -158,9 +158,9 @@ impl CorrectionSettings {
     }
 }
 pub struct CorrectedRecording {
-    pub gps_speed: Option<(Vec<f64>, u16)>,
-    pub speed: Option<(Vec<f64>, u16)>,
-    pub distance: Option<(Vec<f64>, u16)>,
+    pub gps_speed: Option<(Vec<f64>, f64)>,
+    pub speed: Option<(Vec<f64>, f64)>,
+    pub distance: Option<(Vec<f64>, f64)>,
     pub track: Option<TrackData>,
     pub messages: Vec<String>,
 }
@@ -174,7 +174,7 @@ pub fn configured_speed_source<'a>(
     }
     let usable = |name: &str| {
         ld.find_channel_by_name(name).filter(|c| {
-            c.freq > 0
+            c.freq > 0.0
                 && c.n_data > 0
                 && c.data_type.bytes_per_sample().is_some()
                 && speed_unit_to_mps(&c.unit).is_some()
@@ -201,7 +201,7 @@ pub fn configured_speed_source<'a>(
         })
         .map(SpeedSource::Single)
 }
-fn read_speed(ld: &LdFile, source: SpeedSource<'_>) -> Option<(Vec<f64>, u16)> {
+fn read_speed(ld: &LdFile, source: SpeedSource<'_>) -> Option<(Vec<f64>, f64)> {
     match source {
         SpeedSource::Single(c) => Some((
             ld.read_channel_data(c)?
@@ -243,12 +243,12 @@ pub fn clamp_speed(data: &mut [f64], lower: Option<&SpeedLimit>, upper: Option<&
 /// its prediction by the configured threshold. Restart at missing data.
 pub fn correct_wheel_locks(
     speed: &mut [f64],
-    freq: u16,
+    freq: f64,
     accel: &[f64],
-    accel_freq: u16,
+    accel_freq: f64,
     w: &WheelLockCorrection,
 ) {
-    if freq == 0 {
+    if freq == 0.0 {
         return;
     }
     let mut previous: Option<f64> = None;
@@ -256,14 +256,14 @@ pub fn correct_wheel_locks(
         let a = sample_with_policy(
             accel,
             accel_freq,
-            i as f64 / freq as f64 + w.lag_seconds,
+            i as f64 / freq + w.lag_seconds,
             Interpolation::Linear,
         );
         if let (Some(prev), Some(a)) = (previous, a)
             && v.is_finite()
             && a < w.braking_threshold_mps2
         {
-            let predicted = (prev + a / freq as f64).max(0.);
+            let predicted = (prev + a / freq).max(0.);
             if predicted - *v > w.speed_threshold_mps {
                 *v = predicted;
             }
@@ -273,8 +273,8 @@ pub fn correct_wheel_locks(
 }
 /// Stretch supplied competition ranges; the caller selects them by type.
 /// Preserve cumulative continuity outside those ranges.
-pub fn stretch_distance(data: &mut [f64], freq: u16, laps: &[Lap], length: f64, tolerance: f64) {
-    if freq == 0 {
+pub fn stretch_distance(data: &mut [f64], freq: f64, laps: &[Lap], length: f64, tolerance: f64) {
+    if freq == 0.0 {
         return;
     }
     let original = data.to_vec();
@@ -291,7 +291,7 @@ pub fn stretch_distance(data: &mut [f64], freq: u16, laps: &[Lap], length: f64, 
         }
     }
     for (i, v) in data.iter_mut().enumerate() {
-        let t = i as f64 / freq as f64;
+        let t = i as f64 / freq;
         let mut offset = 0.;
         for &(start, end, a, scale) in &changes {
             if t >= end {
@@ -326,7 +326,7 @@ fn duplicate_interpolation(a: &mut [f64], b: &mut [f64]) {
         start = next;
     }
 }
-fn automatic_shift(lat: &[f64], lon: &[f64], freq: u16, fraction: f64) -> f64 {
+fn automatic_shift(lat: &[f64], lon: &[f64], freq: f64, fraction: f64) -> f64 {
     let changed: Vec<_> = (1..lat.len().min(lon.len()))
         .filter(|&i| {
             [lat[i], lon[i], lat[i - 1], lon[i - 1]]
@@ -337,40 +337,31 @@ fn automatic_shift(lat: &[f64], lon: &[f64], freq: u16, fraction: f64) -> f64 {
         .collect();
     let mut periods: Vec<_> = changed
         .windows(2)
-        .map(|w| (w[1] - w[0]) as f64 / freq as f64)
+        .map(|w| (w[1] - w[0]) as f64 / freq)
         .collect();
     periods.sort_by(f64::total_cmp);
-    periods
-        .get(periods.len() / 2)
-        .copied()
-        .unwrap_or(1. / freq as f64)
-        * fraction
+    periods.get(periods.len() / 2).copied().unwrap_or(1. / freq) * fraction
 }
 
 /// Correct positions on the latitude grid. Positive shifts advance delayed data.
 /// Automatic shift is a fraction of the median finite fix-change interval.
 pub fn gps_track_with_settings(
     lat: &[f64],
-    lat_freq: u16,
+    lat_freq: f64,
     lon: &[f64],
-    lon_freq: u16,
+    lon_freq: f64,
     s: &CorrectionSettings,
-    quality: Option<(&[f64], u16, f64)>,
+    quality: Option<(&[f64], f64, f64)>,
 ) -> Result<(Option<TrackData>, f64), String> {
     s.validate()?;
-    if lat_freq == 0 || lon_freq == 0 {
+    if lat_freq == 0.0 || lon_freq == 0.0 {
         return Err("GPS channels need nonzero sample rates".into());
     }
     let mut lat = lat.to_vec();
     let mut aligned: Vec<_> = (0..lat.len())
         .map(|i| {
-            sample_with_policy(
-                lon,
-                lon_freq,
-                i as f64 / lat_freq as f64,
-                s.gps_interpolation,
-            )
-            .unwrap_or(f64::NAN)
+            sample_with_policy(lon, lon_freq, i as f64 / lat_freq, s.gps_interpolation)
+                .unwrap_or(f64::NAN)
         })
         .collect();
     for (i, (x, y)) in lat.iter_mut().zip(aligned.iter_mut()).enumerate() {
@@ -381,7 +372,7 @@ pub fn gps_track_with_settings(
             || (*x == 0. && *y == 0.)
             || s.invalidate_position_with_quality
                 && quality.is_some_and(|(q, f, min)| {
-                    sample_with_policy(q, f, i as f64 / lat_freq as f64, Interpolation::Previous)
+                    sample_with_policy(q, f, i as f64 / lat_freq, Interpolation::Previous)
                         .is_none_or(|v| v < min)
                 })
         {
@@ -404,7 +395,7 @@ pub fn gps_track_with_settings(
                     sample_with_policy(
                         data,
                         lat_freq,
-                        i as f64 / lat_freq as f64 + shift,
+                        i as f64 / lat_freq + shift,
                         s.gps_interpolation,
                     )
                     .unwrap_or(f64::NAN)
@@ -422,12 +413,12 @@ pub fn gps_track_with_settings(
 
 pub fn correct_gps_speed(
     samples: &[f64],
-    freq: u16,
+    freq: f64,
     s: &CorrectionSettings,
-    quality: Option<(&[f64], u16, f64)>,
+    quality: Option<(&[f64], f64, f64)>,
     shift: f64,
 ) -> Vec<f64> {
-    if freq == 0 {
+    if freq == 0.0 {
         return vec![f64::NAN; samples.len()];
     }
     let mut data = samples.to_vec();
@@ -438,18 +429,13 @@ pub fn correct_gps_speed(
     if shift != 0. {
         data = (0..data.len())
             .map(|i| {
-                sample_with_policy(
-                    &data,
-                    freq,
-                    i as f64 / freq as f64 + shift,
-                    s.gps_interpolation,
-                )
-                .unwrap_or(f64::NAN)
+                sample_with_policy(&data, freq, i as f64 / freq + shift, s.gps_interpolation)
+                    .unwrap_or(f64::NAN)
             })
             .collect();
     }
     for (i, v) in data.iter_mut().enumerate() {
-        let t = i as f64 / freq as f64 + shift;
+        let t = i as f64 / freq + shift;
         if quality.is_some_and(|(q, f, min)| {
             sample_with_policy(q, f, t, Interpolation::Previous).is_none_or(|v| v < min)
         }) {
@@ -512,7 +498,7 @@ pub fn build_corrected_recording(
     }
     let gps_speed = if s.gps_enabled {
         ld.find_channel_by_name(&s.gps_speed_channel)
-            .filter(|c| c.freq > 0)
+            .filter(|c| c.freq > 0.0)
             .and_then(|c| {
                 let scale = speed_unit_to_mps(&c.unit)?;
                 let raw = ld.read_channel_data(c)?;
@@ -554,7 +540,7 @@ pub fn build_corrected_recording(
         let c = ld
             .find_channel_by_name(&s.distance_channel)
             .ok_or("Distance channel is unavailable")?;
-        if c.freq == 0 {
+        if c.freq == 0.0 {
             return Err("Distance channel has zero sample rate".into());
         }
         let scale =
@@ -720,12 +706,12 @@ mod tests {
             speed_threshold_mps: 1.,
         };
         let mut v = [20., 5., 4., f64::NAN, 3., 2.];
-        correct_wheel_locks(&mut v, 1, &[-2.; 6], 1, &w);
+        correct_wheel_locks(&mut v, 1.0, &[-2.; 6], 1.0, &w);
         assert_eq!(v[..3], [20., 18., 16.]);
         assert!(v[3].is_nan());
         assert_eq!(v[4..], [3., 2.]);
         let mut v = [20., 5., 4.];
-        correct_wheel_locks(&mut v, 1, &[-2., f64::NAN, -2.], 1, &w);
+        correct_wheel_locks(&mut v, 1.0, &[-2., f64::NAN, -2.], 1.0, &w);
         assert_eq!(v, [20., 5., 4.]);
     }
     #[test]
@@ -737,13 +723,13 @@ mod tests {
             end_time: 4.5,
         };
         let mut d = (0..7).map(|i| i as f64 * 10.).collect::<Vec<_>>();
-        stretch_distance(&mut d, 1, std::slice::from_ref(&lap), 42., 0.05);
+        stretch_distance(&mut d, 1.0, std::slice::from_ref(&lap), 42., 0.05);
         assert_eq!(d[0], 0.);
         assert!((d[1] - 10.25).abs() < 1e-9);
         assert!((d[5] - 52.).abs() < 1e-9);
         assert_eq!(d[6], 62.);
         let mut unchanged = (0..7).map(|i| i as f64 * 10.).collect::<Vec<_>>();
-        stretch_distance(&mut unchanged, 1, &[lap], 45., 0.05);
+        stretch_distance(&mut unchanged, 1.0, &[lap], 45., 0.05);
         assert_eq!(
             unchanged,
             (0..7).map(|i| i as f64 * 10.).collect::<Vec<_>>()
@@ -757,7 +743,7 @@ mod tests {
             interpolate_duplicates: true,
             ..Default::default()
         };
-        let (track, shift) = gps_track_with_settings(&lat, 1, &lon, 1, &s, None).unwrap();
+        let (track, shift) = gps_track_with_settings(&lat, 1.0, &lon, 1.0, &s, None).unwrap();
         assert_eq!(shift, 0.);
         let fixes = track.unwrap().geographic_fixes().unwrap();
         assert!((fixes[1][0] - 36.001).abs() < 1e-10);
@@ -765,11 +751,11 @@ mod tests {
         s.gps_shift = GpsShift::Manual(1.);
         let (track, shift) = gps_track_with_settings(
             &lat,
-            1,
+            1.0,
             &lon,
-            1,
+            1.0,
             &s,
-            Some((&[5., 5., 5., 5., 0., 5., 5.], 1, 4.)),
+            Some((&[5., 5., 5., 5., 0., 5., 5.], 1.0, 4.)),
         )
         .unwrap();
         assert_eq!(shift, 1.);
@@ -781,15 +767,15 @@ mod tests {
         s.gps_shift = GpsShift::Automatic(0.8);
         let (_, shift) = gps_track_with_settings(
             &[36., 36., 36.001, 36.001, 36.002, 36.002],
-            1,
+            1.0,
             &[-79.; 6],
-            1,
+            1.0,
             &s,
             None,
         )
         .unwrap();
         assert!((shift - 1.6).abs() < 1e-9);
-        assert!(gps_track_with_settings(&lat, 0, &lon, 1, &s, None).is_err());
+        assert!(gps_track_with_settings(&lat, 0.0, &lon, 1.0, &s, None).is_err());
     }
 }
 
@@ -804,16 +790,16 @@ mod gps_speed_tests {
         };
         let result = correct_gps_speed(
             &[0.5, 2., 4., f64::NAN],
-            1,
+            1.0,
             &s,
-            Some((&[5., 3., 5., 5.], 1, 4.)),
+            Some((&[5., 3., 5., 5.], 1.0, 4.)),
             0.,
         );
         assert_eq!(result[0], 0.);
         assert!(result[1].is_nan());
         assert_eq!(result[2], 4.);
         assert!(result[3].is_nan());
-        let shifted = correct_gps_speed(&[0.5, 2., 4., 6.], 1, &s, None, 0.5);
+        let shifted = correct_gps_speed(&[0.5, 2., 4., 6.], 1.0, &s, None, 0.5);
         assert_eq!(&shifted[..3], &[1.25, 3., 5.]);
     }
 }
