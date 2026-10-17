@@ -102,6 +102,43 @@ if let Some(name)=file.file_name(){dialog=dialog.set_file_name(name.to_string_lo
 if let Some(key)=remove{a.details.custom.remove(&key);}
                     ui.horizontal(|ui|{ui.text_edit_singleline(&mut self.custom_name);ui.text_edit_singleline(&mut self.custom_value);if ui.button("Add custom field").clicked()&&!self.custom_name.trim().is_empty(){a.details.custom.insert(self.custom_name.trim().into(),self.custom_value.clone());}});
                 });
+                ui.collapsing("Drag: transmission and clutch slip", |ui| {
+                    ui.label("Recording-specific transmission input/output ratios. Configure measured ratios; no vehicle ratios are assumed.");
+                    text(ui, "Engine RPM channel", &mut a.drag_setup.engine);
+                    text(ui, "Drive shaft RPM channel", &mut a.drag_setup.drive_shaft);
+                    text(ui, "Gear channel", &mut a.drag_setup.gear);
+                    ui.checkbox(&mut a.drag_setup.generate_input_shaft, "Generate Input Shaft Speed");
+                    ui.checkbox(&mut a.drag_setup.generate_clutch_slip, "Generate Clutch Slip");
+                    let mut remove = None;
+                    for (i, ratio) in a.drag_setup.ratios.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Gear {} ratio", i + 1));
+                            ui.add(egui::DragValue::new(ratio).speed(0.001).range(0.001..=100.));
+                            if ui.small_button("Remove gear").clicked() { remove = Some(i); }
+                        });
+                    }
+                    if let Some(i) = remove { a.drag_setup.ratios.remove(i); }
+                    if a.drag_setup.ratios.len() < 16 && ui.button("Add gear ratio").clicked() { a.drag_setup.ratios.push(1.); }
+                    if let Err(e) = a.drag_setup.expressions() { ui.weak(e); }
+                    ui.label("Apply edits to update the shared maths; save the workspace, project or sidecar to retain setup.");
+                });
+                ui.collapsing("Drag: run time-slip details", |ui| {
+                    ui.label("Create a Run range in the range editor first. Enter cumulative elapsed seconds from launch, excluding reaction time. Empty milestones use corrected-distance crossings when available.");
+                    for r in a.ranges.iter().filter(|r| r.kind == RangeKind::Run) {
+                        ui.push_id((&r.id, "slip"), |ui| {
+                            ui.label(&r.name);
+                            let slip = a.drag_runs.entry(r.id.clone()).or_default();
+                            for (ft, elapsed) in i3rs_core::drag::MILESTONES_FT.iter().zip(&mut slip.elapsed) {
+                                ui.horizontal(|ui| {
+                                    let mut enabled = elapsed.is_some();
+                                    if ui.checkbox(&mut enabled, format!("{ft} ft elapsed")).changed() { *elapsed = enabled.then_some(0.); }
+                                    if let Some(t) = elapsed { ui.add(egui::DragValue::new(t).speed(0.001).suffix(" s")); }
+                                });
+                            }
+                        });
+                    }
+                    a.drag_runs.retain(|id, _| a.ranges.iter().any(|r| &r.id == id && r.kind == RangeKind::Run));
+                });
                 ui.collapsing("Ranges (lap / run / stage / transport)",|ui|{
                     ui.label("Ranges are [start, end). Types and trust remain separate from their editable names.");
                     let mut remove=None;

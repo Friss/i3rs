@@ -1,9 +1,12 @@
-//! Default worksheet layouts matching MoTeC i2 Pro's tab structure.
+//! Circuit worksheet composition from the audited configured i2 reference.
 //!
 //! When a `.ld` file is opened and no workspace is loaded, we auto-create
 //! worksheets with channels matched by name from the loaded file.
 
 use std::sync::Arc;
+
+mod profiles;
+pub use profiles::{WorkspaceProfile, create_profile_worksheets};
 
 use eframe::egui;
 use egui_dock::{DockState, NodeIndex};
@@ -19,7 +22,7 @@ use crate::panels::report::ReportPanel;
 use crate::panels::scatter::ScatterPanel;
 use crate::panels::track_map::TrackMapPanel;
 use crate::panels::utils::create_plotted_channel;
-use crate::state::{CHANNEL_COLORS, ChannelId, PlottedChannel, SharedState, YAxis};
+use crate::state::{CHANNEL_COLORS, PlottedChannel, SharedState};
 
 /// A graph-centric default worksheet.
 struct GraphWorksheetTemplate {
@@ -43,8 +46,10 @@ const DRIVER_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
         "Brake State",
         "Clutch Position",
         "G Force Lat",
-        "CP Lotus ESP Lateral Acceleration",
         "Gear",
+        "Oversteer",
+        "Oversteer (Speed Weighted)",
+        "CP Lotus Gauge Pack Ambient Air Temperature",
         "Inlet Air Temperature",
         "Coolant Temperature",
         "Engine Oil Temperature",
@@ -53,9 +58,13 @@ const DRIVER_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
         &["Engine Speed", "Engine Speed Limit"],
         &["Throttle Pedal"],
         &["Brake State", "Clutch Position"],
-        &["G Force Lat", "CP Lotus ESP Lateral Acceleration"],
-        &["Gear"],
-        &["Inlet Air Temperature"],
+        &["Oversteer", "Oversteer (Speed Weighted)"],
+        &["G Force Lat"],
+        &[
+            "Gear",
+            "Inlet Air Temperature",
+            "CP Lotus Gauge Pack Ambient Air Temperature",
+        ],
         &["Coolant Temperature", "Engine Oil Temperature"],
     ],
     embedded_gauges: &[
@@ -76,8 +85,16 @@ const DRIVER_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
             style: GaugeStyle::SteeringWheel,
         },
         GaugeTemplate {
-            names: &["G Force Lat", "CP Lotus ESP Lateral Acceleration"],
+            names: &["Oversteer"],
             style: GaugeStyle::Analog,
+        },
+        GaugeTemplate {
+            names: &["G Force Lat", "CP Lotus ESP Lateral Acceleration"],
+            style: GaugeStyle::Bar,
+        },
+        GaugeTemplate {
+            names: &["G Force Long"],
+            style: GaugeStyle::Bar,
         },
         GaugeTemplate {
             names: &["Gear"],
@@ -101,8 +118,8 @@ const BRAKING_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
         "CP Lotus Wheel Speed Front Right",
         "CP Lotus Wheel Speed Rear Left",
         "CP Lotus Wheel Speed Rear Right",
-        "Front Wheels Diff",
-        "Rear Wheel Diff",
+        "Front Wheels Diff (Left - Right)",
+        "Rear Wheel Diff (Left - Right)",
         "CP Lotus ESP Steering Angle",
     ],
     tiled_groups: &[
@@ -119,7 +136,10 @@ const BRAKING_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
             "CP Lotus Wheel Speed Rear Left",
             "CP Lotus Wheel Speed Rear Right",
         ],
-        &["Front Wheels Diff", "Rear Wheel Diff"],
+        &[
+            "Front Wheels Diff (Left - Right)",
+            "Rear Wheel Diff (Left - Right)",
+        ],
         &["CP Lotus ESP Steering Angle"],
     ],
     embedded_gauges: &[],
@@ -251,6 +271,14 @@ const FUEL_IGN_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
         },
         GaugeTemplate {
             names: &["Exhaust Lambda Bank 1"],
+            style: GaugeStyle::Bar,
+        },
+        GaugeTemplate {
+            names: &["Exhaust Lambda Bank 2"],
+            style: GaugeStyle::Bar,
+        },
+        GaugeTemplate {
+            names: &["Exhaust Lambda Bank 1"],
             style: GaugeStyle::Digital,
         },
         GaugeTemplate {
@@ -306,80 +334,23 @@ const SPARE_WORKSHEET: GraphWorksheetTemplate = GraphWorksheetTemplate {
     embedded_gauges: &[],
 };
 
-fn channel_name_matches(actual: &str, candidate: &str) -> bool {
-    actual.eq_ignore_ascii_case(candidate)
-        || actual
-            .get(..candidate.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(candidate))
-        || candidate
-            .get(..actual.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(actual))
-}
-
-fn normalize_channel_name(name: &str) -> String {
-    i3rs_core::normalize_channel_name(name)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Find a channel index by name (case-insensitive, partial match with prefix).
+/// Match the parser's exact/normalized names; alternative names use W02 aliases.
 fn find_channel(ld: &LdFile, name: &str) -> Option<usize> {
     if let Some(channel) = ld.find_channel_by_name(name) {
         return Some(channel.index);
     }
 
-    ld.channels
-        .iter()
-        .position(|ch| channel_name_matches(&ch.name, name))
+    None
 }
 
 fn find_first_channel(ld: &LdFile, names: &[&str]) -> Option<usize> {
     names.iter().find_map(|name| find_channel(ld, name))
 }
 
-fn find_channel_by_all_tokens(ld: &LdFile, tokens: &[&str]) -> Option<usize> {
-    let normalized_tokens: Vec<String> = tokens
-        .iter()
-        .map(|token| normalize_channel_name(token))
-        .filter(|token| !token.is_empty())
-        .collect();
-    if normalized_tokens.is_empty() {
-        return None;
-    }
-
-    ld.channels.iter().position(|ch| {
-        let normalized = normalize_channel_name(&ch.name);
-        !normalized.is_empty()
-            && normalized_tokens
-                .iter()
-                .all(|token| normalized.contains(token))
-    })
-}
-
-fn find_first_channel_by_token_sets(ld: &LdFile, token_sets: &[&[&str]]) -> Option<usize> {
-    token_sets
-        .iter()
-        .find_map(|tokens| find_channel_by_all_tokens(ld, tokens))
-}
-
 fn next_panel_id(shared: &mut SharedState) -> u64 {
     let id = shared.next_panel_id;
     shared.next_panel_id += 1;
     id
-}
-
-fn make_plotted_channel(
-    shared: &SharedState,
-    channel_idx: usize,
-    color: egui::Color32,
-    tile_group: usize,
-) -> Option<PlottedChannel> {
-    let mut channel = create_plotted_channel(ChannelId::Physical(channel_idx), shared, tile_group)?;
-    channel.color = color;
-    channel.tile_group = tile_group;
-    channel.y_axis = YAxis::Left;
-    Some(channel)
 }
 
 fn named_slot(
@@ -406,7 +377,6 @@ fn named_slot(
     }
     let id = shared
         .resolve_slot(requested, false)
-        .or_else(|| found.map(ChannelId::Physical))
         .unwrap_or_else(|| shared.unresolved_channel(requested, false));
     let mut channel = create_plotted_channel(id, shared, group)?;
     channel.requested_reference = Some((requested.into(), false));
@@ -435,43 +405,27 @@ fn build_graph_panel(
                     last_unit: None,
                     channel,
                     style: gauge.style,
-                    settings: Default::default(),
+                    settings: crate::panels::gauge::GaugeSettings {
+                        range: gauge.names[0].contains("Lambda").then_some((0.7, 1.1)),
+                        ..Default::default()
+                    },
                 });
         }
     }
 
-    let mut matched = Vec::new();
     for (i, name) in template.channels.iter().enumerate() {
-        if let Some(index) = find_channel(ld, name) {
-            let actual = &ld.channels[index].name;
-            if actual != name {
-                shared
-                    .channel_settings
-                    .aliases
-                    .entry((*name).into())
-                    .or_insert_with(|| vec![actual.clone()]);
-            }
-        }
-        let id = shared
-            .resolve_slot(name, false)
-            .unwrap_or_else(|| shared.unresolved_channel(name, false));
-        if matched.contains(&id) {
-            continue;
-        }
-        matched.push(id);
         let group = template
             .tiled_groups
             .iter()
-            .position(|members| {
-                members
-                    .iter()
-                    .any(|candidate| channel_name_matches(name, candidate))
-            })
+            .position(|members| members.contains(name))
             .unwrap_or(i);
-        if let Some(mut channel) = create_plotted_channel(id, shared, i) {
-            channel.requested_reference = Some(((*name).into(), false));
-            channel.color = CHANNEL_COLORS[i % CHANNEL_COLORS.len()];
-            channel.tile_group = group;
+        if let Some(channel) = named_slot(
+            ld,
+            shared,
+            &[name],
+            CHANNEL_COLORS[i % CHANNEL_COLORS.len()],
+            group,
+        ) {
             graph.plotted_channels.push(channel);
         }
     }
@@ -594,69 +548,35 @@ fn build_oil_pressure_worksheet(
     ld: &LdFile,
     shared: &mut SharedState,
 ) -> Option<(String, DockState<PanelTab>)> {
-    let x_idx = find_first_channel(
+    let mut panel = ScatterPanel::new(next_panel_id(shared), "Engine Oil Pressure");
+    panel.point_size = 1.75;
+    panel.bounds_padding_frac = 0.10;
+    panel.lock_bounds = true;
+    panel.x_channel = named_slot(
         ld,
-        &[
-            "CP Lotus ESP Lateral Acceleration",
-            "G Force Lat",
-            "Lateral Acceleration",
-            "Lat Accel",
-            "ECU Acceleration Y",
-        ],
-    )
-    .or_else(|| {
-        find_first_channel_by_token_sets(
-            ld,
-            &[
-                &["lateral", "accel"],
-                &["lat", "accel"],
-                &["g", "force", "lat"],
-                &["acceleration", "y"],
-            ],
-        )
-    });
-    let y_idx = find_first_channel(
+        shared,
+        &["G Force Lat", "CP Lotus ESP Lateral Acceleration"],
+        CHANNEL_COLORS[0],
+        0,
+    );
+    panel.y_channel = named_slot(
         ld,
-        &[
-            "Engine Oil Pressure",
-            "Oil Pressure",
-            "Eng Oil Pres",
-            "Oil Pres",
-        ],
-    )
-    .or_else(|| {
-        find_first_channel_by_token_sets(
-            ld,
-            &[
-                &["engine", "oil", "pres"],
-                &["oil", "pressure"],
-                &["oil", "pres"],
-            ],
-        )
-    });
-
-    let scatter = match (x_idx, y_idx) {
-        (Some(x_idx), Some(y_idx)) => {
-            let mut panel = ScatterPanel::new(next_panel_id(shared), "Engine Oil Pressure");
-            panel.point_size = 1.75;
-            panel.bounds_padding_frac = 0.10;
-            panel.lock_bounds = true;
-            panel.x_channel = make_plotted_channel(shared, x_idx, CHANNEL_COLORS[0], 0);
-            panel.y_channel = make_plotted_channel(shared, y_idx, CHANNEL_COLORS[4], 1);
-            (panel.x_channel.is_some() && panel.y_channel.is_some()).then_some(panel)
-        }
-        _ => None,
-    };
-
-    let graph = y_idx.and_then(|idx| {
-        let mut panel = GraphPanel::new(next_panel_id(shared), "Engine Oil Pressure");
-        if let Some(pc) = make_plotted_channel(shared, idx, CHANNEL_COLORS[0], 0) {
-            panel.plotted_channels.push(pc);
-            Some(panel)
-        } else {
-            None
-        }
-    });
+        shared,
+        &["Engine Oil Pressure", "Oil Pressure", "Eng Oil Pres"],
+        CHANNEL_COLORS[4],
+        1,
+    );
+    let scatter = Some(panel);
+    let graph = build_graph_panel(
+        ld,
+        shared,
+        &GraphWorksheetTemplate {
+            name: "Engine Oil Pressure",
+            channels: &["Engine Oil Pressure"],
+            tiled_groups: &[],
+            embedded_gauges: &[],
+        },
+    );
 
     match (scatter, graph) {
         (Some(panel), Some(graph)) => {
@@ -702,8 +622,13 @@ fn build_rpm_histo_worksheet(
             count: 10,
             centered: false,
         };
-        panel.color_channel = find_first_channel(ld, &["Throttle Position", "Throttle Pedal"])
-            .and_then(|idx| make_plotted_channel(shared, idx, CHANNEL_COLORS[2], 0));
+        panel.color_channel = named_slot(
+            ld,
+            shared,
+            &["Throttle Position", "Throttle Pedal"],
+            CHANNEL_COLORS[2],
+            0,
+        );
     }
     let graph = build_graph_panel(
         ld,
@@ -739,7 +664,7 @@ fn build_rpm_histo_worksheet(
 }
 
 /// Create default worksheets from the loaded file's available channels.
-pub fn create_default_worksheets(
+fn create_circuit_worksheets(
     ld: &Arc<LdFile>,
     shared: &mut SharedState,
 ) -> Vec<(String, DockState<PanelTab>)> {
@@ -816,9 +741,17 @@ pub fn create_default_worksheets(
     worksheets
 }
 
+pub fn create_default_worksheets(
+    ld: &Arc<LdFile>,
+    shared: &mut SharedState,
+) -> Vec<(String, DockState<PanelTab>)> {
+    create_profile_worksheets(shared.workspace_profile.unwrap_or_default(), ld, shared)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ChannelId;
 
     fn load_file(path: &str) -> (Arc<LdFile>, SharedState) {
         let ld = Arc::new(LdFile::open(path).unwrap());

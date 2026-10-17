@@ -223,7 +223,7 @@ fn cli_extract_preserves_native_samples_for_enum_channels() {
 fn native_extraction_and_histogram_exclude_samples_before_an_off_grid_start() {
     let ld = i3rs_core::LdFile::open(TEST_LD).unwrap();
     let channel = ld.find_channel_by_name("Engine Speed").unwrap();
-    let hz = channel.freq as f64;
+    let hz = channel.freq;
     let selection = format!("{}:{}", 0.5 / hz, 2.5 / hz);
     let output = run_cli(&[
         "extract",

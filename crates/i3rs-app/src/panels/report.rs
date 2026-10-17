@@ -85,6 +85,9 @@ pub enum AccelerationMetric {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReportSettings {
+    pub range_kind: Option<i3rs_core::ranges::RangeKind>,
+    pub drag_milestones: bool,
+    pub drag_cumulative: bool,
     pub kind: ReportKind,
     pub reference: ReportReference,
     pub sections_as_headings: bool,
@@ -105,10 +108,15 @@ pub struct ReportSettings {
     pub highlight_min: bool,
     pub highlight_max: bool,
     pub chart_statistic: ReportStatistic,
+    /// Empty retains the legacy single-statistic chart.
+    pub chart_statistics: Vec<ReportStatistic>,
 }
 impl Default for ReportSettings {
     fn default() -> Self {
         Self {
+            range_kind: None,
+            drag_milestones: false,
+            drag_cumulative: false,
             kind: ReportKind::Channels,
             reference: ReportReference::Absolute,
             sections_as_headings: false,
@@ -132,6 +140,7 @@ impl Default for ReportSettings {
             highlight_min: false,
             highlight_max: false,
             chart_statistic: ReportStatistic::Average,
+            chart_statistics: Vec::new(),
         }
     }
 }
@@ -151,7 +160,7 @@ struct ChannelKey {
     unit: String,
     data_ptr: usize,
     len: usize,
-    freq: u16,
+    freq: f64,
     scale: u64,
     offset: u64,
     interpolation: i3rs_core::Interpolation,
@@ -252,6 +261,36 @@ impl ReportPanel {
         }
     }
     fn controls(&mut self, ui: &mut egui::Ui, shared: &SharedState) {
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt(("report_range_kind", self.id))
+                .selected_text(
+                    self.settings
+                        .range_kind
+                        .map_or("All range types", |k| k.label()),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.settings.range_kind, None, "All range types");
+                    for kind in [
+                        i3rs_core::ranges::RangeKind::Lap,
+                        i3rs_core::ranges::RangeKind::Run,
+                        i3rs_core::ranges::RangeKind::Stage,
+                        i3rs_core::ranges::RangeKind::Transport,
+                    ] {
+                        ui.selectable_value(
+                            &mut self.settings.range_kind,
+                            Some(kind),
+                            kind.label(),
+                        );
+                    }
+                });
+            ui.checkbox(
+                &mut self.settings.drag_milestones,
+                "Drag distance milestones",
+            );
+            if self.settings.drag_milestones {
+                ui.checkbox(&mut self.settings.drag_cumulative, "Cumulative from launch");
+            }
+        });
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt(("report_kind", self.id))
                 .selected_text(format!("{:?} report", self.settings.kind))
@@ -359,15 +398,35 @@ impl ReportPanel {
                 ui.checkbox(&mut self.settings.highlight_max, "Highlight maximums");
             });
             if self.settings.view != ReportView::Table {
+                ui.menu_button("Chart statistics", |ui| {
+                    for stat in self.visible_statistics() {
+                        let mut enabled = self.settings.chart_statistics.contains(&stat);
+                        if ui.checkbox(&mut enabled, stat.label()).changed() {
+                            self.settings.chart_statistics.retain(|s| *s != stat);
+                            if enabled {
+                                self.settings.chart_statistics.push(stat);
+                            }
+                        }
+                    }
+                });
                 egui::ComboBox::from_id_salt(("report_chart_stat", self.id))
-                    .selected_text(self.stat_label(self.settings.chart_statistic))
+                    .selected_text(if self.settings.chart_statistics.is_empty() {
+                        self.stat_label(self.settings.chart_statistic)
+                    } else {
+                        "Multiple statistics"
+                    })
                     .show_ui(ui, |ui| {
                         for stat in &self.visible_statistics() {
-                            ui.selectable_value(
-                                &mut self.settings.chart_statistic,
-                                *stat,
-                                stat.label(),
-                            );
+                            if ui
+                                .selectable_value(
+                                    &mut self.settings.chart_statistic,
+                                    *stat,
+                                    stat.label(),
+                                )
+                                .clicked()
+                            {
+                                self.settings.chart_statistics.clear();
+                            }
                         }
                     });
             }
@@ -551,6 +610,16 @@ impl ReportPanel {
             });
         }
         self.controls(ui, shared);
+        if self.settings.drag_milestones {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Run details / time slip…").clicked() { shared.show_recording_editor = true; }
+                if let Some(run) = shared.selected_lap.and_then(|i| shared.current_analysis()?.ranges.get(i))
+                    && let Some(reaction) = run.reaction_time {
+                    ui.label(format!("Reaction: {reaction:.3} s (excluded from elapsed times)"));
+                }
+                ui.weak("Time-slip elapsed values take precedence; other milestones use corrected distance.");
+            });
+        }
         if self.settings.kind == ReportKind::Acceleration {
             self.acceleration_ui(ui, shared);
             return;
@@ -584,7 +653,7 @@ impl ReportPanel {
                 channel_id: ChannelId::Unresolved(usize::MAX),
                 name: "Elapsed time".into(),
                 unit: "s".into(),
-                freq: 0,
+                freq: 0.0,
                 dec_places: 3,
                 color: egui::Color32::WHITE,
                 data: std::sync::Arc::from([]),
@@ -601,7 +670,10 @@ impl ReportPanel {
                 self.settings.trusted_only,
                 &self.settings.section_id,
                 self.settings.reverse,
-                self.settings.sections_as_headings
+                self.settings.sections_as_headings,
+                self.settings.range_kind,
+                self.settings.drag_milestones,
+                self.settings.drag_cumulative
             ),
             (
                 shared.session_id,
@@ -612,11 +684,17 @@ impl ReportPanel {
             shared.analysis_range(),
             shared.data_duration,
             shared.laps,
-            shared.current_analysis().map(|a| &a.ranges),
+            shared.current_analysis().map(|a| (&a.ranges, &a.drag_runs)),
             shared.sectors,
-            shared
-                .track_data_if_ready()
-                .map(|t| std::sync::Arc::as_ptr(&t) as usize)
+            (
+                shared
+                    .track_data_if_ready()
+                    .map(|t| std::sync::Arc::as_ptr(&t) as usize),
+                shared
+                    .correction_distance
+                    .as_ref()
+                    .map(|(d, _)| d.as_ptr() as usize)
+            ),
         );
         let mut groups = if grouping_key != self.grouping_key {
             let (groups, diagnostic) = report_groups(&self.settings, shared);
@@ -634,7 +712,7 @@ impl ReportPanel {
             ui.colored_label(egui::Color32::YELLOW, message);
         }
         if self.settings.kind != ReportKind::Time
-            && registry.iter().any(|c| c.freq == 0 || c.data.is_empty())
+            && registry.iter().any(|c| c.freq == 0.0 || c.data.is_empty())
         {
             ui.weak("Some channels are unavailable or loading; their results are shown as —");
         }
@@ -654,7 +732,7 @@ impl ReportPanel {
                 .external_sources
                 .iter()
                 .flatten()
-                .any(|i| i.freq == 0 || i.data.is_empty())
+                .any(|i| i.freq == 0.0 || i.data.is_empty())
         {
             ui.weak("Some outing channels are unavailable or loading; their results are shown as —. Details appear in Status / Messages.");
         }
@@ -874,6 +952,28 @@ impl ReportPanel {
             None
         }
     }
+    fn chart_statistics(&self, channel: usize) -> Vec<ReportStatistic> {
+        let candidates = if self.settings.kind == ReportKind::Time {
+            vec![ReportStatistic::Average]
+        } else if self.settings.chart_statistics.is_empty() {
+            vec![self.settings.chart_statistic]
+        } else {
+            self.settings.chart_statistics.clone()
+        };
+        candidates
+            .into_iter()
+            .filter(|stat| {
+                self.settings.kind == ReportKind::Time
+                    || self
+                        .settings
+                        .channel_statistics
+                        .get(channel)
+                        .and_then(Option::as_ref)
+                        .unwrap_or(&self.settings.statistics)
+                        .contains(stat)
+            })
+            .collect()
+    }
     fn charts(
         &self,
         ui: &mut egui::Ui,
@@ -883,13 +983,18 @@ impl ReportPanel {
         use egui_plot::{Bar, BarChart, Line, Plot};
         let mut selection = None;
         for (c, info) in registry.iter().enumerate() {
+            let statistics = self.chart_statistics(c);
             ui.colored_label(
                 info.color,
                 format!(
                     "{} [{}] · {}",
                     info.name,
                     info.unit,
-                    self.stat_label(self.settings.chart_statistic)
+                    statistics
+                        .iter()
+                        .map(|s| self.stat_label(*s))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
                 ),
             );
             Plot::new(("report_chart", self.id, c))
@@ -908,44 +1013,58 @@ impl ReportPanel {
                     }
                 })
                 .show(ui, |plot| {
-                    let bars: Vec<_> = self
-                        .groups
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(g, group)| {
-                            let value = self.value(c, g, self.settings.chart_statistic)?;
-                            let selected = self.selected_group.as_ref().map_or(
-                                group.source.is_none() && group.lap_index == shared.selected_lap,
-                                |id| id == &group.id,
-                            );
-                            let color = self
-                                .highlight(c, self.settings.chart_statistic, Some(value))
-                                .unwrap_or(info.color);
-                            Some(
-                                Bar::new(g as f64, value)
-                                    .width(0.65)
-                                    .name(&group.label)
-                                    .fill(color)
-                                    .stroke(egui::Stroke::new(
-                                        if selected { 2. } else { 0. },
-                                        egui::Color32::WHITE,
-                                    )),
-                            )
-                        })
-                        .collect();
-                    plot.bar_chart(BarChart::new(&info.name, bars));
-                    let mut run = Vec::new();
-                    for g in 0..self.groups.len() {
-                        if let Some(value) = self.value(c, g, self.settings.chart_statistic) {
-                            run.push([g as f64, value]);
-                        } else if !run.is_empty() {
-                            plot.line(
-                                Line::new("Trend", std::mem::take(&mut run)).color(info.color),
-                            );
+                    for (s, &stat) in statistics.iter().enumerate() {
+                        let width = 0.65 / statistics.len().max(1) as f64;
+                        let offset = (s as f64 + 0.5) * width - 0.325;
+                        let series_color = if statistics.len() == 1 {
+                            info.color
+                        } else {
+                            match stat {
+                                ReportStatistic::Min => egui::Color32::LIGHT_BLUE,
+                                ReportStatistic::Max => egui::Color32::LIGHT_RED,
+                                _ => egui::Color32::GOLD,
+                            }
+                        };
+                        let bars: Vec<_> = self
+                            .groups
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(g, group)| {
+                                let value = self.value(c, g, stat)?;
+                                let selected = self.selected_group.as_ref().map_or(
+                                    group.source.is_none()
+                                        && group.lap_index == shared.selected_lap,
+                                    |id| id == &group.id,
+                                );
+                                let color =
+                                    self.highlight(c, stat, Some(value)).unwrap_or(series_color);
+                                Some(
+                                    Bar::new(g as f64 + offset, value)
+                                        .width(width)
+                                        .name(&group.label)
+                                        .fill(color)
+                                        .stroke(egui::Stroke::new(
+                                            if selected { 2. } else { 0. },
+                                            egui::Color32::WHITE,
+                                        )),
+                                )
+                            })
+                            .collect();
+                        plot.bar_chart(BarChart::new(self.stat_label(stat), bars));
+                        let mut run = Vec::new();
+                        for g in 0..self.groups.len() {
+                            if let Some(value) = self.value(c, g, stat) {
+                                run.push([g as f64, value]);
+                            } else if !run.is_empty() {
+                                plot.line(
+                                    Line::new("Trend", std::mem::take(&mut run))
+                                        .color(series_color),
+                                );
+                            }
                         }
-                    }
-                    if !run.is_empty() {
-                        plot.line(Line::new("Trend", run).color(info.color));
+                        if !run.is_empty() {
+                            plot.line(Line::new("Trend", run).color(series_color));
+                        }
                     }
                     if plot.response().clicked()
                         && let Some(p) = plot.pointer_coordinate()
@@ -953,10 +1072,10 @@ impl ReportPanel {
                         let index = p.x.round();
                         if index >= 0.
                             && (index as usize) < self.groups.len()
-                            && (p.x - index).abs() <= 0.325
-                            && self
-                                .value(c, index as usize, self.settings.chart_statistic)
-                                .is_some()
+                            && (p.x - index).abs() <= 0.45
+                            && statistics
+                                .iter()
+                                .any(|stat| self.value(c, index as usize, *stat).is_some())
                         {
                             selection = Some(index as usize);
                         }
@@ -1073,6 +1192,64 @@ fn report_groups(
             windows: vec![shared.analysis_range()],
         }),
     }
+    if let Some(kind) = settings.range_kind {
+        groups.retain(|g| {
+            g.lap_index
+                .and_then(|i| shared.current_analysis()?.ranges.get(i))
+                .is_some_and(|r| r.kind == kind)
+        });
+    }
+    if settings.drag_milestones {
+        shared.request_track_data_build();
+        let mut expanded = Vec::new();
+        for group in groups {
+            let Some(run) = group
+                .lap_index
+                .and_then(|i| shared.current_analysis()?.ranges.get(i))
+            else {
+                continue;
+            };
+            if run.kind != i3rs_core::ranges::RangeKind::Run {
+                continue;
+            }
+            let times = i3rs_core::drag::milestone_times(
+                run,
+                shared
+                    .current_analysis()
+                    .and_then(|a| a.drag_runs.get(&run.id)),
+                shared
+                    .correction_distance
+                    .as_ref()
+                    .map(|(d, hz)| (d.as_ref(), *hz)),
+            );
+            let mut previous = Some(0.);
+            for (ft, elapsed) in i3rs_core::drag::MILESTONES_FT.into_iter().zip(times) {
+                let start = if settings.drag_cumulative {
+                    Some(0.)
+                } else {
+                    previous
+                };
+                let windows = start
+                    .zip(elapsed)
+                    .map(|(a, b)| vec![(run.start + a, run.start + b)])
+                    .unwrap_or_default();
+                let mut row = group.clone();
+                row.id = format!("{}:{ft}ft", group.id);
+                row.section = Some(format!("drag:{ft}"));
+                row.label = format!("{} · {ft} ft", group.label);
+                row.windows = windows;
+                expanded.push(row);
+                previous = elapsed;
+            }
+        }
+        groups = expanded;
+        if groups.is_empty() {
+            return (
+                groups,
+                Some("Select a Run range; create or edit runs in Run details / time slip".into()),
+            );
+        }
+    }
     if settings.sections_as_headings {
         let mut expanded = Vec::new();
         let mut diagnostic = None;
@@ -1132,8 +1309,11 @@ fn report_groups(
         }
     }
     if groups.iter().all(|g| g.windows.is_empty()) && diagnostic.is_none() {
-        diagnostic =
-            Some("No intervals satisfy the report's range, section and trust selection".into());
+        diagnostic = Some(if settings.drag_milestones {
+            "No eligible milestones: check the run's time slip, corrected distance and trust selection"
+        } else {
+            "No intervals satisfy the report's range, section and trust selection"
+        }.into());
     }
     if settings.reverse {
         groups.reverse();
@@ -1179,7 +1359,7 @@ mod tests {
             channel_id: ChannelId::Math(0),
             name: "Speed, \"test\"".into(),
             unit: "km/h".into(),
-            freq: 1,
+            freq: 1.0,
             dec_places: 1,
             color: egui::Color32::GREEN,
             data: Arc::from(vec![0., 10., 20., 30.]),
@@ -1189,6 +1369,97 @@ mod tests {
             enum_labels: Default::default(),
         }
     }
+    #[test]
+    fn drag_deltas_compare_matching_distance_milestones_and_csv_matches_values() {
+        let mut shared = state();
+        let key = shared.recording_key().to_string();
+        let a = shared.recording_analyses.get_mut(&key).unwrap();
+        a.ranges[1].kind = i3rs_core::ranges::RangeKind::Run;
+        a.drag_runs.insert(
+            a.ranges[1].id.clone(),
+            i3rs_core::drag::RunDetails {
+                elapsed: [Some(0.5), Some(1.25), None, None, None],
+            },
+        );
+        shared.selected_lap = Some(1);
+        let mut panel = ReportPanel::new(1, "Drag");
+        panel.settings = ReportSettings {
+            kind: ReportKind::Time,
+            scope: ReportScope::SelectedRange,
+            drag_milestones: true,
+            reference: ReportReference::Main,
+            ..Default::default()
+        };
+        let groups = report_groups(&panel.settings, &shared).0;
+        let mut reference = groups.clone();
+        reference[0].windows = vec![(0., 0.25)];
+        reference[1].windows = vec![(0.25, 0.75)];
+        panel.reference_groups[0] = reference;
+        let mut time = info();
+        time.name = "Elapsed time".into();
+        time.unit = "s".into();
+        time.dec_places = 3;
+        panel.rebuild(&[time], groups);
+        assert_eq!(panel.value(0, 0, ReportStatistic::Average), Some(0.25));
+        assert_eq!(panel.value(0, 1, ReportStatistic::Average), Some(0.25));
+        let csv = panel.csv();
+        assert!(csv.contains("330 ft") && csv.contains("0.25") && csv.contains("Main"));
+    }
+
+    #[test]
+    fn drag_reports_use_run_splits_official_elapsed_times_and_stage_reports_exclude_transport() {
+        let mut shared = state();
+        let key = shared.recording_key().to_string();
+        let a = shared.recording_analyses.get_mut(&key).unwrap();
+        a.ranges[0].kind = i3rs_core::ranges::RangeKind::Transport;
+        a.ranges[1].kind = i3rs_core::ranges::RangeKind::Run;
+        a.ranges[1].reaction_time = Some(0.4);
+        let id = a.ranges[1].id.clone();
+        a.drag_runs.insert(
+            id,
+            i3rs_core::drag::RunDetails {
+                elapsed: [Some(0.3), Some(0.8), Some(1.3), Some(2.), Some(2.5)],
+            },
+        );
+        shared.selected_lap = Some(1);
+        let mut settings = ReportSettings {
+            scope: ReportScope::SelectedRange,
+            drag_milestones: true,
+            range_kind: Some(i3rs_core::ranges::RangeKind::Run),
+            ..Default::default()
+        };
+        let (groups, error) = report_groups(&settings, &shared);
+        assert!(error.is_none());
+        assert_eq!(groups.len(), 5);
+        assert_eq!(groups[0].windows, [(1.25, 1.55)]);
+        assert_eq!(groups[1].windows, [(1.55, 2.05)]);
+        assert_eq!(groups[4].windows, [(3.25, 3.75)]);
+        assert_eq!(groups[1].section.as_deref(), Some("drag:330"));
+        settings.drag_cumulative = true;
+        assert_eq!(
+            report_groups(&settings, &shared).0[4].windows,
+            [(1.25, 3.75)]
+        );
+        settings.trusted_only = true;
+        shared.recording_analyses.get_mut(&key).unwrap().ranges[1].trust = Trust::Untrusted;
+        assert!(
+            report_groups(&settings, &shared)
+                .0
+                .iter()
+                .all(|g| g.windows.is_empty())
+        );
+        let a = shared.recording_analyses.get_mut(&key).unwrap();
+        a.ranges[1].kind = i3rs_core::ranges::RangeKind::Stage;
+        settings = ReportSettings {
+            scope: ReportScope::Ranges,
+            range_kind: Some(i3rs_core::ranges::RangeKind::Stage),
+            ..Default::default()
+        };
+        let groups = report_groups(&settings, &shared).0;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].lap_index, Some(1));
+    }
+
     #[test]
     fn scopes_and_trust_use_recording_ranges_and_preserve_off_grid_boundaries() {
         let mut shared = state();
@@ -1230,7 +1501,7 @@ mod tests {
             vec![0., 0.001, 0.002, 0.003, 0.004],
             vec![0.; 5],
             vec![0., 1., 2., 3., 4.],
-            1,
+            1.0,
         )));
         shared.sectors.push(i3rs_core::Sector {
             name: "Across beacon".into(),
@@ -1311,7 +1582,7 @@ mod tests {
         let mut shared = state();
         let mut def =
             shared.create_math_channel_def("Report only".into(), "1".into(), "rpm".into(), 1);
-        def.freq = 1;
+        def.freq = 1.0;
         def.data = Some(Arc::from(vec![1., 2., 3., 4.]));
         shared.math_channels.push(def);
         let mut panel = ReportPanel::new(7, "Configured report");
@@ -1328,6 +1599,7 @@ mod tests {
             highlight_min: true,
             highlight_max: true,
             chart_statistic: ReportStatistic::Change,
+            chart_statistics: vec![ReportStatistic::Min, ReportStatistic::Max],
             reference: ReportReference::Overlay0,
             split_horizontal: true,
             channel_statistics: vec![Some(vec![ReportStatistic::Range])],
@@ -1352,17 +1624,36 @@ mod tests {
         assert!(shared.display_channel_registry.is_empty());
     }
     #[test]
+    fn profile_charts_use_each_channels_selected_statistics() {
+        use ReportStatistic::{Average, Max, Min};
+        let mut panel = ReportPanel::new(1, "Stages");
+        panel.settings.statistics = vec![Min, Max, Average];
+        panel.settings.chart_statistics = vec![Min, Max, Average];
+        panel.settings.channel_statistics = vec![Some(vec![Min]), None, Some(vec![Max])];
+        assert_eq!(panel.chart_statistics(0), vec![Min]);
+        assert_eq!(panel.chart_statistics(1), vec![Min, Max, Average]);
+        assert_eq!(panel.chart_statistics(2), vec![Max]);
+        panel.settings.kind = ReportKind::Time;
+        assert_eq!(panel.chart_statistics(0), vec![Average]);
+    }
+
+    #[test]
     fn every_view_and_orientation_renders_without_mutating_shared_selection_or_results() {
         let mut shared = state();
         shared.select_lap(Some(1));
         let mut def =
             shared.create_math_channel_def("Report only".into(), "1".into(), "rpm".into(), 1);
-        def.freq = 1;
+        def.freq = 1.0;
         def.data = Some(Arc::from(vec![0., 10., 20., 30.]));
         shared.math_channels.push(def);
         let mut panel = ReportPanel::new(1, "Report");
         panel.add_channel(ChannelId::Math(0), &shared);
         panel.settings.statistics = ReportStatistic::ALL.into();
+        panel.settings.chart_statistics = vec![
+            ReportStatistic::Min,
+            ReportStatistic::Max,
+            ReportStatistic::Average,
+        ];
         let ctx = egui::Context::default();
         let mut expected = None;
         for view in [ReportView::Table, ReportView::Chart, ReportView::Split] {
@@ -1439,7 +1730,7 @@ mod tests {
         shared.ld_file = Some(ld.clone());
         let mut definition =
             shared.create_math_channel_def("Independent".into(), "2".into(), "km/h".into(), 1);
-        definition.freq = 1;
+        definition.freq = 1.0;
         definition.data = Some(Arc::from(vec![999.; 4]));
         shared.math_channels.push(definition);
         shared.comparisons.main_lap = Some(1);
@@ -1474,7 +1765,7 @@ mod tests {
             let mut groups = report_groups(&panel.settings, &shared).0;
             panel.prepare_populations(&mut shared, &registry, &mut groups);
             panel.rebuild(&registry, groups);
-            if panel.external_sources[0][0].freq > 0 {
+            if panel.external_sources[0][0].freq > 0.0 {
                 break;
             }
             assert!(
@@ -1497,7 +1788,7 @@ mod tests {
         let mut groups = report_groups(&panel.settings, &shared).0;
         panel.prepare_populations(&mut shared, &registry, &mut groups);
         assert_eq!(groups.len(), 2);
-        panel.external_sources[0][0].freq = 0;
+        panel.external_sources[0][0].freq = 0.0;
         panel.external_sources[0][0].data = Arc::from([]);
         panel.rebuild(&registry, groups);
         assert_eq!(panel.value(0, 0, ReportStatistic::Average), None);
@@ -1508,7 +1799,7 @@ mod tests {
         shared.select_lap(Some(1));
         let mut definition =
             shared.create_math_channel_def("Speed".into(), "0".into(), "km/h".into(), 1);
-        definition.freq = 1;
+        definition.freq = 1.0;
         definition.data = Some(Arc::from(vec![0., 36., 72., 108., 72., 36., 0.]));
         shared.math_channels.push(definition);
         let mut panel = ReportPanel::new(12, "Acceleration");

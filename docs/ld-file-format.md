@@ -31,7 +31,8 @@ Starts at offset `0x00`. Total parsed size: **0x6E2 bytes** (1762 bytes).
 | 0x10   | 20   | —        | (unknown)        | |
 | 0x24   | 4    | uint32   | event_ptr         | Absolute file offset to the Event block |
 | 0x28   | 24   | —        | (unknown)        | |
-| 0x40   | 2+2+2| uint16×3 | (statics)        | Unknown static values |
+| 0x40   | 2    | —        | (unknown)        | |
+| 0x42   | 4    | uint32   | sample clock     | Observed 1,000,000 modern; 1,024,000 legacy ADL |
 | 0x46   | 4    | uint32   | device_serial    | ECU serial number (e.g. `28299`) |
 | 0x4A   | 8    | char[8]  | device_type      | Device type string (e.g. `"M1"`) |
 | 0x52   | 2    | uint16   | device_version   | Firmware version (e.g. `100` → v1.00, `150` → v1.50) |
@@ -413,3 +414,7 @@ Verification against i2: all 19 May 8 crossings match to the millisecond, includ
 
 - Format originally reverse-engineered by the [gotzl/ldparser](https://github.com/gotzl/ldparser) project.
 - Verified and extended against real Lotus Evora S1 logs from a MoTeC M1 ECU (2025).
+
+### Legacy ADL sample clock
+
+The bundled Drag and Rally samples use header +0x42 = 1,024,000. Their channel metadata rates are nominal: physical rate = nominal × 1.024. Keeping 100 Hz instead of 102.4 Hz shifts the Drag launch from the correct data at 176.750 s by over four seconds. Matched i2 Standard 1.1.4.457 reports verify the factor independently on 100 Hz Drag RPM, 20 Hz Rally RPM/oil pressure and 1 Hz Rally temperature. The parser retains source samples and validity masks and exposes physical rates as `f64`; it does not resample or round the rate. Modern 1,000,000-clock and unspecified-clock producers retain their recorded rates. See [W08 validation](testing/i3r-8-workspace-profiles-2026-10-16.md).

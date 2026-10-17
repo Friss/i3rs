@@ -354,7 +354,7 @@ struct Segment {
 #[derive(Debug, Clone, Copy)]
 enum ResampleMode {
     Native,
-    Hz(u16),
+    Hz(f64),
     Points(usize),
 }
 
@@ -510,10 +510,10 @@ fn ldx_metadata_json(ldx: Option<&LdxFile>) -> Value {
     }
 }
 
-fn frequency_counts(ld: &LdFile) -> BTreeMap<u16, usize> {
-    let mut freq_counts: BTreeMap<u16, usize> = BTreeMap::new();
+fn frequency_counts(ld: &LdFile) -> BTreeMap<String, usize> {
+    let mut freq_counts: BTreeMap<String, usize> = BTreeMap::new();
     for ch in &ld.channels {
-        *freq_counts.entry(ch.freq).or_insert(0) += 1;
+        *freq_counts.entry(ch.freq.to_string()).or_insert(0) += 1;
     }
     freq_counts
 }
@@ -795,9 +795,9 @@ fn parse_resample(input: &str) -> Result<ResampleMode, String> {
     }
     let hz = normalized.strip_suffix("hz").unwrap_or(&normalized);
     let hz = hz
-        .parse::<u16>()
+        .parse::<f64>()
         .map_err(|_| format!("invalid resample mode: {input}"))?;
-    if hz == 0 {
+    if !hz.is_finite() || hz <= 0.0 || hz > 65535.0 {
         return Err("Hz resample value must be greater than zero".into());
     }
     Ok(ResampleMode::Hz(hz))
@@ -924,7 +924,7 @@ fn extract_channel_samples(
             .into_iter()
             .enumerate()
             .map(|(idx, value)| {
-                let absolute_time = (window.start_sample + idx) as f64 / channel.freq as f64;
+                let absolute_time = (window.start_sample + idx) as f64 / channel.freq;
                 ExtractedSample {
                     x: x_value(axis, segment, absolute_time),
                     absolute_time,
@@ -1358,7 +1358,7 @@ fn comparison_times(
     let points = match mode {
         ResampleMode::Native => 200,
         ResampleMode::Points(points) => points,
-        ResampleMode::Hz(hz) => ((reference.duration() * hz as f64).ceil() as usize).max(1),
+        ResampleMode::Hz(hz) => ((reference.duration() * hz).ceil() as usize).max(1),
     };
     let fractions: Vec<f64> = match points {
         0 => Vec::new(),

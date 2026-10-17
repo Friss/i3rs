@@ -482,7 +482,7 @@ impl TrackMapPanel {
         track: &TrackData,
         time: f64,
     ) {
-        let sample_idx = (time * track.freq as f64).round() as usize;
+        let sample_idx = (time * track.freq).round() as usize;
         let sample_idx = sample_idx.min(track.x.len().saturating_sub(1));
 
         if sample_idx >= track.x.len()
@@ -1380,10 +1380,10 @@ mod tests {
                 vec![x, x + 1., x + 2.],
                 vec![0.; 3],
                 vec![0., 1., 2.],
-                1,
+                1.0,
             );
-            track.corrected_speed = Some((vec![speed; 3], 1));
-            track.distance = Some((vec![0., speed, 2. * speed], 1));
+            track.corrected_speed = Some((vec![speed; 3], 1.0));
+            track.distance = Some((vec![0., speed, 2. * speed], 1.0));
             let key = shared.correction_key();
             assert!(shared.apply_correction_result(
                 &key,
@@ -1483,7 +1483,7 @@ mod tests {
         ))
         .unwrap();
         let gear_index = ld.find_channel_by_name("Gear").unwrap().index;
-        ld.channels[gear_index].freq = 1;
+        ld.channels[gear_index].freq = 1.0;
         shared.ld_file = Some(Arc::new(ld));
         shared.laps = vec![Lap {
             name: "Lap 1".into(),
@@ -1507,10 +1507,10 @@ mod tests {
             vec![0.0; 5],
             vec![0.0; 5],
             vec![0.0, 1.0, 2.0, 3.0, 4.0],
-            1,
+            1.0,
         );
-        track.distance = Some((vec![0.0, 10.0, 20.0, 30.0, 40.0], 1));
-        track.corrected_speed = Some((vec![10.0, 20.0, 30.0, 40.0, 50.0], 1));
+        track.distance = Some((vec![0.0, 10.0, 20.0, 30.0, 40.0], 1.0));
+        track.corrected_speed = Some((vec![10.0, 20.0, 30.0, 40.0, 50.0], 1.0));
         let track = Arc::new(track);
         let before = panel.section_annotations(&track, &shared);
         assert_eq!(before.len(), 1);

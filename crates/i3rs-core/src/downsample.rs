@@ -25,15 +25,15 @@ pub struct DownsampledPoint {
 /// per sample with min == max. Otherwise, performs min-max decimation.
 pub fn downsample_minmax(
     samples: &[f64],
-    freq: u16,
+    freq: f64,
     start_sample: usize,
     target_width: usize,
 ) -> Vec<DownsampledPoint> {
-    if samples.is_empty() || target_width == 0 || freq == 0 {
+    if samples.is_empty() || target_width == 0 || freq == 0.0 {
         return vec![];
     }
 
-    let freq_f = freq as f64;
+    let freq_f = freq;
     let n = samples.len();
 
     // If we have few enough samples, return raw points (no downsampling needed)
@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn test_no_downsampling_needed() {
         let samples: Vec<f64> = (0..100).map(|i| i as f64).collect();
-        let result = downsample_minmax(&samples, 10, 0, 100);
+        let result = downsample_minmax(&samples, 10.0, 0, 100);
         assert_eq!(result.len(), 100);
         assert_eq!(result[0].min, 0.0);
         assert_eq!(result[0].max, 0.0);
@@ -111,7 +111,7 @@ mod tests {
     fn test_minmax_decimation() {
         // 1000 samples, target 10 buckets = 100 samples per bucket
         let samples: Vec<f64> = (0..1000).map(|i| (i as f64 * 0.01).sin()).collect();
-        let result = downsample_minmax(&samples, 100, 0, 10);
+        let result = downsample_minmax(&samples, 100.0, 0, 10);
         assert_eq!(result.len(), 10);
         // Each bucket should have min <= max
         for p in &result {
@@ -121,14 +121,14 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let result = downsample_minmax(&[], 10, 0, 100);
+        let result = downsample_minmax(&[], 10.0, 0, 100);
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_with_offset() {
         let samples: Vec<f64> = vec![1.0, 2.0, 3.0];
-        let result = downsample_minmax(&samples, 10, 500, 100);
+        let result = downsample_minmax(&samples, 10.0, 500, 100);
         assert_eq!(result.len(), 3);
         assert!((result[0].time - 50.0).abs() < 1e-9); // sample 500 / 10 Hz
     }
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn decimation_preserves_gaps_even_inside_a_single_bucket() {
         let samples = [1.0, 2.0, f64::NAN, 8.0, 9.0, f64::NAN];
-        let result = downsample_minmax(&samples, 1, 0, 1);
+        let result = downsample_minmax(&samples, 1.0, 0, 1);
         assert_eq!(result.len(), 4);
         assert_eq!((result[0].min, result[0].max), (1.0, 2.0));
         assert!(result[1].min.is_nan());

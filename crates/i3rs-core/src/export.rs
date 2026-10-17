@@ -10,7 +10,7 @@ pub struct ExportChannel<'a> {
     pub unit: &'a str,
     /// Source samples; the display transform is applied when writing each cell.
     pub data: &'a [f64],
-    pub freq: u16,
+    pub freq: f64,
     pub dec_places: i16,
     pub display_scale: f64,
     pub display_offset: f64,
@@ -48,16 +48,16 @@ pub fn export_csv(
         return Err("no channels to export".into());
     }
 
-    let max_freq = channels.iter().map(|c| c.freq).max().unwrap_or(1).max(1);
+    let max_freq = channels.iter().map(|c| c.freq).fold(1.0_f64, f64::max);
     let max_duration = channels
         .iter()
-        .filter(|c| c.freq > 0)
-        .map(|c| c.data.len() as f64 / c.freq as f64)
+        .filter(|c| c.freq > 0.0)
+        .map(|c| c.data.len() as f64 / c.freq)
         .fold(0.0f64, f64::max);
 
     let (t_start, t_end) = time_range.unwrap_or((0.0, max_duration));
-    let start_sample = (t_start * max_freq as f64).floor() as usize;
-    let end_sample = (t_end * max_freq as f64).ceil() as usize;
+    let start_sample = (t_start * max_freq).floor() as usize;
+    let end_sample = (t_end * max_freq).ceil() as usize;
     let n_rows = end_sample.saturating_sub(start_sample);
 
     if n_rows == 0 {
@@ -87,7 +87,7 @@ pub fn export_csv(
             let source_indices = if channel.freq == max_freq {
                 (0..n_rows).map(|row| start_sample + row).collect()
             } else {
-                let ratio = channel.freq as f64 / max_freq as f64;
+                let ratio = channel.freq / max_freq;
                 (0..n_rows)
                     .map(|row| ((start_sample + row) as f64 * ratio).round() as usize)
                     .collect()
@@ -103,7 +103,7 @@ pub fn export_csv(
         .collect();
 
     // Rows
-    let dt = 1.0 / max_freq as f64;
+    let dt = 1.0 / max_freq;
     for row in 0..n_rows {
         let time = (start_sample + row) as f64 * dt;
         write!(writer, "{:.6}", time).map_err(|e| e.to_string())?;
@@ -147,7 +147,7 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             data: &[10.0, 20.0, 30.0],
-            freq: 1,
+            freq: 1.0,
             dec_places: 1,
         };
         let ch2 = ExportChannel {
@@ -156,7 +156,7 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             data: &[1000.0, 2000.0, 3000.0],
-            freq: 1,
+            freq: 1.0,
             dec_places: 0,
         };
 
@@ -184,7 +184,7 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             data: &[10.0, 20.0, 30.0, 40.0, 50.0],
-            freq: 1,
+            freq: 1.0,
             dec_places: 0,
         };
 
@@ -214,7 +214,7 @@ mod tests {
                 name: "Pressure",
                 unit: "psi",
                 data: &[100.0, 200.0],
-                freq: 2,
+                freq: 2.0,
                 dec_places: 3,
                 display_scale: 0.145_037_738,
                 display_offset: 0.0,
@@ -223,7 +223,7 @@ mod tests {
                 name: "Temperature",
                 unit: "°F",
                 data: &[0.0, 100.0],
-                freq: 1,
+                freq: 1.0,
                 dec_places: 1,
                 display_scale: 1.8,
                 display_offset: 32.0,
@@ -245,7 +245,7 @@ mod tests {
                 name: "Pressure, \"left\"",
                 unit: "psi",
                 data: &[1.0, f64::MAX, f64::INFINITY, f64::NAN],
-                freq: 1,
+                freq: 1.0,
                 dec_places: 0,
                 display_scale: -2.0,
                 display_offset: 10.0,
@@ -254,7 +254,7 @@ mod tests {
                 name: "State",
                 unit: "",
                 data: &[1.0],
-                freq: 1,
+                freq: 1.0,
                 dec_places: 0,
                 display_scale: 1.0,
                 display_offset: 0.0,
@@ -277,7 +277,7 @@ mod tests {
             display_scale: 1.0,
             display_offset: 0.0,
             data: &[0.895, f64::NAN, 1.020],
-            freq: 1,
+            freq: 1.0,
             dec_places: 3,
         };
         export_csv(&path, &[channel], Some((0.0, 4.0))).unwrap();

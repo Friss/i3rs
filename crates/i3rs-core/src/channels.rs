@@ -99,18 +99,21 @@ impl Default for ChannelMapping {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MathOptions {
+    /// Owner of generated definitions, independent of editable comments/names.
+    pub generator: Option<String>,
     pub source: String,
     pub recording: Option<String>,
     pub quantity: String,
     pub display_unit: Option<String>,
     pub comment: String,
     pub enum_labels: BTreeMap<i64, String>,
-    pub output_freq: Option<u16>,
+    pub output_freq: Option<f64>,
     pub interpolation: Interpolation,
 }
 impl Default for MathOptions {
     fn default() -> Self {
         Self {
+            generator: None,
             source: "User".into(),
             recording: None,
             quantity: String::new(),
@@ -276,14 +279,14 @@ pub fn component_gate_includes(value: f64) -> bool {
 /// Sample a result with an explicit interpolation policy, retaining missing data.
 pub fn sample_with_policy(
     data: &[f64],
-    freq: u16,
+    freq: f64,
     time: f64,
     policy: Interpolation,
 ) -> Option<f64> {
-    if freq == 0 || !time.is_finite() || time < 0.0 {
+    if freq == 0.0 || !time.is_finite() || time < 0.0 {
         return None;
     }
-    sample_at_position_with_policy(data, time * freq as f64, policy)
+    sample_at_position_with_policy(data, time * freq, policy)
 }
 
 pub(crate) fn sample_at_position_with_policy(
@@ -326,7 +329,7 @@ pub fn unit_transform(from: &str, to: &str) -> Result<(f64, f64), String> {
             "in/s" => Some(("speed", 0.0254, 0.0)),
             "m/s" => Some(("speed", 1.0, 0.0)),
             "km/h" | "kph" => Some(("speed", 1.0 / 3.6, 0.0)),
-            "mph" => Some(("speed", 0.44704, 0.0)),
+            "mph" | "mile/h" | "mi/h" => Some(("speed", 0.44704, 0.0)),
             "m/s/s" | "m/s²" | "m/s^2" => Some(("acceleration", 1.0, 0.0)),
             "g" => Some(("acceleration", 9.80665, 0.0)),
             "rad" => Some(("angle", 1.0, 0.0)),

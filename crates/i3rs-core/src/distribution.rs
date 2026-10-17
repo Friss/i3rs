@@ -50,9 +50,9 @@ pub struct IntervalAverage {
 /// Average native samples with an optional positive-value gate, aligned by time.
 pub fn interval_averages(
     data: &[f64],
-    hz: u16,
+    hz: f64,
     intervals: &[(f64, f64)],
-    gate: Option<(&[f64], u16)>,
+    gate: Option<(&[f64], f64)>,
 ) -> Vec<IntervalAverage> {
     intervals
         .iter()
@@ -69,7 +69,7 @@ pub fn interval_averages(
                     crate::channels::sample_with_policy(
                         g,
                         f,
-                        i as f64 / hz as f64,
+                        i as f64 / hz,
                         crate::Interpolation::Previous,
                     )
                     .is_some_and(crate::component_gate_includes)
@@ -113,15 +113,14 @@ impl Default for GearFilter {
 /// Centered least-squares RPM slope over the configured time window, then a
 /// non-retriggering exclusion period. The odd window includes its center sample.
 /// Missing values invalidate the entire slope window; gaps are never bridged.
-pub fn gear_filter_mask(rpm: &[f64], hz: u16, settings: GearFilter) -> Vec<bool> {
+pub fn gear_filter_mask(rpm: &[f64], hz: f64, settings: GearFilter) -> Vec<bool> {
     if !settings.enabled {
         return vec![true; rpm.len()];
     }
-    if hz == 0 {
+    if hz == 0.0 {
         return vec![false; rpm.len()];
     }
-    let width =
-        ((settings.rpm_filter_seconds.max(0.) * hz as f64).round() as usize).clamp(1, 100001) | 1;
+    let width = ((settings.rpm_filter_seconds.max(0.) * hz).round() as usize).clamp(1, 100001) | 1;
     let half = width / 2;
     let mut until = f64::NEG_INFINITY;
     let mut mask = vec![false; rpm.len()];
@@ -130,7 +129,7 @@ pub fn gear_filter_mask(rpm: &[f64], hz: u16, settings: GearFilter) -> Vec<bool>
             if i == 0 {
                 Some(0.)
             } else {
-                Some((rpm[i] - rpm[i - 1]) * hz as f64)
+                Some((rpm[i] - rpm[i - 1]) * hz)
             }
         } else if i >= half && i + half < rpm.len() {
             let segment = &rpm[i - half..=i + half];
@@ -138,7 +137,7 @@ pub fn gear_filter_mask(rpm: &[f64], hz: u16, settings: GearFilter) -> Vec<bool>
                 let mut numerator = 0.;
                 let mut denominator = 0.;
                 for (j, &v) in segment.iter().enumerate() {
-                    let t = (j as f64 - half as f64) / hz as f64;
+                    let t = (j as f64 - half as f64) / hz;
                     numerator += t * v;
                     denominator += t * t;
                 }
@@ -149,7 +148,7 @@ pub fn gear_filter_mask(rpm: &[f64], hz: u16, settings: GearFilter) -> Vec<bool>
         } else {
             None
         };
-        let time = i as f64 / hz as f64;
+        let time = i as f64 / hz;
         if !rpm[i].is_finite() {
             continue;
         }
@@ -176,15 +175,15 @@ pub struct SuspensionSummary {
 
 /// Backward velocity; positive means bump unless inverted. Missing position
 /// produces missing velocity on both sides of the gap. Units follow position/s.
-pub fn suspension_velocity(position: &[f64], hz: u16, invert: bool) -> Vec<f64> {
+pub fn suspension_velocity(position: &[f64], hz: f64, invert: bool) -> Vec<f64> {
     let mut velocity = vec![f64::NAN; position.len()];
-    if hz == 0 {
+    if hz == 0.0 {
         return velocity;
     }
     let sign = if invert { -1. } else { 1. };
     for i in 1..position.len() {
         if position[i].is_finite() && position[i - 1].is_finite() {
-            velocity[i] = (position[i] - position[i - 1]) * hz as f64 * sign;
+            velocity[i] = (position[i] - position[i - 1]) * hz * sign;
         }
     }
     velocity
@@ -233,9 +232,9 @@ mod tests {
     fn interval_population_is_native_half_open_with_signed_mixed_rate_gate() {
         let r = interval_averages(
             &[0., 1., 2., 3., 4., 5.],
-            2,
+            2.0,
             &[(0.25, 2.5)],
-            Some((&[-1., 1., f64::NAN], 1)),
+            Some((&[-1., 1., f64::NAN], 1.0)),
         );
         assert_eq!((r[0].count, r[0].mean), (2, Some(2.5)));
     }
@@ -258,15 +257,15 @@ mod tests {
             f64::NAN,
         ];
         assert_eq!(
-            gear_filter_mask(&rpm, 10, s),
+            gear_filter_mask(&rpm, 10.0, s),
             [true, true, false, false, false, false, false, true, false]
         );
         s.enabled = false;
-        assert!(gear_filter_mask(&rpm, 10, s).iter().all(|v| *v));
+        assert!(gear_filter_mask(&rpm, 10.0, s).iter().all(|v| *v));
     }
     #[test]
     fn suspension_split_inversion_and_gaps() {
-        let v = suspension_velocity(&[0., 1., 0., f64::NAN, 2., 2.], 10, false);
+        let v = suspension_velocity(&[0., 1., 0., f64::NAN, 2., 2.], 10.0, false);
         let s = suspension_summary(&v, 0.1);
         assert_eq!(
             (s.bump_count, s.rebound_count, s.stationary_count),
@@ -274,7 +273,7 @@ mod tests {
         );
         assert_eq!((s.bump_mean, s.rebound_mean), (Some(10.), Some(-10.)));
         assert!(v[3].is_nan() && v[4].is_nan());
-        assert_eq!(suspension_velocity(&[0., 1.], 10, true)[1], -10.);
+        assert_eq!(suspension_velocity(&[0., 1.], 10.0, true)[1], -10.);
     }
 }
 
@@ -308,7 +307,7 @@ pub struct SuspensionSplit {
 }
 pub fn filtered_suspension_velocity(
     position: &[f64],
-    hz: u16,
+    hz: f64,
     settings: SuspensionSettings,
 ) -> Vec<f64> {
     let velocity = if settings.input_is_velocity {
@@ -319,8 +318,7 @@ pub fn filtered_suspension_velocity(
     } else {
         suspension_velocity(position, hz, settings.invert)
     };
-    let width =
-        ((settings.filter_seconds.max(0.) * hz as f64).round() as usize).clamp(1, 100001) | 1;
+    let width = ((settings.filter_seconds.max(0.) * hz).round() as usize).clamp(1, 100001) | 1;
     if width == 1 {
         return velocity;
     }
@@ -379,7 +377,7 @@ mod specialized_tests {
             ..Default::default()
         };
         let position = [0., 1., 2., 3., 4., f64::NAN, 6., 7., 8., 9.];
-        let velocity = filtered_suspension_velocity(&position, 10, s);
+        let velocity = filtered_suspension_velocity(&position, 10.0, s);
         assert_eq!(velocity[2], 10.);
         assert!(velocity[4..8].iter().all(|v| v.is_nan()));
         let split = suspension_split(&[0., 10., 10.1, -10., -10.1, f64::NAN], s);
@@ -394,9 +392,9 @@ mod specialized_tests {
             (5, 1, 1, 1, 1)
         );
         let inverse =
-            filtered_suspension_velocity(&position, 10, SuspensionSettings { invert: true, ..s });
+            filtered_suspension_velocity(&position, 10.0, SuspensionSettings { invert: true, ..s });
         assert_eq!(inverse[2], -10.);
-        let slow = filtered_suspension_velocity(&[0., 0.5, 1., 1.5, 2.], 2, Default::default());
+        let slow = filtered_suspension_velocity(&[0., 0.5, 1., 1.5, 2.], 2.0, Default::default());
         assert_eq!(&slow[1..], &[1., 1., 1., 1.]);
     }
     #[test]
@@ -404,7 +402,7 @@ mod specialized_tests {
         let rpm: Vec<_> = (0..30).map(|i| 1000. + 300. * i as f64).collect();
         let mut mask = gear_filter_mask(
             &rpm,
-            10,
+            10.0,
             GearFilter {
                 enabled: true,
                 rpm_filter_seconds: 0.3,
@@ -416,7 +414,7 @@ mod specialized_tests {
         missing[10] = f64::NAN;
         mask = gear_filter_mask(
             &missing,
-            10,
+            10.0,
             GearFilter {
                 enabled: true,
                 ..Default::default()
@@ -562,7 +560,7 @@ pub fn suspension_histogram(velocity: &[f64], bins: usize, limit: f64) -> Vec<cr
 pub fn suspension_histogram_csv(
     series: &str,
     unit: &str,
-    hz: u16,
+    hz: f64,
     range: (f64, f64),
     bins: &[crate::HistogramBin],
     header: bool,
@@ -583,7 +581,7 @@ pub fn suspension_histogram_csv(
             quote(unit),
             bin.count,
             100. * bin.count as f64 / count.max(1) as f64,
-            bin.count as f64 / hz.max(1) as f64,
+            bin.count as f64 / hz.max(1.0),
             range.0,
             range.1
         ));
@@ -600,7 +598,7 @@ mod suspension_distribution_tests {
             bins.iter().map(|b| b.count).collect::<Vec<_>>(),
             [1, 1, 1, 2]
         );
-        let csv = suspension_histogram_csv("Damper FL", "mm/s", 2, (0., 3.), &bins, true);
+        let csv = suspension_histogram_csv("Damper FL", "mm/s", 2.0, (0., 3.), &bins, true);
         assert!(csv.contains("\"mm/s\",2,40.000000000000,1.000000000000,0.000000000,3.000000000"));
     }
 }

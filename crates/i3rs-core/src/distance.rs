@@ -15,16 +15,16 @@ pub const SPEED_FALLBACKS: [&str; 7] = [
 
 /// Use the faster valid front wheel at each time, after converting both to m/s.
 /// A missing sample in one wheel does not discard the other wheel's valid speed.
-pub fn fastest_speed(a: (&[f64], u16, &str), b: (&[f64], u16, &str)) -> Option<(Vec<f64>, u16)> {
+pub fn fastest_speed(a: (&[f64], f64, &str), b: (&[f64], f64, &str)) -> Option<(Vec<f64>, f64)> {
     let (sa, sb) = (speed_unit_to_mps(a.2)?, speed_unit_to_mps(b.2)?);
     let freq = a.1.max(b.1);
-    if a.1 == 0 || b.1 == 0 {
+    if a.1 == 0.0 || b.1 == 0.0 {
         return None;
     }
-    let duration = (a.0.len() as f64 / a.1 as f64).max(b.0.len() as f64 / b.1 as f64);
-    let data = (0..(duration * freq as f64).ceil() as usize)
+    let duration = (a.0.len() as f64 / a.1).max(b.0.len() as f64 / b.1);
+    let data = (0..(duration * freq).ceil() as usize)
         .map(|i| {
-            let t = i as f64 / freq as f64;
+            let t = i as f64 / freq;
             let av = sample_at_time(a.0, a.1, t).map(|v| v * sa);
             let bv = sample_at_time(b.0, b.1, t).map(|v| v * sb);
             match (av, bv) {
@@ -51,7 +51,7 @@ pub enum SpeedSource<'a> {
 pub fn corrected_speed_source(ld: &LdFile) -> Option<SpeedSource<'_>> {
     let usable = |name| {
         ld.find_channel_by_name(name).filter(|c| {
-            c.freq > 0
+            c.freq > 0.0
                 && c.n_data > 0
                 && c.data_type.bytes_per_sample().is_some()
                 && speed_unit_to_mps(&c.unit).is_some()
@@ -73,7 +73,7 @@ pub fn corrected_speed_source(ld: &LdFile) -> Option<SpeedSource<'_>> {
 }
 
 /// Corrected speed from [`corrected_speed_source`], in m/s.
-pub fn corrected_speed_from_ld(ld: &LdFile) -> Option<(Vec<f64>, u16)> {
+pub fn corrected_speed_from_ld(ld: &LdFile) -> Option<(Vec<f64>, f64)> {
     match corrected_speed_source(ld)? {
         SpeedSource::Single(c) => {
             let scale = speed_unit_to_mps(&c.unit)?;
@@ -87,8 +87,8 @@ pub fn corrected_speed_from_ld(ld: &LdFile) -> Option<(Vec<f64>, u16)> {
     }
 }
 
-pub fn integrate_speed_series(data: &[f64], freq: u16, unit: &str) -> Option<Vec<f64>> {
-    if freq == 0 {
+pub fn integrate_speed_series(data: &[f64], freq: f64, unit: &str) -> Option<Vec<f64>> {
+    if freq == 0.0 {
         return None;
     }
 
@@ -97,7 +97,7 @@ pub fn integrate_speed_series(data: &[f64], freq: u16, unit: &str) -> Option<Vec
         return Some(Vec::new());
     }
 
-    let dt = 1.0 / freq as f64;
+    let dt = 1.0 / freq;
     let mut result = Vec::with_capacity(data.len());
     let mut sum = 0.0;
     result.push(0.0);
@@ -120,7 +120,7 @@ pub fn speed_unit_to_mps(unit: &str) -> Option<f64> {
     let normalized = unit.to_ascii_lowercase().replace(' ', "");
     if normalized.contains("km/h") || normalized.contains("kmh") || normalized.contains("kph") {
         Some(1.0 / 3.6)
-    } else if normalized.contains("mph") {
+    } else if normalized.contains("mph") || normalized == "mile/h" || normalized == "mi/h" {
         Some(MPS_PER_MPH)
     } else if normalized.contains("m/s") || normalized.contains("mps") {
         Some(1.0)
@@ -162,7 +162,7 @@ mod tests {
             let mut channel = base.clone();
             channel.index = index;
             channel.name = name.into();
-            channel.freq = 10;
+            channel.freq = 10.0;
             channel.unit = "m/s".into();
             channel
         })
@@ -176,7 +176,7 @@ mod tests {
             matches!(corrected_speed_source(&ld), Some(SpeedSource::Single(c)) if c.index == 2)
         );
         let (data, freq) = corrected_speed_from_ld(&ld).unwrap();
-        assert_eq!(freq, 10);
+        assert_eq!(freq, 10.0);
         assert_eq!(
             data.len(),
             ld.read_channel_data(&ld.channels[2]).unwrap().len()
@@ -185,24 +185,24 @@ mod tests {
         assert!(
             matches!(corrected_speed_source(&ld), Some(SpeedSource::Single(c)) if c.index == 3)
         );
-        ld.channels[3].freq = 0;
+        ld.channels[3].freq = 0.0;
         assert!(corrected_speed_source(&ld).is_none());
     }
 
     #[test]
     fn fastest_wheel_converts_units_and_preserves_one_valid_source() {
         let (speed, freq) = fastest_speed(
-            (&[36., f64::NAN, 18.], 1, "km/h"),
-            (&[5., 8., f64::NAN], 1, "m/s"),
+            (&[36., f64::NAN, 18.], 1.0, "km/h"),
+            (&[5., 8., f64::NAN], 1.0, "m/s"),
         )
         .unwrap();
-        assert_eq!(freq, 1);
+        assert_eq!(freq, 1.0);
         assert_eq!(speed, [10., 8., 5.]);
         assert_eq!(
-            integrate_speed_series(&speed, 1, "m/s").unwrap(),
+            integrate_speed_series(&speed, 1.0, "m/s").unwrap(),
             [0., 9., 15.5]
         );
-        assert!(fastest_speed((&[1.], 0, "km/h"), (&[1.], 1, "mph")).is_none());
-        assert!(fastest_speed((&[1.], 1, "rpm"), (&[1.], 1, "mph")).is_none());
+        assert!(fastest_speed((&[1.], 0.0, "km/h"), (&[1.], 1.0, "mph")).is_none());
+        assert!(fastest_speed((&[1.], 1.0, "rpm"), (&[1.], 1.0, "mph")).is_none());
     }
 }

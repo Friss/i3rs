@@ -4,7 +4,9 @@ use super::*;
 pub(super) struct SourceContext {
     key: String,
     state: SharedState,
-    track: Option<std::sync::mpsc::Receiver<Option<i3rs_core::TrackData>>>,
+    track: Option<
+        std::sync::mpsc::Receiver<Result<i3rs_core::corrections::CorrectedRecording, String>>,
+    >,
 }
 impl SourceContext {
     pub(super) fn is_loading(&self) -> bool {
@@ -77,7 +79,7 @@ impl ReportPanel {
     }
     fn reference_value(&self, r: usize, c: usize, g: usize, stat: ReportStatistic) -> Option<f64> {
         // Section headings compare the corresponding section, never a whole-lap value.
-        if self.settings.sections_as_headings {
+        if self.settings.sections_as_headings || self.settings.drag_milestones {
             let section = self.groups[g].section.as_ref()?;
             let source = self.reference_groups[r]
                 .iter()
@@ -119,8 +121,11 @@ impl ReportPanel {
                 .get(si)
                 .is_none_or(|c| c.key != key)
             {
-                let mut state =
-                    crate::comparison::recording_context(shared, session.ld_file.clone());
+                let mut state = crate::comparison::recording_context_from_path(
+                    shared,
+                    session.ld_file.clone(),
+                    &session.path,
+                );
                 state.laps = state
                     .current_analysis()
                     .map_or_else(|| session.laps.clone(), |a| a.laps());
@@ -137,7 +142,9 @@ impl ReportPanel {
                 }
             }
             let context = &mut self.population_contexts[si];
-            if (self.settings.section_id.is_some() || self.settings.sections_as_headings)
+            if (self.settings.section_id.is_some()
+                || self.settings.sections_as_headings
+                || self.settings.drag_milestones)
                 && context.track.is_none()
                 && !context.state.corrections_settled()
             {
@@ -148,9 +155,7 @@ impl ReportPanel {
                 context.track = Some(rx);
                 let work = move || {
                     let track =
-                        i3rs_core::corrections::build_corrected_recording(&ld, &corrections, &laps)
-                            .ok()
-                            .and_then(|r| r.track);
+                        i3rs_core::corrections::build_corrected_recording(&ld, &corrections, &laps);
                     let _ = tx.send(track);
                 };
                 #[cfg(not(target_arch = "wasm32"))]
@@ -161,7 +166,8 @@ impl ReportPanel {
             if let Some(rx) = &context.track {
                 match rx.try_recv() {
                     Ok(track) => {
-                        context.state.store_track_data(track);
+                        let key = context.state.correction_key();
+                        context.state.apply_correction_result(&key, track);
                         context.track = None;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -194,11 +200,11 @@ impl ReportPanel {
                             crate::comparison::reference_interpolation(&context.state, &slot.name);
                     } else {
                         info.data = std::sync::Arc::from([]);
-                        info.freq = 0;
+                        info.freq = 0.0;
                     }
                 } else {
                     info.data = std::sync::Arc::from([]);
-                    info.freq = 0;
+                    info.freq = 0.0;
                 }
                 infos.push(info);
             }
@@ -306,7 +312,10 @@ fn cached_groups(
             settings.trusted_only,
             &settings.section_id,
             settings.sections_as_headings,
-            settings.reverse
+            settings.reverse,
+            settings.range_kind,
+            settings.drag_milestones,
+            settings.drag_cumulative,
         ),
         (
             shared.recording_key(),
@@ -316,11 +325,17 @@ fn cached_groups(
             shared.data_duration
         ),
         shared.laps,
-        shared.current_analysis().map(|a| &a.ranges),
+        shared.current_analysis().map(|a| (&a.ranges, &a.drag_runs)),
         shared.sectors,
-        shared
-            .track_data_if_ready()
-            .map(|t| std::sync::Arc::as_ptr(&t) as usize)
+        (
+            shared
+                .track_data_if_ready()
+                .map(|t| std::sync::Arc::as_ptr(&t) as usize),
+            shared
+                .correction_distance
+                .as_ref()
+                .map(|(d, _)| d.as_ptr() as usize)
+        )
     );
     if let Some(rows) = cache.get(&key) {
         return rows.clone();

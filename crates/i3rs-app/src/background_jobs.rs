@@ -64,7 +64,7 @@ pub struct DecodedPhysicalChannel {
 
 pub struct EvaluatedMathChannel {
     pub samples: Vec<f64>,
-    pub freq: u16,
+    pub freq: f64,
     pub stats: ChannelStats,
 }
 
@@ -92,7 +92,7 @@ pub enum JobResult {
     },
 }
 
-fn read_analysis_sidecar(
+pub(crate) fn read_analysis_sidecar(
     path: &std::path::Path,
     ld: &LdFile,
 ) -> (Option<i3rs_core::ranges::RecordingAnalysis>, Option<String>) {
@@ -132,7 +132,15 @@ fn perform_load_session(source: LoadSessionSource) -> Result<LoadedSession, Stri
             let data_duration = ld.duration_secs();
             // Compute source identity in the load job, before UI metadata needs it.
             ld.recording_id();
-            let (analysis, analysis_warning) = read_analysis_sidecar(&path, &ld);
+            let (mut analysis, mut analysis_warning) = read_analysis_sidecar(&path, &ld);
+            if analysis.is_none()
+                && let Some(ldx) = &ldx
+            {
+                match ldx.specialty_analysis(ld.recording_id().into(), data_duration) {
+                    Ok(imported) => analysis = imported,
+                    Err(error) => analysis_warning = Some(format!("LDX analysis: {error}")),
+                }
+            }
             let ld = std::sync::Arc::new(ld);
             let laps = {
                 let _perf = crate::perf_metrics::scope("lap detection");
@@ -160,6 +168,12 @@ fn perform_load_session(source: LoadSessionSource) -> Result<LoadedSession, Stri
         } => {
             let ld = LdFile::from_bytes(bytes)?;
             let data_duration = ld.duration_secs();
+            let (analysis, analysis_warning) = ldx.as_ref().map_or((None, None), |ldx| {
+                match ldx.specialty_analysis(ld.recording_id().into(), data_duration) {
+                    Ok(a) => (a, None),
+                    Err(e) => (None, Some(format!("LDX analysis: {e}"))),
+                }
+            });
             // Compute source identity in the load job, before UI metadata needs it.
             ld.recording_id();
             let ld = std::sync::Arc::new(ld);
@@ -178,8 +192,8 @@ fn perform_load_session(source: LoadSessionSource) -> Result<LoadedSession, Stri
                 ld,
                 laps,
                 data_duration,
-                analysis: None,
-                analysis_warning: None,
+                analysis,
+                analysis_warning,
             })
         }
     }
@@ -272,7 +286,7 @@ async fn perform_build_track_data_cooperative(
     }
     let gps_speed = ld
         .find_channel_by_name("GPS Speed")
-        .filter(|c| c.freq > 0)
+        .filter(|c| c.freq > 0.0)
         .and_then(|c| {
             let scale = i3rs_core::distance::speed_unit_to_mps(&c.unit)?;
             Some((

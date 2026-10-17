@@ -83,7 +83,7 @@ pub struct Comparisons {
     pub sessions: Vec<OverlaySession>,
 }
 
-pub type ResolvedSeries = Result<(Arc<[f64]>, u16), String>;
+pub type ResolvedSeries = Result<(Arc<[f64]>, f64), String>;
 
 /// Copy definitions and settings, never cached results from another recording.
 pub fn recording_context(shared: &SharedState, ld: Arc<i3rs_core::LdFile>) -> SharedState {
@@ -108,19 +108,51 @@ pub fn recording_context(shared: &SharedState, ld: Arc<i3rs_core::LdFile>) -> Sh
             def
         })
         .collect();
+    context.sync_drag_math();
+    context
+}
+
+pub fn recording_context_from_path(
+    shared: &SharedState,
+    ld: Arc<i3rs_core::LdFile>,
+    path: &std::path::Path,
+) -> SharedState {
+    let mut context = recording_context(shared, ld.clone());
+    if context.current_analysis().is_none() {
+        let (saved, warning) = crate::background_jobs::read_analysis_sidecar(path, &ld);
+        if let Some(warning) = warning {
+            context.message(warning);
+        }
+        let imported = saved.or_else(|| {
+            i3rs_core::find_ldx_for_ld(path).and_then(|ldx| {
+                match ldx.specialty_analysis(ld.recording_id().into(), ld.duration_secs()) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        context.message(format!("LDX analysis: {e}"));
+                        None
+                    }
+                }
+            })
+        });
+        if let Some(a) = imported {
+            context.laps = a.laps();
+            context.recording_analyses.insert(a.recording.clone(), a);
+            context.sync_drag_math();
+        }
+    }
     context
 }
 
 pub fn evaluate_channel(
     context: &SharedState,
     reference: &str,
-) -> Result<(Vec<f64>, u16, String), String> {
+) -> Result<(Vec<f64>, f64, String), String> {
     fn resolve(
         context: &SharedState,
         reference: &str,
         visiting: &mut HashSet<u64>,
-        cache: &mut HashMap<String, (Vec<f64>, u16, String)>,
-    ) -> Result<(Vec<f64>, u16, String), String> {
+        cache: &mut HashMap<String, (Vec<f64>, f64, String)>,
+    ) -> Result<(Vec<f64>, f64, String), String> {
         if let Some(result) = cache.get(reference) {
             return Ok(result.clone());
         }
@@ -144,7 +176,7 @@ pub fn evaluate_channel(
                     let c = &context.channel_settings.constants[idx];
                     (
                         vec![c.value; context.data_duration.unwrap_or(0.).ceil() as usize],
-                        1,
+                        1.0,
                         c.unit.clone(),
                     )
                 }
@@ -383,7 +415,7 @@ pub fn overlay_populations_in_range(
             OverlaySource::External(i) => comparisons
                 .sessions
                 .get(i)
-                .map(|s| recording_context(shared, s.ld_file.clone())),
+                .map(|s| recording_context_from_path(shared, s.ld_file.clone(), &s.path)),
         };
         let source = context.as_ref().unwrap_or(shared);
         let lap = match overlay.source {
@@ -607,15 +639,15 @@ fn mapped_time_range(
     (a.is_finite() && b.is_finite() && b > a).then_some((a, b))
 }
 fn mapped_distance_range(
-    main: (&[f64], u16),
-    source: (&[f64], u16),
+    main: (&[f64], f64),
+    source: (&[f64], f64),
     ml: &i3rs_core::Lap,
     sl: &i3rs_core::Lap,
     range: (f64, f64),
     offset: f64,
     stretch: bool,
 ) -> Option<(f64, f64)> {
-    let sample = |axis: (&[f64], u16), t| i3rs_core::sample_at_time(axis.0, axis.1, t);
+    let sample = |axis: (&[f64], f64), t| i3rs_core::sample_at_time(axis.0, axis.1, t);
     let m0 = sample(main, ml.start_time)?;
     let s0 = sample(source, sl.start_time)?;
     let scale = if stretch {
@@ -625,7 +657,7 @@ fn mapped_distance_range(
     };
     let shift = sample(
         source,
-        (sl.start_time + offset).clamp(0., source.0.len() as f64 / source.1.max(1) as f64),
+        (sl.start_time + offset).clamp(0., source.0.len() as f64 / source.1.max(1.0)),
     )? - s0;
     let inverse = |distance: f64| {
         let w =
@@ -645,7 +677,7 @@ fn mapped_distance_range(
             return Some(sl.end_time);
         }
         let fraction = (distance - values[i - 1]) / (values[i] - values[i - 1]).max(f64::EPSILON);
-        Some((w.start_sample + i - 1) as f64 / source.1 as f64 + fraction / source.1 as f64)
+        Some((w.start_sample + i - 1) as f64 / source.1 + fraction / source.1)
     };
     let a = inverse((sample(main, range.0)? - m0 - shift) / scale + s0)?;
     let b = inverse((sample(main, range.1)? - m0 - shift) / scale + s0)?;
@@ -784,11 +816,11 @@ mod alignment_tests {
         let md: Vec<_> = (0..=20).map(|i| i as f64 * 10.).collect();
         let sd: Vec<_> = (0..=30).map(|i| i as f64 * 5.).collect();
         assert_eq!(
-            mapped_distance_range((&md, 1), (&sd, 1), &main, &source, (2., 8.), 0., false),
+            mapped_distance_range((&md, 1.0), (&sd, 1.0), &main, &source, (2., 8.), 0., false),
             Some((4., 16.))
         );
         assert_eq!(
-            mapped_distance_range((&md, 1), (&sd, 1), &main, &source, (2., 8.), 2., false),
+            mapped_distance_range((&md, 1.0), (&sd, 1.0), &main, &source, (2., 8.), 2., false),
             Some((2., 14.))
         );
         assert_eq!(
@@ -802,8 +834,8 @@ mod alignment_tests {
         let missing = [0., f64::NAN, 10.];
         assert!(
             mapped_distance_range(
-                (&md, 1),
-                (&missing, 1),
+                (&md, 1.0),
+                (&missing, 1.0),
                 &main,
                 &lap(0., 2.),
                 (0., 1.),

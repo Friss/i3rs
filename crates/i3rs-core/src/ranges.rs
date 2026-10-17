@@ -58,7 +58,7 @@ pub struct AnalysisRange {
     pub trust: Trust,
     #[serde(default)]
     pub comment: String,
-    /// Optional reaction time for a drag run, in seconds. W08 adds time-slip reports.
+    /// Optional reaction time for a drag run, in seconds; excluded from elapsed times.
     #[serde(default)]
     pub reaction_time: Option<f64>,
 }
@@ -106,6 +106,8 @@ pub struct GpsGeneration {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecordingAnalysis {
+    pub drag_setup: crate::drag::DragSetup,
+    pub drag_runs: BTreeMap<String, crate::drag::RunDetails>,
     pub version: u32,
     pub recording: String,
     pub duration: f64,
@@ -121,6 +123,8 @@ pub struct RecordingAnalysis {
 impl Default for RecordingAnalysis {
     fn default() -> Self {
         Self {
+            drag_setup: Default::default(),
+            drag_runs: Default::default(),
             version: 1,
             recording: String::new(),
             duration: 0.,
@@ -166,6 +170,15 @@ impl RecordingAnalysis {
         }
     }
     pub fn validate(&self) -> Result<(), String> {
+        self.drag_setup.validate()?;
+        for (id, slip) in &self.drag_runs {
+            let run = self
+                .ranges
+                .iter()
+                .find(|r| &r.id == id && r.kind == RangeKind::Run)
+                .ok_or("Time-slip details must belong to a Run range")?;
+            slip.validate(run.end - run.start)?;
+        }
         if self.version != 1 {
             return Err("Unsupported recording analysis version".into());
         }
