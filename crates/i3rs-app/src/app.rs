@@ -1805,6 +1805,30 @@ impl App {
                         self.add_report_panel();
                         ui.close();
                     }
+                    if ui.button("Add Acceleration Report").clicked() {
+                        let id = self.shared.next_panel_id;
+                        self.shared.next_panel_id += 1;
+                        let mut report = ReportPanel::new(id, "Acceleration Report");
+                        report.settings.kind = crate::panels::report::ReportKind::Acceleration;
+                        report.settings.view = crate::panels::report::ReportView::Split;
+                        self.worksheets[self.active_worksheet]
+                            .dock_state
+                            .push_to_focused_leaf(PanelTab::Report(report));
+                        ui.close();
+                    }
+                    if ui.button("Add Time / Section Report").clicked() {
+                        let id = self.shared.next_panel_id;
+                        self.shared.next_panel_id += 1;
+                        let mut report = ReportPanel::new(id, "Time / Section Report");
+                        report.settings.kind = crate::panels::report::ReportKind::Time;
+                        report.settings.scope = crate::panels::report::ReportScope::Ranges;
+                        report.settings.statistics =
+                            vec![i3rs_core::report::ReportStatistic::Average];
+                        self.worksheets[self.active_worksheet]
+                            .dock_state
+                            .push_to_focused_leaf(PanelTab::Report(report));
+                        ui.close();
+                    }
                     if ui.button("Add Track Map").clicked() {
                         self.add_track_map_panel();
                         ui.close();

@@ -15,6 +15,14 @@ cargo run --release -p i3rs-cli -- test_data/VIR_LAP.ld   # Run CLI inspector
 
 Rust 2024 edition — requires rustc 1.95+ for the GUI dependencies.
 
+## Native GUI Validation on macOS
+
+- Reuse `~/Applications/i3rs Dev.app`, bundle ID `io.github.friss.i3rs.dev`.
+- Build it with `bash scripts/build-macos-dev.sh`. See `docs/macos-development.md` for the one-time signing and permission setup.
+- Keep the signing certificate consistent. Do not create ticket-specific bundles/IDs, shell-launcher bundles, or silently use ad-hoc signing when the persistent identity is unavailable.
+- Quit the previous development instance before replacing it, then select the fixed full app path with Computer Use and open recordings in its file dialog. Prefer the full path over bundle-ID lookup, which can be ambiguous if LaunchServices has indexed diagnostic copies.
+- macOS privacy grants and Computer Use Always allow decisions are separate from the task sandbox. The user approves privacy prompts; do not change TCC or broaden permissions through scripts.
+
 ## Workspace Structure
 
 Three crates in `crates/`:

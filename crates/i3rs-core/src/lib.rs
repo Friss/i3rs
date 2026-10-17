@@ -15,6 +15,7 @@ mod ld_parser;
 mod ldx_parser;
 pub mod math_engine;
 pub mod math_expr;
+pub mod report;
 mod state_labels;
 pub mod track;
 
@@ -51,3 +52,5 @@ pub mod corrections;
 pub mod ranges;
 
 pub mod annotations;
+
+pub mod acceleration;
