@@ -551,16 +551,15 @@ if ui.button("None").clicked(){self.channels.clear();}});
         let mut context = recording_context(shared, ld.clone());
         context.channel_preferences = shared.channel_preferences.clone();
         if self.format == 3 {
-            let lat = ld
-                .channels
-                .iter()
-                .find(|c| c.name.to_lowercase().contains("latitude"))
-                .ok_or("No GPS latitude channel")?;
-            let lon = ld
-                .channels
-                .iter()
-                .find(|c| c.name.to_lowercase().contains("longitude"))
-                .ok_or("No GPS longitude channel")?;
+            let settings = context.current_corrections();
+            let (lat, lon) =
+                if settings.latitude_channel.is_empty() && settings.longitude_channel.is_empty() {
+                    i3rs_core::track::gps_channels(&ld)
+                } else {
+                    ld.find_channel_by_name(&settings.latitude_channel)
+                        .zip(ld.find_channel_by_name(&settings.longitude_channel))
+                }
+                .ok_or("Configured GPS latitude/longitude sources are unavailable")?;
             let lat = logged_series(&context, lat, false)?;
             let lon = logged_series(&context, lon, false)?;
             if !["deg", "°", ""].contains(&lon.unit.as_str()) {
@@ -779,16 +778,18 @@ fn source(shared: &SharedState, source: usize) -> Option<OutputSource> {
         ));
     }
     let o = shared.comparisons.overlays.get(source - 1)?;
-    let (ld, lap) = match o.source {
-        crate::panels::graph::OverlaySource::MainSession => {
-            (shared.ld_file.clone()?, shared.laps.get(o.lap_idx)?)
-        }
+    let (ld, lap, laps) = match o.source {
+        crate::panels::graph::OverlaySource::MainSession => (
+            shared.ld_file.clone()?,
+            shared.laps.get(o.lap_idx)?,
+            &shared.laps,
+        ),
         crate::panels::graph::OverlaySource::External(i) => {
             let s = shared.comparisons.sessions.get(i)?;
-            (s.ld_file.clone(), s.laps.get(o.lap_idx)?)
+            (s.ld_file.clone(), s.laps.get(o.lap_idx)?, &s.laps)
         }
     };
-    let a = shared
+    let mut a = shared
         .recording_analyses
         .get(ld.recording_id())
         .cloned()
@@ -796,7 +797,7 @@ fn source(shared: &SharedState, source: usize) -> Option<OutputSource> {
             let mut a = i3rs_core::ranges::RecordingAnalysis::from_laps(
                 ld.recording_id().into(),
                 ld.duration_secs(),
-                &i3rs_core::detect_laps(&ld),
+                laps,
             );
             a.details.driver = ld.session.driver.clone();
             a.details.venue = ld.session.venue.clone();
@@ -804,6 +805,7 @@ fn source(shared: &SharedState, source: usize) -> Option<OutputSource> {
             a.details.event = ld.event.event_name.clone();
             a
         });
+    a.selected_range = Some(a.ranges.get(o.lap_idx)?.id.clone());
     Some((ld, a, Some((lap.start_time, lap.end_time))))
 }
 
@@ -1076,6 +1078,163 @@ mod contract_tests {
         shared.zoom_range = Some((0.25, 0.75));
         assert_eq!(source(&shared, 0).unwrap().2, main.2);
     }
+    #[test]
+    fn overlay_reference_log_reopens_on_its_exported_range() {
+        use crate::panels::graph::{LapOverlay, OverlaySession, OverlaySource};
+        for external in [false, true] {
+            for selected in [None, Some("lap-0".to_owned())] {
+                let mut shared = state();
+                let ld = if external {
+                    let mut bytes = std::fs::read(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../test_data/VIR_LAP.ld"
+                    ))
+                    .unwrap();
+                    bytes.push(0);
+                    Arc::new(LdFile::from_bytes(bytes).unwrap())
+                } else {
+                    shared.ld_file.clone().unwrap()
+                };
+                let laps = (0..2)
+                    .map(|i| i3rs_core::Lap {
+                        number: i,
+                        name: format!("Range {i}"),
+                        start_time: i as f64,
+                        end_time: i as f64 + 1.,
+                    })
+                    .collect::<Vec<_>>();
+                let mut analysis = i3rs_core::ranges::RecordingAnalysis::from_laps(
+                    ld.recording_id().into(),
+                    ld.duration_secs(),
+                    &laps,
+                );
+                analysis.selected_range = selected;
+                if external {
+                    shared
+                        .recording_analyses
+                        .insert(analysis.recording.clone(), analysis.clone());
+                } else {
+                    shared.apply_recording_analysis(analysis.clone()).unwrap();
+                }
+                if external {
+                    shared.comparisons.sessions.push(OverlaySession {
+                        settings_key: String::new(),
+                        requests: Default::default(),
+                        failures: Default::default(),
+                        path: "overlay.ld".into(),
+                        file_name: "overlay.ld".into(),
+                        ld_file: ld.clone(),
+                        laps: laps.clone(),
+                        distance_axis_cache: None,
+                        channel_cache: Default::default(),
+                    });
+                }
+                shared.comparisons.overlays.push(LapOverlay {
+                    alignment_valid: true,
+                    gps_align: false,
+                    visible: true,
+                    color: None,
+                    source: if external {
+                        OverlaySource::External(0)
+                    } else {
+                        OverlaySource::MainSession
+                    },
+                    lap_idx: 1,
+                    manual_offset: 3.,
+                    stretch_to_reference: true,
+                });
+                let (ld, output_analysis, bounds) = source(&shared, 1).unwrap();
+                assert_eq!(
+                    output_analysis.selected_range,
+                    Some(analysis.ranges[1].id.clone())
+                );
+                let (start, end) = bounds.unwrap();
+                let (bytes, saved) = i3rs_core::log_writer::encode_log(
+                    &ld,
+                    &output_analysis,
+                    Some(OutputPlan {
+                        start,
+                        end,
+                        rate: 20.,
+                        relative_time: true,
+                        include_time: true,
+                    }),
+                )
+                .unwrap();
+                let reopened = Arc::new(LdFile::from_bytes(bytes).unwrap());
+                let mut restored = SharedState::new();
+                restored.data_duration = Some(reopened.duration_secs());
+                restored.ld_file = Some(reopened);
+                restored
+                    .recording_analyses
+                    .insert(saved.recording.clone(), saved.clone());
+                restored.activate_recording_analysis(&[]);
+                assert_eq!(saved.ranges.len(), 1);
+                assert_eq!(restored.selected_lap, Some(0));
+                assert_eq!(
+                    restored.range_selection().range_id,
+                    Some(analysis.ranges[1].id.clone())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn earth_export_uses_configured_gps_pair_or_canonical_short_names() {
+        for configured in [true, false] {
+            let mut ld = LdFile::open(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../test_data/VIR_LAP.ld"
+            ))
+            .unwrap();
+            let (lat, lon) = i3rs_core::track::gps_channels(&ld).unwrap();
+            let (lat_index, lon_index) = (lat.index, lon.index);
+            ld.channels[lat_index].name = if configured { "Lat" } else { "GPS Lat" }.into();
+            ld.channels[lon_index].name = if configured { "Long" } else { "GPS Long" }.into();
+            let mut decoy = ld.channels[lat_index].clone();
+            decoy.name = "Unrelated latitude".into();
+            decoy.shift = 1000;
+            ld.channels.insert(0, decoy);
+            for (index, channel) in ld.channels.iter_mut().enumerate() {
+                channel.index = index;
+            }
+            let ld = Arc::new(ld);
+            let mut shared = SharedState::new();
+            shared.ld_file = Some(ld.clone());
+            shared.data_duration = Some(ld.duration_secs());
+            shared.activate_recording_analysis(&[]);
+            if configured {
+                let analysis = shared
+                    .recording_analyses
+                    .get_mut(ld.recording_id())
+                    .unwrap();
+                analysis.corrections.latitude_channel = "Lat".into();
+                analysis.corrections.longitude_channel = "Long".into();
+            }
+            let output = OutputUi {
+                format: 3,
+                ..Default::default()
+            };
+            let plan = OutputPlan {
+                start: 0.125,
+                end: 0.375,
+                rate: 20.,
+                relative_time: true,
+                include_time: true,
+            };
+            let (_, kml) = output.make_preview(&shared, ld.clone(), plan).unwrap();
+            let lat = logged_series(&shared, &ld.channels[lat_index + 1], false).unwrap();
+            let lon = logged_series(&shared, &ld.channels[lon_index + 1], false).unwrap();
+            assert_eq!(kml, earth_kml(&ld.session.venue, plan, &lat, &lon).unwrap());
+            let analysis = shared
+                .recording_analyses
+                .get_mut(ld.recording_id())
+                .unwrap();
+            analysis.corrections.latitude_channel = "Missing".into();
+            assert!(output.make_preview(&shared, ld, plan).is_err());
+        }
+    }
+
     #[test]
     fn logged_and_derived_exports_are_explicit_and_use_selected_unit_contract() {
         let mut shared = state();

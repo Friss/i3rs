@@ -215,6 +215,7 @@ mod tests {
 
     fn sample_workspace() -> WorkspaceFile {
         WorkspaceFile {
+            carried_layout: false,
             profile: None,
             version: 2,
             comparisons: None,
