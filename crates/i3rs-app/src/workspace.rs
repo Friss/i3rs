@@ -1155,6 +1155,22 @@ pub fn load_workspace(
         .map(|c| (c.main_lap, c.overlays.as_slice()))
         .or_else(|| legacy.map(|g| (g.reference_lap, g.overlays.as_slice())))
         .unwrap_or((None, &[]));
+    // A newly opened export owns its selected range. A previous recording's
+    // workbook index must not replace that identity, or become an invalid Main.
+    let saved_main = main.filter(|i| *i < shared.laps.len());
+    let incoming_main = if !workspace
+        .recording_analyses
+        .contains_key(shared.recording_key())
+    {
+        shared.current_analysis().and_then(|a| {
+            a.selected_range
+                .as_ref()
+                .and_then(|id| a.ranges.iter().position(|r| &r.id == id))
+        })
+    } else {
+        None
+    };
+    let main = incoming_main.or(saved_main);
     let mut loader = GraphPanel::new(0, "comparison loader");
     for overlay in overlays {
         let source = if let Some(path) = &overlay.file_path {

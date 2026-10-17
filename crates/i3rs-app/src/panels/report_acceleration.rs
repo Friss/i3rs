@@ -146,9 +146,7 @@ impl ReportPanel {
         // Retain the allocation used in the cache identity.
         self.sources = vec![info.clone()];
         ui.horizontal(|ui| {
-            if ui.button("Copy all event CSV").clicked() {
-                ui.ctx().copy_text(self.acceleration_csv());
-            }
+            crate::output_ui::result_buttons(ui, &self.acceleration_csv());
             if ui.button("Copy event JSON").clicked() {
                 ui.ctx().copy_text(
                     serde_json::to_string_pretty(&self.acceleration_result)

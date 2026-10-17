@@ -773,9 +773,7 @@ impl ReportPanel {
             ui.label("Select at least one statistic");
             return;
         }
-        if ui.button("Copy report CSV").clicked() {
-            ui.ctx().copy_text(self.csv());
-        }
+        ui.horizontal_wrapped(|ui| crate::output_ui::result_buttons(ui, &self.csv()));
         ui.weak(if self.settings.kind==ReportKind::Time {"Duration of selected intervals [s]; click a cell or chart to select its range."}else{"Sample-weighted statistics; click a cell, range or chart bar to select it. Blue = minimum, red = maximum when enabled."});
         let mut selection = None;
         if self.settings.view == ReportView::Split && self.settings.split_horizontal {

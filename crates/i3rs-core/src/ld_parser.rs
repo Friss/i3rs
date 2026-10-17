@@ -264,6 +264,10 @@ impl LdBacking {
 }
 
 impl LdFile {
+    pub(crate) fn source_bytes(&self) -> &[u8] {
+        self.backing.as_slice()
+    }
+
     /// Physical-to-nominal sample rate ratio, also used to migrate saved timelines.
     pub fn sample_clock_scale(&self) -> f64 {
         sample_clock_scale(self.data())

@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState};
-use i3rs_core::{ExportChannel, LdFile, LdxFile, detect_laps, export_csv};
+use i3rs_core::{LdFile, LdxFile, detect_laps};
 #[cfg(target_arch = "wasm32")]
 use std::any::Any;
 use std::collections::HashMap;
@@ -139,6 +139,7 @@ pub struct App {
     show_channel_preferences: bool,
     show_session_details: bool,
     recording_editor: crate::panels::recording_editor::RecordingEditor,
+    output_ui: crate::output_ui::OutputUi,
     compare_session_path: Option<PathBuf>,
     session_summary_cache: HashMap<PathBuf, SessionSummary>,
     load_error: Option<String>,
@@ -196,6 +197,7 @@ impl App {
             show_channel_preferences: false,
             show_session_details: false,
             recording_editor: Default::default(),
+            output_ui: Default::default(),
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,
@@ -1750,28 +1752,6 @@ impl App {
         }
     }
 
-    fn export_csv(&self) {
-        let registry = &self.shared.display_channel_registry;
-        if registry.is_empty() {
-            return;
-        }
-
-        if let Some(path) = crate::platform::save_csv_file() {
-            let channels: Vec<ExportChannel<'_>> =
-                registry.iter().map(|info| info.export_channel()).collect();
-
-            if let Err(e) = export_csv(
-                &path,
-                &channels,
-                self.shared
-                    .zoom_range
-                    .or_else(|| self.shared.data_duration.map(|end| (0.0, end))),
-            ) {
-                self.shared.message(format!("Failed to export CSV: {}", e));
-            }
-        }
-    }
-
     fn show_menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button(
@@ -1779,6 +1759,10 @@ impl App {
                 |ui| {
                     if ui.button("Open .ld file...").clicked() {
                         self.start_open_session(ctx);
+                        ui.close();
+                    }
+                    if ui.button("Log Browser…").clicked() {
+                        self.output_ui.browser_open = true;
                         ui.close();
                     }
                     ui.separator();
@@ -1796,6 +1780,12 @@ impl App {
                             }
                         }
                     });
+                    if ui.button("Print / Preview visible worksheet…").clicked() {
+                        self.shared.playback_active = false;
+                        self.output_ui.capture_requested = true;
+                        ctx.request_repaint();
+                        ui.close();
+                    }
                     if ui.button("Save Workspace...").clicked() {
                         self.save_workspace();
                         ui.close();
@@ -1824,12 +1814,12 @@ impl App {
                     ui.separator();
                     if ui
                         .add_enabled(
-                            !self.shared.display_channel_registry.is_empty(),
-                            egui::Button::new("Export CSV..."),
+                            self.shared.ld_file.is_some(),
+                            egui::Button::new("Export Data / Split Log…"),
                         )
                         .clicked()
                     {
-                        self.export_csv();
+                        self.output_ui.begin_export(&self.shared);
                         ui.close();
                     }
                 },
@@ -2239,6 +2229,12 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if std::mem::take(&mut self.output_ui.capture_requested) {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                    "i3rs-print".to_owned(),
+                )));
+        }
         crate::perf_metrics::maybe_log_summary();
         self.process_platform_events(ui.ctx());
         self.submit_requested_channel_decodes(ui.ctx());
@@ -2597,6 +2593,9 @@ impl eframe::App for App {
         self.show_options_and_help(ui.ctx());
         self.show_session_details_window(ui.ctx());
         self.recording_editor.show(ui.ctx(), &mut self.shared);
+        if let Some(path) = self.output_ui.show(ui.ctx(), &mut self.shared) {
+            self.open_file(path);
+        }
         self.submit_requested_channel_decodes(ui.ctx());
         self.submit_requested_math_channel_evaluations(ui.ctx());
         self.submit_requested_track_data_build(ui.ctx());
@@ -2651,6 +2650,7 @@ mod tests {
             show_channel_preferences: false,
             show_session_details: false,
             recording_editor: Default::default(),
+            output_ui: Default::default(),
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,

@@ -502,3 +502,57 @@ fn cli_output_contains_channel_stats() {
     // Sample rate breakdown should be present
     assert!(stdout.contains("By sample rate:"));
 }
+
+#[test]
+fn exported_typed_ranges_roundtrip_through_cli_auto_and_reject_wrong_identity() {
+    use i3rs_core::{LdFile, output::OutputPlan, ranges::*};
+    let dir = temp_skill_dir();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("stage.ld");
+    let ld = LdFile::open(TEST_LD).unwrap();
+    let mut analysis =
+        RecordingAnalysis::from_laps(ld.recording_id().into(), ld.duration_secs(), &[]);
+    analysis.ranges = vec![AnalysisRange {
+        id: "stage".into(),
+        name: "Exported stage".into(),
+        start: 1.125,
+        end: 2.375,
+        kind: RangeKind::Stage,
+        trust: Trust::Trusted,
+        comment: "Exported metadata".into(),
+        reaction_time: None,
+    }];
+    i3rs_core::log_writer::write_log(
+        &path,
+        &ld,
+        &analysis,
+        Some(OutputPlan {
+            start: 1.125,
+            end: 2.375,
+            rate: 20.,
+            relative_time: true,
+            include_time: true,
+        }),
+    )
+    .unwrap();
+    let output = run_cli(&["summary", path.to_str().unwrap(), "--format", "json"]);
+    assert!(output.status.success());
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["lap_count"], 1);
+    assert_eq!(summary["duration_secs"], 1.25);
+    let output = run_cli(&["laps", path.to_str().unwrap(), "--format", "json"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Exported stage"));
+    assert!(text.contains("analysis"));
+    let sidecar = path.with_extension("i3rs.json");
+    let mut edited: RecordingAnalysis =
+        serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+    edited.recording = "wrong recording".into();
+    fs::write(sidecar, serde_json::to_vec(&edited).unwrap()).unwrap();
+    let output = run_cli(&["summary", path.to_str().unwrap(), "--format", "json"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("invalid_analysis_sidecar"));
+    fs::remove_dir_all(dir).unwrap();
+}

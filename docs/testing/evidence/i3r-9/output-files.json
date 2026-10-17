@@ -1,0 +1,30 @@
+{
+  "i3r9-final-split.ld": {
+    "bytes": 5505832,
+    "sha256": "b451ef83388a9fa5da10e9e0b868f781f1ba12bc84e27cacae9d7041ac4c6a53"
+  },
+  "i3r9-final-split.ldx": {
+    "bytes": 987,
+    "sha256": "fd3b31d40b3d5e29c8aba010a883ae8a22b9c4b4b40bc0c5d649a3df93c31dbb"
+  },
+  "i3r9-final-split.i3rs.json": {
+    "bytes": 2133,
+    "sha256": "28651f5bd9248771a3e1c90196e5192f5789157954ca3d44dfe48dd14fa67a32"
+  },
+  "i3r9-native-reference.td1": {
+    "bytes": 27976,
+    "sha256": "62bb02120aa3798128d443faba4f5c509cb740518fb52f3c3be63a218c5a9727"
+  },
+  "i3r9-gui-final.ld": {
+    "bytes": 7199592,
+    "sha256": "fe9670f5c578714ed17df1e30f6ce177bb20e76501cb991a419d646961127398"
+  },
+  "i3r9-gui-final.ldx": {
+    "bytes": 987,
+    "sha256": "fd3b31d40b3d5e29c8aba010a883ae8a22b9c4b4b40bc0c5d649a3df93c31dbb"
+  },
+  "i3r9-gui-final.i3rs.json": {
+    "bytes": 2133,
+    "sha256": "0f6064ed165a725214b2de3d5fa136b8ad8809ec93fa8c211224cd6da8a9c501"
+  }
+}

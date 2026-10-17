@@ -101,7 +101,7 @@ impl PlottedChannelInfo {
         value * self.display_scale + self.display_offset
     }
 
-    /// Export the same values, units and precision used by the readout.
+    #[cfg(test)]
     pub fn export_channel(&self) -> i3rs_core::ExportChannel<'_> {
         i3rs_core::ExportChannel {
             name: &self.name,

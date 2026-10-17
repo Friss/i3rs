@@ -1,0 +1,86 @@
+{
+  "drag_setup": {
+    "engine": "Engine Speed",
+    "drive_shaft": "Drive Shaft Speed",
+    "gear": "Gear",
+    "ratios": [],
+    "generate_input_shaft": true,
+    "generate_clutch_slip": true
+  },
+  "drag_runs": {},
+  "version": 1,
+  "recording": "ld:31084831499c72805fc1c0331bb0e922",
+  "duration": 134.0,
+  "ranges": [
+    {
+      "id": "ldx-stage-0",
+      "name": "Stage 1",
+      "start": 0.0,
+      "end": 133.9999945,
+      "kind": "Stage",
+      "trust": "Unknown",
+      "comment": "",
+      "reaction_time": null
+    }
+  ],
+  "markers": [],
+  "details": {
+    "driver": "Roger Outback",
+    "venue": "Belgrave",
+    "vehicle": "x234",
+    "event": "Test Session",
+    "notes": "",
+    "custom": {
+      "Driver": "Roger Outback",
+      "Event": "Test Session",
+      "Fastest Lap": "1",
+      "Fastest Time": "1:59.999",
+      "Log Time And Date": "6/10/2005  2:32 PM",
+      "Total Laps": "2",
+      "Vehicle Drive Type": "Four Wheel Drive",
+      "Vehicle Id": "x234",
+      "Vehicle Type": "Car",
+      "Vehicle Wheelbase": "2000 mm",
+      "Venue": "Belgrave"
+    }
+  },
+  "corrections": {
+    "speed_enabled": true,
+    "prefer_logged_corrected_speed": true,
+    "fastest_pair": null,
+    "speed_priority": [
+      "Ground Speed",
+      "Wheel Speed Front Left",
+      "Wheel Speed Front Right",
+      "Vehicle Speed",
+      "GPS Speed",
+      "Ground Speed",
+      "Speed",
+      "Drive Speed"
+    ],
+    "gps_speed_channel": "GPS Speed",
+    "gps_fallback": true,
+    "lower_speed": null,
+    "upper_speed": null,
+    "wheel_lock": null,
+    "distance_enabled": true,
+    "distance_source": "Automatic",
+    "distance_channel": "Lap Distance",
+    "stretch_enabled": true,
+    "stretch_tolerance": 0.05,
+    "track_length_m": null,
+    "gps_enabled": true,
+    "latitude_channel": "",
+    "longitude_channel": "",
+    "gps_interpolation": "Linear",
+    "interpolate_duplicates": false,
+    "gps_shift": "None",
+    "gps_quality": null,
+    "gps_zero_below_mps": null,
+    "invalidate_position_with_quality": true
+  },
+  "track": null,
+  "sectors": [],
+  "selected_range": "ldx-stage-0",
+  "gps_generation": null
+}

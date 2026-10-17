@@ -30,6 +30,7 @@ crossbeam-channel = "0.5.15"
 pollster = "1.0.1"
 log = "0.4.29"
 js-sys = "0.3.94"
+png = "0.18.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tempfile = "3.27.0"

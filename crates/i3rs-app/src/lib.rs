@@ -23,3 +23,5 @@ mod web;
 
 #[cfg(target_arch = "wasm32")]
 pub use web::WebHandle;
+
+mod output_ui;

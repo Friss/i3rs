@@ -526,6 +526,34 @@ fn load_laps(
     let ldx = find_ldx_for_ld(ld_path);
     let mut warnings = Vec::new();
     let detected = || detect_laps(ld);
+    // Edited and exported typed ranges are authoritative in automatic mode.
+    // Explicit --source ld/ldx continues to inspect those formats independently.
+    if source == LapSourceArg::Auto {
+        let path = ld_path.with_extension("i3rs.json");
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let analysis =
+                    serde_json::from_slice::<i3rs_core::ranges::RecordingAnalysis>(&bytes)
+                        .map_err(|e| e.to_string())
+                        .and_then(|mut a| {
+                            a.migrate_sample_clock(ld)?;
+                            Ok(a)
+                        });
+                match analysis {
+                    Ok(a) => return (a.laps(), ldx, warnings, "analysis"),
+                    Err(e) => warnings.push(warn(
+                        "invalid_analysis_sidecar",
+                        format!("{}: {e}; using logged lap detection", path.display()),
+                    )),
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => warnings.push(warn(
+                "invalid_analysis_sidecar",
+                format!("{}: {e}; using logged lap detection", path.display()),
+            )),
+        }
+    }
 
     match source {
         LapSourceArg::Auto | LapSourceArg::Ld => {
