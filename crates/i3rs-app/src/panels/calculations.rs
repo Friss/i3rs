@@ -491,16 +491,7 @@ pub fn result_csv(rows: &[ResultRow]) -> String {
     csv
 }
 pub fn export_buttons(ui: &mut egui::Ui, csv: &str) {
-    if ui.button("Copy CSV").clicked() {
-        ui.ctx().copy_text(csv.into());
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    if ui.button("Export CSV…").clicked()
-        && let Some(path) = crate::platform::save_csv_file()
-        && let Err(error) = std::fs::write(path, csv)
-    {
-        ui.label(format!("Export failed: {error}"));
-    }
+    crate::output_ui::result_buttons(ui, csv);
 }
 #[cfg(test)]
 mod tests {

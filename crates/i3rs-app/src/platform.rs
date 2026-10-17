@@ -99,11 +99,6 @@ pub fn save_csv_file() -> Option<PathBuf> {
         .save_file()
 }
 
-#[cfg(target_arch = "wasm32")]
-pub fn save_csv_file() -> Option<PathBuf> {
-    None
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_math_channels_file() -> Option<PathBuf> {
     native_dialog()

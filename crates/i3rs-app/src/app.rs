@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use egui_dock::{DockArea, DockState};
-use i3rs_core::{ExportChannel, LdFile, LdxFile, detect_laps, export_csv};
+use i3rs_core::{LdFile, LdxFile, detect_laps};
 #[cfg(target_arch = "wasm32")]
 use std::any::Any;
 use std::collections::HashMap;
@@ -139,6 +139,7 @@ pub struct App {
     show_channel_preferences: bool,
     show_session_details: bool,
     recording_editor: crate::panels::recording_editor::RecordingEditor,
+    output_ui: crate::output_ui::OutputUi,
     compare_session_path: Option<PathBuf>,
     session_summary_cache: HashMap<PathBuf, SessionSummary>,
     load_error: Option<String>,
@@ -196,6 +197,7 @@ impl App {
             show_channel_preferences: false,
             show_session_details: false,
             recording_editor: Default::default(),
+            output_ui: Default::default(),
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,
@@ -276,7 +278,9 @@ impl App {
         if is_startup_default_layout(&self.worksheets) {
             None
         } else {
-            Some(self.build_workspace_snapshot_with_popped_out_track_maps(false))
+            let mut workspace = self.build_workspace_snapshot_with_popped_out_track_maps(false);
+            workspace.carried_layout = true;
+            Some(workspace)
         }
     }
 
@@ -1750,28 +1754,6 @@ impl App {
         }
     }
 
-    fn export_csv(&self) {
-        let registry = &self.shared.display_channel_registry;
-        if registry.is_empty() {
-            return;
-        }
-
-        if let Some(path) = crate::platform::save_csv_file() {
-            let channels: Vec<ExportChannel<'_>> =
-                registry.iter().map(|info| info.export_channel()).collect();
-
-            if let Err(e) = export_csv(
-                &path,
-                &channels,
-                self.shared
-                    .zoom_range
-                    .or_else(|| self.shared.data_duration.map(|end| (0.0, end))),
-            ) {
-                self.shared.message(format!("Failed to export CSV: {}", e));
-            }
-        }
-    }
-
     fn show_menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button(
@@ -1779,6 +1761,10 @@ impl App {
                 |ui| {
                     if ui.button("Open .ld file...").clicked() {
                         self.start_open_session(ctx);
+                        ui.close();
+                    }
+                    if ui.button("Log Browser…").clicked() {
+                        self.output_ui.browser_open = true;
                         ui.close();
                     }
                     ui.separator();
@@ -1796,6 +1782,12 @@ impl App {
                             }
                         }
                     });
+                    if ui.button("Print / Preview visible worksheet…").clicked() {
+                        self.shared.playback_active = false;
+                        self.output_ui.capture_requested = true;
+                        ctx.request_repaint();
+                        ui.close();
+                    }
                     if ui.button("Save Workspace...").clicked() {
                         self.save_workspace();
                         ui.close();
@@ -1824,12 +1816,12 @@ impl App {
                     ui.separator();
                     if ui
                         .add_enabled(
-                            !self.shared.display_channel_registry.is_empty(),
-                            egui::Button::new("Export CSV..."),
+                            self.shared.ld_file.is_some(),
+                            egui::Button::new("Export Data / Split Log…"),
                         )
                         .clicked()
                     {
-                        self.export_csv();
+                        self.output_ui.begin_export(&self.shared);
                         ui.close();
                     }
                 },
@@ -2239,6 +2231,12 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if std::mem::take(&mut self.output_ui.capture_requested) {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+                    "i3rs-print".to_owned(),
+                )));
+        }
         crate::perf_metrics::maybe_log_summary();
         self.process_platform_events(ui.ctx());
         self.submit_requested_channel_decodes(ui.ctx());
@@ -2597,6 +2595,9 @@ impl eframe::App for App {
         self.show_options_and_help(ui.ctx());
         self.show_session_details_window(ui.ctx());
         self.recording_editor.show(ui.ctx(), &mut self.shared);
+        if let Some(path) = self.output_ui.show(ui.ctx(), &mut self.shared) {
+            self.open_file(path);
+        }
         self.submit_requested_channel_decodes(ui.ctx());
         self.submit_requested_math_channel_evaluations(ui.ctx());
         self.submit_requested_track_data_build(ui.ctx());
@@ -2651,6 +2652,7 @@ mod tests {
             show_channel_preferences: false,
             show_session_details: false,
             recording_editor: Default::default(),
+            output_ui: Default::default(),
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,
@@ -2945,6 +2947,62 @@ mod tests {
 
         assert_eq!(docked_track_maps, 0);
         assert_eq!(app.popped_out_track_maps.len(), 1);
+    }
+
+    #[test]
+    fn carried_workspace_waits_for_math_without_replacing_browser_selection() {
+        for selection in [Some(1), None] {
+            let ld = Arc::new(LdFile::open(TEST_LD).unwrap());
+            let mut shared = SharedState::new();
+            shared.ld_file = Some(ld.clone());
+            shared.ld_path = Some("previous.ld".into());
+            shared.data_duration = Some(ld.duration_secs());
+            let laps = (0..2)
+                .map(|i| i3rs_core::Lap {
+                    number: i,
+                    name: format!("Stage {i}"),
+                    start_time: i as f64,
+                    end_time: i as f64 + 1.,
+                })
+                .collect::<Vec<_>>();
+            shared.activate_recording_analysis(&laps);
+            shared.select_lap(Some(0));
+            shared.comparisons.main_lap = Some(0);
+            let mut math =
+                shared.create_math_channel_def("Deferred".into(), "1".into(), "V".into(), 2);
+            math.evaluation_state = MathEvaluationState::WaitingForInputs;
+            shared.math_channels.push(math);
+            let mut app = test_app(
+                shared,
+                vec![worksheet_with_tabs(vec![
+                    PanelTab::Graph(GraphPanel::new(1, "Saved graph")),
+                    PanelTab::Histogram(HistogramPanel::new(2, "Saved histogram")),
+                ])],
+            );
+            let carried = app.workspace_snapshot_for_session_reload().unwrap();
+            assert!(carried.recording_analyses.contains_key(ld.recording_id()));
+            assert!(carried.carried_layout);
+            let explicit: crate::workspace::WorkspaceFile =
+                serde_json::from_slice(&serde_json::to_vec(&carried).unwrap()).unwrap();
+            assert!(!explicit.carried_layout);
+            app.shared.ld_path = Some("current.ld".into());
+            app.restore_workspace_when_ready(carried);
+            assert!(app.pending_workspace_restore.is_some());
+            // The browser's pending Main selection runs before math finishes.
+            app.shared.select_lap(selection);
+            app.shared.comparisons.main_lap = selection;
+            let selected_id = app.shared.range_selection().range_id;
+            app.shared.math_channels[0].evaluation_state = MathEvaluationState::Ready;
+            app.maybe_apply_pending_workspace_restore();
+            assert!(app.pending_workspace_restore.is_none());
+            assert_eq!(app.shared.selected_lap, selection);
+            assert_eq!(app.shared.comparisons.main_lap, selection);
+            assert_eq!(app.shared.range_selection().range_id, selected_id);
+            // An explicit workspace load still restores its saved Main selection.
+            app.restore_workspace_when_ready(explicit);
+            assert_eq!(app.shared.selected_lap, Some(0));
+            assert_eq!(app.shared.comparisons.main_lap, Some(0));
+        }
     }
 
     #[test]

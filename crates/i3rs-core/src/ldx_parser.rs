@@ -152,6 +152,26 @@ impl LdxFile {
             }
         }
 
+        // i3rs generic ranges are an explicitly named private detail. They do
+        // not masquerade as MoTeC MarkerPair timestamps or alter i2 outings.
+        if let Some((json, _)) = ldx.details.get("i3rs Ranges (s)") {
+            let ranges: Vec<(f64, f64)> =
+                serde_json::from_str(json).map_err(|e| format!("Invalid i3rs LDX ranges: {e}"))?;
+            if ranges.iter().any(|(start, end)| {
+                !start.is_finite() || !end.is_finite() || *start < 0. || end <= start
+            }) {
+                return Err("Invalid i3rs LDX range bounds".into());
+            }
+            ldx.laps = ranges
+                .into_iter()
+                .enumerate()
+                .map(|(i, (start_time, end_time))| LdxLap {
+                    number: i as u32,
+                    start_time,
+                    end_time,
+                })
+                .collect();
+        }
         Ok(ldx)
     }
 

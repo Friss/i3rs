@@ -22,6 +22,10 @@ use crate::state::{CHANNEL_COLORS, ChannelId, GraphMode, GraphXAxis, SharedState
 
 #[derive(Serialize, Deserialize)]
 pub struct WorkspaceFile {
+    /// Transient intent: carry worksheets across a recording open without
+    /// replacing the incoming recording's analysis or selected range.
+    #[serde(skip)]
+    pub carried_layout: bool,
     #[serde(default)]
     pub profile: Option<crate::default_layouts::WorkspaceProfile>,
     #[serde(default)]
@@ -1029,6 +1033,7 @@ pub fn save_workspace(
     let sectors: Vec<Sector> = shared.sectors.clone();
 
     WorkspaceFile {
+        carried_layout: false,
         profile: shared.workspace_profile,
         version: 2,
         comparisons: Some(ComparisonConfig {
@@ -1083,6 +1088,11 @@ pub fn save_workspace(
 
 /// Restore section identity before asynchronous math/layout restoration can wait.
 pub(crate) fn restore_track_sections(workspace: &WorkspaceFile, shared: &mut SharedState) {
+    if workspace.carried_layout && shared.current_analysis().is_some() {
+        // The incoming recording already owns its analysis. A carried layout
+        // can contain an older snapshot of this same recording.
+        return;
+    }
     shared.track_definition_error = None;
     if !workspace.recording_analyses.is_empty() {
         for (key, analysis) in &workspace.recording_analyses {
@@ -1155,6 +1165,27 @@ pub fn load_workspace(
         .map(|c| (c.main_lap, c.overlays.as_slice()))
         .or_else(|| legacy.map(|g| (g.reference_lap, g.overlays.as_slice())))
         .unwrap_or((None, &[]));
+    // A newly opened export owns its selected range. A previous recording's
+    // workbook index must not replace that identity, or become an invalid Main.
+    let saved_main = main.filter(|i| *i < shared.laps.len());
+    let incoming_main = if workspace.carried_layout
+        || !workspace
+            .recording_analyses
+            .contains_key(shared.recording_key())
+    {
+        shared.current_analysis().and_then(|a| {
+            a.selected_range
+                .as_ref()
+                .and_then(|id| a.ranges.iter().position(|r| &r.id == id))
+        })
+    } else {
+        None
+    };
+    let main = if workspace.carried_layout {
+        incoming_main
+    } else {
+        incoming_main.or(saved_main)
+    };
     let mut loader = GraphPanel::new(0, "comparison loader");
     for overlay in overlays {
         let source = if let Some(path) = &overlay.file_path {

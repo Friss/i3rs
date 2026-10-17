@@ -589,7 +589,11 @@ impl HistogramPanel {
                 .flat_map(|(bins, _, _)| {
                     bins.counts.iter().zip(&bins.base).map(move |(n, base)| {
                         histogram_height(n + base, bins.denominator, percentage)
-                            / if seconds { bins.freq.max(1.0) } else { 1. }
+                            / if seconds {
+                                if bins.freq > 0. { bins.freq } else { 1. }
+                            } else {
+                                1.
+                            }
                     })
                 })
                 .fold(0.0_f64, f64::max);
@@ -598,6 +602,24 @@ impl HistogramPanel {
         } else {
             None
         };
+
+        let mut csv =
+            String::from("Series,Bin start,Bin end,Count,Denominator,Value,Base,Output\n");
+        for (index, (bins, _, label)) in cached.charts.iter().enumerate() {
+            if self.color_channel.is_none()
+                || self
+                    .band_presentation
+                    .visible(index % self.color_bands.len())
+            {
+                append_histogram_csv(&mut csv, bins, label, percentage, seconds);
+            }
+        }
+        for (bins, _, label, band) in &overlay_charts {
+            if self.color_channel.is_none() || self.band_presentation.visible(*band) {
+                append_histogram_csv(&mut csv, bins, label, percentage, seconds);
+            }
+        }
+        ui.horizontal_wrapped(|ui| crate::output_ui::result_buttons(ui, &csv));
 
         let plot_response = plot.show(ui, |plot_ui| {
             if let Some((x_min, x_max)) = locked_x_range {
@@ -822,6 +844,44 @@ fn histogram_series_label(name: &str, unit: &str) -> String {
     }
 }
 
+fn append_histogram_csv(
+    csv: &mut String,
+    bins: &HistogramBins,
+    name: &str,
+    percentage: bool,
+    seconds: bool,
+) {
+    use std::fmt::Write;
+    for (i, count) in bins.counts.iter().enumerate() {
+        let divisor = if seconds {
+            if bins.freq > 0. { bins.freq } else { 1. }
+        } else {
+            1.
+        };
+        let value = histogram_height(*count, bins.denominator, percentage) / divisor;
+        let base = histogram_height(bins.base[i], bins.denominator, percentage) / divisor;
+        writeln!(
+            csv,
+            "{},{},{},{},{},{},{},{}",
+            i3rs_core::output::csv_cell(name),
+            bins.min + i as f64 * bins.bin_width,
+            bins.min + (i + 1) as f64 * bins.bin_width,
+            count,
+            bins.denominator,
+            value,
+            base,
+            if seconds {
+                "s"
+            } else if percentage {
+                "%"
+            } else {
+                "samples"
+            }
+        )
+        .unwrap();
+    }
+}
+
 fn bins_to_bar_chart(
     bins: &HistogramBins,
     color: egui::Color32,
@@ -838,11 +898,19 @@ fn bins_to_bar_chart(
             Bar::new(
                 center,
                 histogram_height(count, bins.denominator, percentage)
-                    / if seconds { bins.freq.max(1.0) } else { 1. },
+                    / if seconds {
+                        if bins.freq > 0. { bins.freq } else { 1. }
+                    } else {
+                        1.
+                    },
             )
             .base_offset(
                 histogram_height(bins.base[i], bins.denominator, percentage)
-                    / if seconds { bins.freq.max(1.0) } else { 1. },
+                    / if seconds {
+                        if bins.freq > 0. { bins.freq } else { 1. }
+                    } else {
+                        1.
+                    },
             )
             .width(bins.bin_width * 0.9)
             .fill(color)
@@ -1073,5 +1141,27 @@ mod policy_tests {
         .remove(0);
         assert_eq!(b.counts, [2, 3]);
         assert_eq!(b.denominator, 5);
+    }
+}
+
+#[cfg(test)]
+mod output_contract_tests {
+    use super::*;
+    #[test]
+    fn exported_heights_and_stacking_match_chart_percentage_and_sub_hz_seconds() {
+        let bins = HistogramBins {
+            freq: 0.5,
+            min: 10.,
+            bin_width: 2.,
+            counts: vec![2, 3],
+            base: vec![1, 2],
+            denominator: 10,
+        };
+        let mut csv = String::new();
+        append_histogram_csv(&mut csv, &bins, "A, B", true, false);
+        assert!(csv.contains("\"A, B\",10,12,2,10,20,10,%"));
+        let mut csv = String::new();
+        append_histogram_csv(&mut csv, &bins, "A", false, true);
+        assert!(csv.contains("\"A\",10,12,2,10,4,2,s"));
     }
 }
