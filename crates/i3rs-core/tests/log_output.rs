@@ -102,9 +102,12 @@ fn writeback_produces_recoverable_original_and_reopenable_sidecars() {
     let path = dir.join("output.ld");
     assert!(write_log(&path, &ld, &a, None).unwrap().is_none());
     let first = std::fs::read(&path).unwrap();
-    let mut edit = a.clone();
+    // Keep the destination mapped while writing its edited analysis back.
+    let mapped = LdFile::open(&path).unwrap();
+    let mut edit: RecordingAnalysis =
+        serde_json::from_slice(&std::fs::read(path.with_extension("i3rs.json")).unwrap()).unwrap();
     edit.details.driver = "Second driver".into();
-    let backup = write_log(&path, &ld, &edit, None).unwrap().unwrap();
+    let backup = write_log(&path, &mapped, &edit, None).unwrap().unwrap();
     assert_eq!(std::fs::read(backup.join("0")).unwrap(), first);
     assert!(backup.join("RESTORE.txt").exists());
     let reopened = LdFile::open(&path).unwrap();
@@ -112,10 +115,33 @@ fn writeback_produces_recoverable_original_and_reopenable_sidecars() {
     let saved: RecordingAnalysis =
         serde_json::from_slice(&std::fs::read(path.with_extension("i3rs.json")).unwrap()).unwrap();
     assert_eq!(saved.recording, reopened.recording_id());
+    assert_eq!(mapped.session.driver, "Output test");
     saved.validate().unwrap();
     let ldx = i3rs_core::LdxFile::open(path.with_extension("ldx")).unwrap();
     assert_eq!(ldx.laps.len(), saved.ranges.len());
     drop(reopened);
+    drop(mapped);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn reference_overwrite_preserves_the_original_in_a_recovery_backup() {
+    let mut lap = i3rs_core::reference_lap::ReferenceLap::decode(include_bytes!(
+        "../../../test_data/reference/i3r9/rally-stage-1.td1"
+    ))
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("i3r9-reference-replace-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("reference.td1");
+    assert!(lap.write(&path).unwrap().is_none());
+    let first = std::fs::read(&path).unwrap();
+    lap.driver = "Replacement driver".into();
+    let backup = lap.write(&path).unwrap().unwrap();
+    assert_eq!(std::fs::read(backup.join("0")).unwrap(), first);
+    assert!(backup.join("RESTORE.txt").exists());
+    assert_eq!(
+        i3rs_core::reference_lap::ReferenceLap::decode(&std::fs::read(&path).unwrap()).unwrap(),
+        lap
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[test]

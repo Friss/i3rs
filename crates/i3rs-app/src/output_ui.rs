@@ -101,7 +101,12 @@ impl OutputUi {
         };
         Some(base.join("i3rs/log-index.json"))
     }
-    fn scan(&mut self, folder: PathBuf, ctx: &Context) {
+    fn refresh_folders(&self) -> Vec<PathBuf> {
+        self.folder
+            .clone()
+            .map_or_else(|| self.index.folders.clone(), |f| vec![f])
+    }
+    fn scan(&mut self, folders: Vec<PathBuf>, ctx: &Context) {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let (tx, rx) = mpsc::channel();
@@ -109,14 +114,17 @@ impl OutputUi {
             let ctx = ctx.clone();
             self.scan = Some(rx);
             std::thread::spawn(move || {
-                let errors = index.scan(&folder);
+                let errors = folders
+                    .iter()
+                    .flat_map(|folder| index.scan(folder))
+                    .collect();
                 let _ = tx.send((index, errors));
                 ctx.request_repaint();
             });
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = (folder, ctx);
+            let _ = (folders, ctx);
             self.browser_status = "Folder indexing is available in the desktop app".into();
         }
     }
@@ -161,15 +169,17 @@ impl OutputUi {
         }
         if let Some((path, analysis, range)) = &self.pending_main
             && shared.ld_path.as_ref() == Some(path)
-            && shared
-                .ld_file
-                .as_ref()
-                .is_some_and(|ld| ld.recording_id() == analysis.recording)
         {
             let analysis = analysis.clone();
             let range_id = range.clone();
             self.pending_main = None;
-            if let Err(e) = shared.apply_recording_analysis(analysis) {
+            if shared
+                .ld_file
+                .as_ref()
+                .is_none_or(|ld| ld.recording_id() != analysis.recording)
+            {
+                self.browser_status = "Recording changed; refresh the index".into();
+            } else if let Err(e) = shared.apply_recording_analysis(analysis) {
                 self.browser_status = e;
             } else {
                 let range = range_id.and_then(|id| {
@@ -234,16 +244,13 @@ impl OutputUi {
                             && let Some(folder) = rfd::FileDialog::new().pick_folder()
                         {
                             self.folder = Some(folder.clone());
-                            scan_folder = Some(folder);
+                            scan_folder = Some(vec![folder]);
                         }
                         if ui
                             .add_enabled(self.scan.is_none(), egui::Button::new("Refresh"))
                             .clicked()
                         {
-                            scan_folder = self
-                                .folder
-                                .clone()
-                                .or_else(|| self.index.folders.first().cloned());
+                            scan_folder = Some(self.refresh_folders());
                         }
                     });
                     ui.horizontal_wrapped(|ui| {
@@ -429,7 +436,7 @@ impl OutputUi {
             let sources=std::iter::once("Main".to_owned()).chain(shared.comparisons.overlays.iter().enumerate().map(|(i,_)|format!("Overlay {}",i+1))).collect::<Vec<_>>();
             self.source=self.source.min(sources.len()-1);
             ui.horizontal(|ui|{ui.label("Source");egui::ComboBox::from_id_salt("output_source").selected_text(&sources[self.source]).show_ui(ui,|ui|{for(i,s)in sources.iter().enumerate(){ui.selectable_value(&mut self.source,i,s);}});});
-            let Some((ld,analysis,selected))=source(shared,self.source) else{ui.label("Source recording or selected range is unavailable");return;};
+            let (ld,analysis,selected)=match source(shared,self.source){Ok(source)=>source,Err(error)=>{ui.label(error);return;}};
             #[cfg(target_arch="wasm32")] let _=&analysis;
             ui.horizontal_wrapped(|ui|{ui.label("Scope");for(i,s)in ["Full recording","Selected range","Zoom","Custom"].iter().enumerate(){ui.selectable_value(&mut self.scope,i,*s);}});
             if self.scope==1 && selected.is_none(){ui.label("Choose a Main/Overlay range before exporting Selected range.");return;}
@@ -777,41 +784,59 @@ type OutputSource = (
     i3rs_core::ranges::RecordingAnalysis,
     Option<(f64, f64)>,
 );
-fn source(shared: &SharedState, source: usize) -> Option<OutputSource> {
+fn source(shared: &mut SharedState, source: usize) -> Result<OutputSource, String> {
+    let unavailable = "Source recording or selected range is unavailable";
     if source == 0 {
-        return Some((
-            shared.ld_file.clone()?,
+        return Ok((
+            shared.ld_file.clone().ok_or(unavailable)?,
             shared
                 .snapshot_recording_analysis()
-                .get(shared.recording_key())?
-                .clone(),
+                .get(shared.recording_key())
+                .cloned()
+                .ok_or(unavailable)?,
             shared
                 .selected_lap
                 .and_then(|i| shared.laps.get(i))
                 .map(|l| (l.start_time, l.end_time)),
         ));
     }
-    let o = shared.comparisons.overlays.get(source - 1)?;
-    let (ld, lap, laps) = match o.source {
+    let o = shared
+        .comparisons
+        .overlays
+        .get(source - 1)
+        .ok_or(unavailable)?;
+    let (ld, lap, laps, path) = match o.source {
         crate::panels::graph::OverlaySource::MainSession => (
-            shared.ld_file.clone()?,
-            shared.laps.get(o.lap_idx)?,
-            &shared.laps,
+            shared.ld_file.clone().ok_or(unavailable)?,
+            shared.laps.get(o.lap_idx).cloned().ok_or(unavailable)?,
+            shared.laps.clone(),
+            None,
         ),
         crate::panels::graph::OverlaySource::External(i) => {
-            let s = shared.comparisons.sessions.get(i)?;
-            (s.ld_file.clone(), s.laps.get(o.lap_idx)?, &s.laps)
+            let s = shared.comparisons.sessions.get(i).ok_or(unavailable)?;
+            (
+                s.ld_file.clone(),
+                s.laps.get(o.lap_idx).cloned().ok_or(unavailable)?,
+                s.laps.clone(),
+                Some(s.path.clone()),
+            )
         }
     };
-    let mut a = shared
-        .recording_analyses
-        .get(ld.recording_id())
-        .cloned()
-        .unwrap_or_else(|| {
+    let mut a = if let Some(a) = shared.recording_analyses.get(ld.recording_id()) {
+        a.clone()
+    } else {
+        let (saved, warning) = path
+            .as_ref()
+            .map(|path| crate::background_jobs::read_analysis_sidecar(path, &ld))
+            .unwrap_or((None, None));
+        if let Some(error) = warning {
+            return Err(error);
+        }
+        let a = saved.unwrap_or_else(|| {
             let mut a = i3rs_core::ranges::RecordingAnalysis::from_laps(
                 ld.recording_id().into(),
                 ld.duration_secs(),
-                laps,
+                &laps,
             );
             a.details.driver = ld.session.driver.clone();
             a.details.venue = ld.session.venue.clone();
@@ -819,8 +844,21 @@ fn source(shared: &SharedState, source: usize) -> Option<OutputSource> {
             a.details.event = ld.event.event_name.clone();
             a
         });
-    a.selected_range = Some(a.ranges.get(o.lap_idx)?.id.clone());
-    Some((ld, a, Some((lap.start_time, lap.end_time))))
+        shared
+            .recording_analyses
+            .insert(a.recording.clone(), a.clone());
+        a
+    };
+    a.migrate_sample_clock(&ld)?;
+    // An older graph/workspace can have a different numeric range ordering.
+    // Match the displayed interval instead of applying its index to the sidecar.
+    let selected = a
+        .ranges
+        .iter()
+        .find(|r| (r.start - lap.start_time).abs() < 1e-6 && (r.end - lap.end_time).abs() < 1e-6)
+        .ok_or("Overlay range changed; choose its current range in Log Browser")?;
+    a.selected_range = Some(selected.id.clone());
+    Ok((ld, a, Some((lap.start_time, lap.end_time))))
 }
 
 fn indexed_range(
@@ -1091,6 +1129,164 @@ mod contract_tests {
         assert!(make_device_reference(&shared, ld, &analysis, (0.125, 2.375)).is_err());
     }
     #[test]
+    fn refresh_all_scans_every_folder_and_removes_deleted_logs() {
+        let root = std::env::temp_dir().join(format!("i3r9-refresh-all-{}", std::process::id()));
+        let folders = [root.join("one"), root.join("two")];
+        let mut index = LogIndex::default();
+        for folder in &folders {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::copy(
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/VIR_LAP.ld"),
+                folder.join("sample.ld"),
+            )
+            .unwrap();
+            assert!(index.scan(folder).is_empty());
+        }
+        assert_eq!(index.logs.len(), 2);
+        for folder in &folders {
+            std::fs::remove_file(folder.join("sample.ld")).unwrap();
+        }
+        let mut output = OutputUi {
+            index,
+            ..Default::default()
+        };
+        let targets = output.refresh_folders();
+        assert_eq!(targets, folders);
+        output.scan(targets, &Context::default());
+        let (index, errors) = output
+            .scan
+            .take()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(errors.is_empty());
+        assert!(index.logs.is_empty());
+        output.folder = Some(folders[1].clone());
+        assert_eq!(output.refresh_folders(), vec![folders[1].clone()]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_pending_main_is_cleared_and_cannot_apply_when_old_identity_returns() {
+        let mut shared = state();
+        let original = shared.ld_file.clone().unwrap();
+        let analysis = shared.current_analysis().unwrap().clone();
+        let path = PathBuf::from("replaced.ld");
+        let mut output = OutputUi {
+            initialized: true,
+            pending_main: Some((
+                path.clone(),
+                analysis.clone(),
+                Some(analysis.ranges[0].id.clone()),
+            )),
+            ..Default::default()
+        };
+        let mut bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test_data/VIR_LAP.ld"
+        ))
+        .unwrap();
+        bytes.push(0);
+        shared.ld_path = Some(path);
+        for ld in [Arc::new(LdFile::from_bytes(bytes).unwrap()), original] {
+            shared.ld_file = Some(ld);
+            let mut frame = Context::default().run_ui(Default::default(), |ui| {
+                output.show(ui.ctx(), &mut shared);
+            });
+            frame.textures_delta.clear();
+            assert!(output.pending_main.is_none());
+            assert!(output.browser_status.contains("refresh the index"));
+            assert!(shared.selected_lap.is_none());
+        }
+    }
+
+    #[test]
+    fn external_export_loads_validated_sidecar_and_keeps_unsaved_analysis() {
+        use crate::panels::graph::{GraphPanel, LapOverlay, OverlaySource};
+        use i3rs_core::corrections::{ClampAction, DistanceSource, SpeedLimit};
+        let mut shared = state();
+        let original = shared.ld_file.clone().unwrap();
+        let mut analysis = shared.current_analysis().unwrap().clone();
+        analysis.details.driver = "Overlay driver".into();
+        analysis
+            .details
+            .custom
+            .insert("Tyres".into(), "Soft".into());
+        for range in &mut analysis.ranges {
+            range.kind = i3rs_core::ranges::RangeKind::Stage;
+            range.trust = i3rs_core::ranges::Trust::Trusted;
+        }
+        analysis.corrections.distance_source = DistanceSource::CorrectedSpeed;
+        analysis.corrections.stretch_enabled = false;
+        analysis.corrections.upper_speed = Some(SpeedLimit {
+            threshold_mps: 1.,
+            action: ClampAction::Clamp,
+        });
+        let dir = std::env::temp_dir().join(format!("i3r9-overlay-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("overlay.ld");
+        i3rs_core::log_writer::write_log(&path, &original, &analysis, None).unwrap();
+        let mut graph = GraphPanel::new(0, "Overlay");
+        let session = graph.load_external_overlay_path(path.clone()).unwrap();
+        let key = graph.overlay_sessions[session]
+            .ld_file
+            .recording_id()
+            .to_owned();
+        assert!(!shared.recording_analyses.contains_key(&key));
+        shared.comparisons.sessions = graph.overlay_sessions;
+        shared.comparisons.overlays.push(LapOverlay {
+            alignment_valid: true,
+            gps_align: false,
+            visible: true,
+            color: None,
+            source: OverlaySource::External(session),
+            lap_idx: 0,
+            manual_offset: 0.,
+            stretch_to_reference: false,
+        });
+        let (ld, loaded, _) = source(&mut shared, 1).unwrap();
+        assert_eq!(loaded.details.driver, "Overlay driver");
+        assert_eq!(loaded.details.custom["Tyres"], "Soft");
+        assert_eq!(loaded.ranges[0].kind, i3rs_core::ranges::RangeKind::Stage);
+        assert_eq!(loaded.ranges[0].trust, i3rs_core::ranges::Trust::Trusted);
+        assert_eq!(loaded.corrections, analysis.corrections);
+        let context = recording_context(&shared, ld.clone());
+        let reference =
+            make_device_reference(&context, ld.clone(), &loaded, (0.125, 2.375)).unwrap();
+        assert!(*reference.distance_dm.last().unwrap() <= 23);
+        std::fs::write(path.with_extension("i3rs.json"), "{invalid").unwrap();
+        shared
+            .recording_analyses
+            .get_mut(&key)
+            .unwrap()
+            .details
+            .notes = "Unsaved wins".into();
+        assert_eq!(
+            source(&mut shared, 1).unwrap().1.details.notes,
+            "Unsaved wins"
+        );
+        shared.recording_analyses.remove(&key);
+        assert!(
+            source(&mut shared, 1)
+                .err()
+                .unwrap()
+                .contains("Analysis sidecar")
+        );
+        let mut wrong = loaded.clone();
+        wrong.recording = "wrong recording".into();
+        std::fs::write(
+            path.with_extension("i3rs.json"),
+            serde_json::to_vec(&wrong).unwrap(),
+        )
+        .unwrap();
+        assert!(source(&mut shared, 1).is_err());
+        drop(context);
+        drop(ld);
+        drop(shared);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn browser_main_resolves_cached_ranges_by_identity_and_rejects_removed_ranges() {
         let mut shared = state();
         let ld = shared.ld_file.clone().unwrap();
@@ -1177,7 +1373,7 @@ mod contract_tests {
         use crate::panels::graph::{LapOverlay, OverlaySource};
         let mut shared = state();
         shared.select_lap(Some(0));
-        let main = source(&shared, 0).unwrap();
+        let main = source(&mut shared, 0).unwrap();
         let lap = shared.laps.last().unwrap().clone();
         shared.comparisons.overlays.push(LapOverlay {
             alignment_valid: true,
@@ -1189,11 +1385,11 @@ mod contract_tests {
             manual_offset: 1.,
             stretch_to_reference: false,
         });
-        let overlay = source(&shared, 1).unwrap();
+        let overlay = source(&mut shared, 1).unwrap();
         assert_eq!(overlay.2, Some((lap.start_time, lap.end_time)));
         assert_eq!(main.0.recording_id(), overlay.0.recording_id());
         shared.zoom_range = Some((0.25, 0.75));
-        assert_eq!(source(&shared, 0).unwrap().2, main.2);
+        assert_eq!(source(&mut shared, 0).unwrap().2, main.2);
     }
     #[test]
     fn overlay_reference_log_reopens_on_its_exported_range() {
@@ -1260,7 +1456,7 @@ mod contract_tests {
                     manual_offset: 3.,
                     stretch_to_reference: true,
                 });
-                let (ld, output_analysis, bounds) = source(&shared, 1).unwrap();
+                let (ld, output_analysis, bounds) = source(&mut shared, 1).unwrap();
                 assert_eq!(
                     output_analysis.selected_range,
                     Some(analysis.ranges[1].id.clone())
