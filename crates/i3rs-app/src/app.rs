@@ -140,6 +140,8 @@ pub struct App {
     show_session_details: bool,
     recording_editor: crate::panels::recording_editor::RecordingEditor,
     output_ui: crate::output_ui::OutputUi,
+    #[cfg(not(target_arch = "wasm32"))]
+    m1_download_ui: crate::m1_download_ui::M1DownloadUi,
     compare_session_path: Option<PathBuf>,
     session_summary_cache: HashMap<PathBuf, SessionSummary>,
     load_error: Option<String>,
@@ -198,6 +200,8 @@ impl App {
             show_session_details: false,
             recording_editor: Default::default(),
             output_ui: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            m1_download_ui: Default::default(),
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,
@@ -1767,6 +1771,11 @@ impl App {
                         self.output_ui.browser_open = true;
                         ui.close();
                     }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if ui.button("Download M1 logs…").clicked() {
+                        self.m1_download_ui.open = true;
+                        ui.close();
+                    }
                     ui.separator();
                     ui.menu_button("Workspace Profile", |ui| {
                         for profile in crate::default_layouts::WorkspaceProfile::ALL {
@@ -2041,6 +2050,9 @@ impl App {
             let mut switch_to = None;
 
             ui.horizontal_wrapped(|ui| {
+                // Keep each field in its own allocated widget. Label's flowing
+                // text layout can place empty fields back at the row origin.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                 if let Some(project_name) = self.project_name.as_ref() {
                     ui.label(format!("Project: {}", project_name));
                     if !project_sessions.is_empty() {
@@ -2079,21 +2091,23 @@ impl App {
                     ui.separator();
                 }
 
-                ui.strong(&self.shared.file_name);
-                ui.separator();
-                ui.label(format!("{} {}", s.date, s.time));
-                ui.separator();
-                ui.label(
-                    self.shared
-                        .current_analysis()
-                        .map_or(s.venue.as_str(), |a| a.details.venue.as_str()),
-                );
-                ui.separator();
-                ui.label(
-                    self.shared
-                        .current_analysis()
-                        .map_or(s.vehicle_id.as_str(), |a| a.details.vehicle.as_str()),
-                );
+                ui.strong(&self.shared.file_name)
+                    .on_hover_text(&self.shared.file_name);
+                let date_time = format!("{} {}", s.date, s.time);
+                let venue = self
+                    .shared
+                    .current_analysis()
+                    .map_or(s.venue.as_str(), |a| a.details.venue.as_str());
+                let vehicle = self
+                    .shared
+                    .current_analysis()
+                    .map_or(s.vehicle_id.as_str(), |a| a.details.vehicle.as_str());
+                for field in [date_time.trim(), venue.trim(), vehicle.trim()] {
+                    if !field.is_empty() {
+                        ui.separator();
+                        ui.label(field).on_hover_text(field);
+                    }
+                }
                 ui.separator();
                 ui.label(i3rs_core::format_duration(ld.duration_secs()));
                 ui.separator();
@@ -2598,6 +2612,10 @@ impl eframe::App for App {
         if let Some(path) = self.output_ui.show(ui.ctx(), &mut self.shared) {
             self.open_file(path);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(path) = self.m1_download_ui.show(ui.ctx()) {
+            self.open_file(path);
+        }
         self.submit_requested_channel_decodes(ui.ctx());
         self.submit_requested_math_channel_evaluations(ui.ctx());
         self.submit_requested_track_data_build(ui.ctx());
@@ -2653,6 +2671,8 @@ mod tests {
             show_session_details: false,
             recording_editor: Default::default(),
             output_ui: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            m1_download_ui: Default::default(),
             compare_session_path: None,
             session_summary_cache: HashMap::new(),
             load_error: None,

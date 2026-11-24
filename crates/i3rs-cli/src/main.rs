@@ -1,5 +1,8 @@
 //! CLI tool for parsing and analyzing MoTeC .ld files using i3rs-core.
 
+#[cfg(not(target_arch = "wasm32"))]
+mod m1;
+
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use i3rs_core::{
     ChannelData, ChannelMeta, Lap, LdFile, LdxFile, analysis::*, detect_laps, evaluate_expression,
@@ -52,6 +55,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Experimental native M1 discovery, log download, and conversion.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[command(long_about = m1::EXPERIMENTAL_HELP)]
+    M1(m1::M1Args),
     /// Parse a log and print metadata, channel counts, laps, and sample-rate summary.
     Summary(SummaryArgs),
     /// List channels and channel metadata.
@@ -2079,6 +2086,8 @@ fn handle_run(args: RunArgs) -> Result<(), String> {
 
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
+        #[cfg(not(target_arch = "wasm32"))]
+        Commands::M1(args) => m1::run(args),
         Commands::Summary(args) => handle_summary(args),
         Commands::Channels(args) => handle_channels(args),
         Commands::Laps(args) => handle_laps(args),

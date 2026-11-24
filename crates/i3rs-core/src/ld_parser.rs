@@ -567,28 +567,64 @@ fn parse_event(data: &[u8], event_ptr: u32) -> Event {
 
 /// M1 records have a 124-byte base and pointer-linked optional blocks. They are
 /// not fixed-size: validity transitions can precede the extended attributes.
-fn channel_attributes(data: &[u8], off: usize) -> (Option<String>, Option<u16>) {
-    let mut name = None;
-    let mut enum_id = None;
+#[derive(Default)]
+struct ChannelAttributes {
+    name: Option<String>,
+    enum_id: Option<u16>,
+    signed_labels: Option<HashMap<i64, String>>,
+}
+
+// i3rs extension, version 1: retain signed 32-bit M1 enum keys without changing
+// the interpretation of the vendor's legacy unsigned 16-bit tables.
+fn signed_enum_attribute(payload: &[u8]) -> Option<HashMap<i64, String>> {
+    if payload.len() < 4 || read_u16(payload, 0) != 1 {
+        return None;
+    }
+    let count = usize::from(read_u16(payload, 2));
+    if count > 500 {
+        return None;
+    }
+    let mut labels = HashMap::new();
+    let mut pos = 4usize;
+    for _ in 0..count {
+        let header = payload.get(pos..pos.checked_add(6)?)?;
+        let value = i32::from_le_bytes(header[..4].try_into().ok()?);
+        let len = usize::from(read_u16(header, 4));
+        pos += 6;
+        let text = payload.get(pos..pos.checked_add(len)?)?;
+        if text.is_empty() || text.contains(&0) {
+            return None;
+        }
+        let text = std::str::from_utf8(text).ok()?.to_owned();
+        if labels.insert(i64::from(value), text).is_some() {
+            return None;
+        }
+        pos += len;
+    }
+    (pos == payload.len()).then_some(labels)
+}
+
+fn channel_attributes(data: &[u8], off: usize) -> ChannelAttributes {
+    let mut result = ChannelAttributes::default();
     let Some(base) = data.get(off..).filter(|b| b.len() >= 124) else {
-        return (name, enum_id);
+        return result;
     };
     let ext = read_u32(base, 120) as usize;
     let Some(extension) = data.get(ext..).filter(|b| ext != 0 && b.len() >= 6) else {
-        return (name, enum_id);
+        return result;
     };
     let ptr = read_u32(extension, 2) as usize;
     let Some(attrs) = data.get(ptr..).filter(|b| ptr != 0 && b.len() >= 8) else {
-        return (name, enum_id);
+        return result;
     };
     if read_u32(attrs, 0) != 1 {
-        return (name, enum_id);
+        return result;
     }
     let count = read_u32(attrs, 4) as usize;
     let mut pos = 8;
     // Each attribute has an eight-byte header and a length-delimited payload.
     if count > (attrs.len() - 8) / 8 {
-        return (name, enum_id);
+        return result;
     }
     for _ in 0..count {
         let Some(header) = attrs.get(pos..).and_then(|rest| rest.get(..8)) else {
@@ -604,15 +640,16 @@ fn channel_attributes(data: &[u8], off: usize) -> (Option<String>, Option<u16>) 
             4 if payload.last() == Some(&0) => {
                 let full_name = decode_string(payload);
                 if !full_name.is_empty() {
-                    name = Some(full_name);
+                    result.name = Some(full_name);
                 }
             }
-            5 if len == 2 => enum_id = Some(read_u16(payload, 0)),
+            5 if len == 2 => result.enum_id = Some(read_u16(payload, 0)),
+            0x7372_3369 => result.signed_labels = signed_enum_attribute(payload),
             _ => {}
         }
         pos += len;
     }
-    (name, enum_id)
+    result
 }
 
 fn channel_invalid_ranges(
@@ -723,8 +760,8 @@ fn parse_channel_metadata(
         }
         let legacy_name = legacy_name.replace('.', " ");
 
-        let (full_name, enum_id) = channel_attributes(data, off);
-        if let Some(full_name) = full_name {
+        let attributes = channel_attributes(data, off);
+        if let Some(full_name) = attributes.name {
             name = full_name;
         }
 
@@ -750,9 +787,12 @@ fn parse_channel_metadata(
 
         let data_type = DataType::from_codes(dtype_a, dtype_code);
 
-        let mut enum_labels = enum_id
-            .and_then(|id| enum_tables.get(&id).cloned())
-            .unwrap_or_default();
+        let mut enum_labels = attributes.signed_labels.map(Arc::new).unwrap_or_else(|| {
+            attributes
+                .enum_id
+                .and_then(|id| enum_tables.get(&id).cloned())
+                .unwrap_or_default()
+        });
         let invalid_ranges = channel_invalid_ranges(data, off, rec_freq, n_data);
         // Byte +100 is the display precision, +101 is its format (integer/float).
         // Older producers leave both zero: retain scaling precision as fallback.
@@ -1128,11 +1168,11 @@ mod tests {
     #[test]
     fn linked_attributes_preserve_names_units_precision_and_enum_references() {
         let bytes = extended_fixture();
-        let (name, enum_id) = channel_attributes(&bytes, 1800);
-        assert_eq!(enum_id, Some(137));
+        let attributes = channel_attributes(&bytes, 1800);
+        assert_eq!(attributes.enum_id, Some(137));
         let ld = LdFile::from_bytes(bytes).unwrap();
         let ch = &ld.channels[0];
-        assert_eq!(ch.name, name.unwrap());
+        assert_eq!(ch.name, attributes.name.unwrap());
         assert!(ch.name.ends_with("with its full suffix"));
         assert_eq!(ch.unit, "G");
         assert_eq!(ch.display_decimals, 3);

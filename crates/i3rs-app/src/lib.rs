@@ -25,3 +25,6 @@ mod web;
 pub use web::WebHandle;
 
 mod output_ui;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod m1_download_ui;
