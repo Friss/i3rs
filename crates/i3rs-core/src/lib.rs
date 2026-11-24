@@ -14,6 +14,7 @@ pub mod fft;
 mod lap_detect;
 mod ld_parser;
 mod ldx_parser;
+pub mod m1;
 pub mod math_engine;
 pub mod math_expr;
 pub mod reference_lap;

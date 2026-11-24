@@ -17,6 +17,9 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [[bin]]
 name = "i3rs"
 path = "src/main.rs"

@@ -18,6 +18,16 @@ quick-xml = { workspace = true }
 rustfft = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+lzma-rust2 = { version = "=0.22.0", default-features = false, features = ["std", "xz"] }
+crc32fast = "1.5.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sha2 = "0.11"
+mdns-sd = { version = "=0.21.4", default-features = false, features = ["serde"] }
+tempfile = "3.27.0"
 
 [dev-dependencies]
 criterion = "0.8"
