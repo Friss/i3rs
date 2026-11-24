@@ -2614,7 +2614,7 @@ impl eframe::App for App {
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = self.m1_download_ui.show(ui.ctx()) {
-            self.open_file(path);
+            self.open_file_async(path, ui.ctx());
         }
         self.submit_requested_channel_decodes(ui.ctx());
         self.submit_requested_math_channel_evaluations(ui.ctx());
@@ -2622,6 +2622,11 @@ impl eframe::App for App {
 
         // Clear per-frame flags
         self.shared.zoom_from_timeline = false;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn on_exit(&mut self) {
+        self.m1_download_ui.shutdown_gracefully();
     }
 
     #[cfg(target_arch = "wasm32")]

@@ -196,9 +196,6 @@ fn browse(
         if cancellation.is_cancelled() {
             return Err(DiscoveryError::Cancelled);
         }
-        if Instant::now() >= deadline {
-            break;
-        }
         match received {
             Ok(event) => apply_event(event, &mut devices, &mut warnings),
             Err(mdns_sd::RecvTimeoutError::Timeout) => {}
@@ -207,8 +204,8 @@ fn browse(
         next_receiver = (next_receiver + 1) % receivers.len();
         for receiver in &receivers {
             for _ in 0..32 {
-                if cancellation.is_cancelled() || Instant::now() >= deadline {
-                    break;
+                if cancellation.is_cancelled() {
+                    return Err(DiscoveryError::Cancelled);
                 }
                 match receiver.try_recv() {
                     Ok(event) => apply_event(event, &mut devices, &mut warnings),
@@ -218,8 +215,8 @@ fn browse(
             }
         }
         for _ in 0..32 {
-            if cancellation.is_cancelled() || Instant::now() >= deadline {
-                break;
+            if cancellation.is_cancelled() {
+                return Err(DiscoveryError::Cancelled);
             }
             match monitor.try_recv() {
                 Ok(DaemonEvent::Error(error)) => warn(&mut warnings, error.to_string()),
@@ -227,6 +224,9 @@ fn browse(
                 Err(mdns_sd::TryRecvError::Empty) => break,
                 Err(error) => return Err(mdns_error("monitor receive", error)),
             }
+        }
+        if Instant::now() >= deadline {
+            break;
         }
     }
     Ok(DiscoveryReport {
@@ -259,6 +259,8 @@ fn apply_event(
                         format!("Candidate limit {MAX_CANDIDATES} reached"),
                     );
                 }
+            } else if !service.fullname.is_empty() {
+                devices.remove(&service.fullname.to_ascii_lowercase());
             }
         }
         ServiceEvent::ServiceRemoved(_, fullname) => {
@@ -293,12 +295,23 @@ pub fn candidate_from_service(service: &ResolvedService) -> Option<CandidateDevi
             ),
             ScopedIp::V6(ip) => {
                 let scope = ip.scope_id();
+                let is_link_local = ip.addr().is_unicast_link_local();
+                let scope_id = if is_link_local { scope.index } else { 0 };
+                let interfaces = if scope.index != 0 || !scope.name.is_empty() {
+                    vec![interface(scope)]
+                } else {
+                    Vec::new()
+                };
+                let mapped_unusable = ip.addr().to_ipv4_mapped().is_some_and(|v4| {
+                    v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()
+                });
                 (
-                    SocketAddr::V6(SocketAddrV6::new(*ip.addr(), service.port, 0, scope.index)),
-                    vec![interface(scope)],
+                    SocketAddr::V6(SocketAddrV6::new(*ip.addr(), service.port, 0, scope_id)),
+                    interfaces,
                     !ip.addr().is_unspecified()
                         && !ip.addr().is_multicast()
-                        && (!ip.addr().is_unicast_link_local() || scope.index != 0),
+                        && !mapped_unusable
+                        && (!is_link_local || scope.index != 0),
                 )
             }
             _ => continue,
@@ -503,5 +516,24 @@ mod tests {
             discover(Duration::ZERO, &CancellationToken::default()),
             Err(DiscoveryError::InvalidWindow)
         );
+    }
+
+    #[test]
+    fn non_link_local_ipv6_clears_scope_id_and_rejects_mapped_multicast() {
+        let mut service = service();
+        service.addresses = [
+            scoped_v6("fd00::1", 4, "en4"),
+            scoped_v6("fd00::1", 7, "en7"),
+            scoped_v6("::ffff:224.0.0.1", 4, "en4"),
+        ]
+        .into();
+        let device = candidate_from_service(&service).unwrap();
+        assert_eq!(device.endpoints.len(), 1);
+        assert_eq!(
+            device.endpoints[0].address,
+            SocketAddr::V6(SocketAddrV6::new("fd00::1".parse().unwrap(), 5555, 0, 0))
+        );
+        assert_eq!(device.endpoints[0].interfaces.len(), 2);
+        assert_eq!(device.unusable_endpoints.len(), 1);
     }
 }

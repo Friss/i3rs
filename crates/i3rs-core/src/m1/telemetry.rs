@@ -8,6 +8,9 @@ use super::catalog::{Catalog, ValueType};
 use super::log_image::{MoRecord, MoRecordIter};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
+
+const MAX_CHANNEL_TEXT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Explicit timing departure from Tune's presentation timeline. The raw clock
 /// remains available through segment tick bounds and timestamped samples.
@@ -90,7 +93,7 @@ pub struct TelemetryChannel {
     pub address: u32,
     pub name: String,
     pub unit: String,
-    pub enum_labels: BTreeMap<i32, String>,
+    pub enum_labels: Arc<BTreeMap<i32, String>>,
     pub display_decimals: u8,
     pub frequency_hz: f64,
     pub samples: Vec<TimestampedSample>,
@@ -273,8 +276,11 @@ pub fn parse_setups(
                         .map_err(|_| invalid("logging packet index exceeds 255"))?;
                     // Count fields count source entry records, not expanded words.
 
-                    if entry_count as usize != actual_entries
-                        || entries.len().checked_mul(4) != Some(bytes as usize)
+                    if entries.is_empty() {
+                        return Err(invalid("logging packet setup has no channels"));
+                    }
+                    if usize::try_from(entry_count).ok() != Some(actual_entries)
+                        || entries.len().checked_mul(4) != usize::try_from(bytes).ok()
                     {
                         return Err(invalid("logging packet setup count mismatch"));
                     }
@@ -338,7 +344,19 @@ pub fn decode_stream(
     limits: TelemetryLimits,
 ) -> Result<DecodedTelemetry, TelemetryError> {
     decode_stream_with_capture_start(record, setups, catalog, limits, false)
-        .map(|(telemetry, _)| telemetry)
+        .map(|(telemetry, _, _)| telemetry)
+}
+
+/// As [`decode_stream`], while allowing circular-buffer streams that begin
+/// mid-recording before the first setup and high-timestamp markers.
+pub fn decode_stream_allowing_mid_stream(
+    record: MoRecord<'_>,
+    setups: &LoggingSetups,
+    catalog: &Catalog,
+    limits: TelemetryLimits,
+) -> Result<(DecodedTelemetry, [usize; 8]), TelemetryError> {
+    decode_stream_with_capture_start(record, setups, catalog, limits, true)
+        .map(|(telemetry, skipped, _)| (telemetry, skipped))
 }
 
 pub(super) fn decode_stream_with_capture_start(
@@ -347,7 +365,7 @@ pub(super) fn decode_stream_with_capture_start(
     catalog: &Catalog,
     limits: TelemetryLimits,
     allow_mid_stream_start: bool,
-) -> Result<(DecodedTelemetry, [usize; 8]), TelemetryError> {
+) -> Result<(DecodedTelemetry, [usize; 8], Vec<u8>), TelemetryError> {
     kind(record, STREAM)?;
     let clock_hz = catalog.sys_clock_hz.unwrap_or(125_000_000.0);
     if !clock_hz.is_finite() || clock_hz <= 0.0 {
@@ -369,6 +387,7 @@ pub(super) fn decode_stream_with_capture_start(
     let mut states: BTreeMap<u8, SystemState> = BTreeMap::new();
     let mut samples_left = limits.max_samples;
     let mut total_channels = 0usize;
+    let mut channel_text_bytes = 0usize;
     let mut sector_ids = BTreeSet::new();
     for sector in sectors.into_iter().rev() {
         kind(sector, SECTOR)?;
@@ -403,6 +422,14 @@ pub(super) fn decode_stream_with_capture_start(
                 FIRMWARE_STARTED => {
                     if !packet.payload.is_empty() {
                         return Err(invalid("invalid firmware-start record length"));
+                    }
+                    // A soft/watchdog reset can restart the ECU clock without
+                    // a preceding power-on record.
+                    if state.previous.is_some() || !state.current.is_empty() {
+                        state.flush();
+                        state.synchronized = true;
+                        state.high = None;
+                        state.setup = None;
                     }
                 }
                 SETUP_ID => {
@@ -496,19 +523,23 @@ pub(super) fn decode_stream_with_capture_start(
                             })?;
                         let raw = word(packet.payload, 4 + 4 * i)?;
                         let value = match definition.data_type {
-                            // Tune marks these two finite payloads as missing
-                            // for Traction Aim. Keep the original word for
-                            // inspection and mask it before applying units.
-                            ValueType::F32
-                                if matches!(raw, 0x7d8f_5c28 | 0x7e19_9999)
-                                    && definition.name == "Traction Aim" =>
-                            {
-                                f64::NAN
+                            ValueType::F32 => {
+                                let raw_f32 = f32::from_bits(raw);
+                                // Mask non-finite IEEE-754 floats and M1 Traction Aim
+                                // inactive sentinels (observed as FLT_MAX * target_ratio,
+                                // e.g. 0x7d8f_5c28 for 7% and 0x7e19_9999 for 15%).
+                                if !raw_f32.is_finite()
+                                    || (definition.name.starts_with("Traction Aim")
+                                        && raw_f32.abs() >= 1e35)
+                                {
+                                    f64::NAN
+                                } else {
+                                    f64::from(raw_f32)
+                                }
                             }
-                            ValueType::F32 => f32::from_bits(raw) as f64,
                             ValueType::U32 => raw as f64,
                             ValueType::I32 | ValueType::Enum => raw as i32 as f64,
-                            ValueType::I32E7 => (raw as i32 as f64) * 1e-7,
+                            ValueType::I32E7 => (raw as i32 as f64) / 1e7,
                         };
                         let value = value * definition.display_scale + definition.display_offset;
                         let channel = match state.current.entry((base, address)) {
@@ -520,14 +551,20 @@ pub(super) fn decode_stream_with_capture_start(
                                 if total_channels > limits.max_channels {
                                     return Err(invalid("telemetry channel limit exceeded"));
                                 }
+                                channel_text_bytes = channel_text_bytes
+                                    .checked_add(definition.name.len() + definition.unit.len())
+                                    .filter(|total| *total <= MAX_CHANNEL_TEXT_BYTES)
+                                    .ok_or_else(|| {
+                                        invalid("telemetry channel metadata text limit exceeded")
+                                    })?;
                                 entry.insert(TelemetryChannel {
                                     data_type: definition.data_type,
                                     base,
                                     address,
                                     name: definition.name.clone(),
                                     unit: definition.unit.clone(),
-                                    enum_labels: definition.enum_labels.clone(),
-                                    display_decimals: definition.display_decimals,
+                                    enum_labels: Arc::clone(&definition.enum_labels),
+                                    display_decimals: definition.display_decimals.min(9),
                                     frequency_hz: frequency,
                                     samples: Vec::new(),
                                 })
@@ -537,6 +574,13 @@ pub(super) fn decode_stream_with_capture_start(
                             return Err(invalid(
                                 "channel appears at conflicting logging frequencies",
                             ));
+                        }
+                        if channel
+                            .samples
+                            .last()
+                            .is_some_and(|prev| time_seconds <= prev.time_seconds)
+                        {
+                            return Err(invalid("channel timestamp is not strictly increasing"));
                         }
                         channel.samples.push(TimestampedSample {
                             time_seconds,
@@ -554,6 +598,7 @@ pub(super) fn decode_stream_with_capture_start(
     }
     let mut systems = Vec::new();
     let mut skipped = [0; 8];
+    let mut undecodable_partial = Vec::new();
     for (system_id, mut state) in states {
         state.flush();
         skipped[usize::from(system_id)] = state.leading_packets_skipped;
@@ -563,11 +608,16 @@ pub(super) fn decode_stream_with_capture_start(
                 segments: state.segments,
             });
         } else if state.leading_packets_skipped != 0 {
-            return Err(invalid(format!(
-                "logging system {} has numeric packets but no decodable setup and timestamp context",
-                system_id + 1
-            )));
+            undecodable_partial.push(system_id);
         }
+    }
+    if systems.is_empty()
+        && let Some(&system_id) = undecodable_partial.first()
+    {
+        return Err(invalid(format!(
+            "logging system {} has numeric packets but no decodable setup and timestamp context",
+            system_id + 1
+        )));
     }
     Ok((
         DecodedTelemetry {
@@ -576,6 +626,7 @@ pub(super) fn decode_stream_with_capture_start(
             used_default_clock: catalog.sys_clock_hz.is_none(),
         },
         skipped,
+        undecodable_partial,
     ))
 }
 
@@ -671,7 +722,7 @@ mod tests {
                     name: format!("Channel {address}"),
                     unit: String::new(),
                     data_type,
-                    enum_labels: BTreeMap::new(),
+                    enum_labels: Arc::new(BTreeMap::new()),
                     display_decimals: 3,
                     display_scale: 1.0,
                     display_offset: 0.0,
@@ -757,7 +808,17 @@ mod tests {
 
     #[test]
     fn traction_aim_missing_words_are_masked_before_scaling() {
-        let words = [0x7d8f_5c28, 0x7e19_9999, 0.125f32.to_bits()];
+        // Covers the two observed M150 products (7% and 15% of f32::MAX), other
+        // dial settings (e.g. 10% of f32::MAX), raw f32::MAX, and +/-Inf.
+        let ten_pct_sentinel = (f32::MAX * 0.10).to_bits();
+        let words = [
+            0x7d8f_5c28,
+            0x7e19_9999,
+            ten_pct_sentinel,
+            f32::MAX.to_bits(),
+            f32::INFINITY.to_bits(),
+            0.125f32.to_bits(),
+        ];
         let mut packets = sync();
         packets.extend(
             words
@@ -779,14 +840,41 @@ mod tests {
             samples.iter().map(|s| s.source_word).collect::<Vec<_>>(),
             words
         );
-        assert!(samples[0].value.is_nan() && samples[1].value.is_nan());
-        assert_eq!(samples[2].value, 12.5);
+        assert!(samples[..5].iter().all(|s| s.value.is_nan()));
+        assert_eq!(samples[5].value, 12.5);
 
         let ordinary_channel = decode(&bytes, limits).unwrap();
         let samples = &ordinary_channel.systems[0].segments[0].channels[0].samples;
         for (sample, word) in samples.iter().zip(words) {
-            assert_eq!(sample.value, f64::from(f32::from_bits(word)));
+            let f = f32::from_bits(word);
+            if f.is_finite() {
+                assert_eq!(sample.value, f64::from(f));
+            } else {
+                assert!(sample.value.is_nan());
+            }
         }
+    }
+
+    #[test]
+    fn firmware_started_flushes_active_segment_and_enum_labels_share_arc_across_segments() {
+        let mut packets = sync();
+        packets.push(packet(100));
+        packets.push(record(FIRMWARE_STARTED, 0, &[]));
+        packets.extend(sync());
+        packets.push(packet(20));
+        let bytes = record(STREAM, 0, &sector(0, packets));
+        let raw_setups = setups();
+        let limits = TelemetryLimits::default();
+        let parsed_setups = parse_setups(borrowed(&raw_setups), limits).unwrap();
+        let mut cat = catalog();
+        let shared = Arc::new(BTreeMap::from([(0, "Off".into()), (1, "On".into())]));
+        cat.channels.get_mut(&(1, 0x104)).unwrap().enum_labels = Arc::clone(&shared);
+        let decoded = decode_stream(borrowed(&bytes), &parsed_setups, &cat, limits).unwrap();
+        assert_eq!(decoded.systems[0].segments.len(), 2);
+        assert!(Arc::ptr_eq(
+            &decoded.systems[0].segments[0].channels[1].enum_labels,
+            &decoded.systems[0].segments[1].channels[1].enum_labels,
+        ));
     }
 
     #[test]

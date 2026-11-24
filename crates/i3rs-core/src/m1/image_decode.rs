@@ -28,6 +28,8 @@ const METADATA_GUID: u32 = 0x0201_0044;
 const CONFIG_XML: u32 = 0x0201_002c;
 const VARIANT_VALUE: u32 = 0x0101_0008;
 const MAX_SESSION_TEXT_BYTES: usize = 64 * 1024;
+const MAX_LD_SESSION_FIELD_BYTES: usize = 64;
+const MAX_INDIVIDUAL_UNIT_WARNINGS: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImageDecodeLimits {
@@ -42,7 +44,7 @@ pub struct ImageDecodeLimits {
 impl Default for ImageDecodeLimits {
     fn default() -> Self {
         Self {
-            max_image_bytes: 256 * 1024 * 1024,
+            max_image_bytes: 512 * 1024 * 1024,
             max_decoded_bytes: 64 * 1024 * 1024,
             max_catalog_items: 20_000,
             max_xz_memory_kib: 64 * 1024,
@@ -81,7 +83,7 @@ pub fn decode_image(bytes: &[u8], limits: &ImageDecodeLimits) -> Result<DecodedI
     if image.header.encoding != 0 {
         return Err("transformed M1 image roots are unsupported".into());
     }
-    let session = session_metadata(&image, limits.telemetry.max_records)?;
+    let (session, session_warnings) = session_metadata(&image, limits.telemetry.max_records)?;
     let mut budget = HeaderBudget(limits.telemetry.max_records);
     budget.take()?; // Outer image header.
     let mut setup_record = None;
@@ -108,7 +110,9 @@ pub fn decode_image(bytes: &[u8], limits: &ImageDecodeLimits) -> Result<DecodedI
         limits,
         &mut budget,
         true,
+        false,
     )?;
+    decoded.warnings.extend(session_warnings);
     if unrelated_roots != 0 {
         decoded.warnings.push(format!(
             "{unrelated_roots} unrecognized root record(s) were left uninterpreted."
@@ -132,7 +136,19 @@ pub fn decode_parts(
     session: Session,
     limits: &ImageDecodeLimits,
 ) -> Result<DecodedImage, String> {
-    decode_parts_with_capture_start(setups, metadata, stream, session, limits, false)
+    decode_parts_with_capture_start(setups, metadata, stream, session, limits, false, false)
+}
+
+/// As [`decode_parts`], while allowing circular-buffer streams that begin
+/// mid-recording before the first setup and high-timestamp markers.
+pub fn decode_parts_allowing_mid_stream(
+    setups: MoRecord<'_>,
+    metadata: MoRecord<'_>,
+    stream: MoRecord<'_>,
+    session: Session,
+    limits: &ImageDecodeLimits,
+) -> Result<DecodedImage, String> {
+    decode_parts_with_capture_start(setups, metadata, stream, session, limits, true, false)
 }
 
 pub(super) fn decode_parts_with_capture_start(
@@ -142,6 +158,7 @@ pub(super) fn decode_parts_with_capture_start(
     session: Session,
     limits: &ImageDecodeLimits,
     allow_mid_stream_start: bool,
+    from_raw_capture: bool,
 ) -> Result<DecodedImage, String> {
     validate_limits(limits)?;
     let mut total = 0usize;
@@ -177,9 +194,11 @@ pub(super) fn decode_parts_with_capture_start(
         limits,
         &mut budget,
         allow_mid_stream_start,
+        from_raw_capture,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_records(
     setup_record: MoRecord<'_>,
     metadata_record: MoRecord<'_>,
@@ -188,6 +207,7 @@ fn decode_records(
     limits: &ImageDecodeLimits,
     budget: &mut HeaderBudget,
     allow_mid_stream_start: bool,
+    from_raw_capture: bool,
 ) -> Result<DecodedImage, String> {
     if setup_record.header.record_type != SETUPS
         || metadata_record.header.record_type != METADATA_LIST
@@ -205,12 +225,19 @@ fn decode_records(
     let config = entries
         .get(&required_guid)
         .ok_or("logging setups have no matching metadata GUID in the image")?;
+    if config.header.encoding != XZ_RECORD_ENCODING || config.header.flags != 0 {
+        return Err(
+            "logging metadata XML requires the supported encoding-31/index-0 layout".into(),
+        );
+    }
     // Validate packet layouts before allocating or decompressing their catalog.
     let setups = parse_setups(setup_record, limits.telemetry).map_err(|error| error.to_string())?;
-    let decoded_config =
-        decode_xz_record(config, limits.max_decoded_bytes, limits.max_xz_memory_kib)?;
+    let max_xml_record_bytes = limits
+        .max_decoded_bytes
+        .min(super::catalog::MAX_XML_BYTES + MO_HEADER_SIZE);
+    let decoded_config = decode_xz_record(config, max_xml_record_bytes, limits.max_xz_memory_kib)?;
     let catalog = parse_catalog(&decoded_config[MO_HEADER_SIZE..], limits.max_catalog_items)?;
-    let (telemetry, skipped) = decode_stream_with_capture_start(
+    let (telemetry, skipped, undecodable_partial) = decode_stream_with_capture_start(
         stream_record,
         &setups,
         &catalog,
@@ -218,11 +245,12 @@ fn decode_records(
         allow_mid_stream_start,
     )
     .map_err(|error| error.to_string())?;
-    let mut warnings = vec![
-        "Image enable/permission records remain opaque; conversion permissions and image signatures were not validated.".into(),
-        "Recording calendar timestamps are not interpreted; source retrieval time is not used as recording time.".into(),
-        TIMESTAMP_POLICY.into(),
-    ];
+    let mut warnings = Vec::new();
+    if !from_raw_capture {
+        warnings.push("Image enable/permission records remain opaque; conversion permissions and image signatures were not validated.".into());
+        warnings.push("Recording calendar timestamps are not interpreted; source retrieval time is not used as recording time.".into());
+    }
+    warnings.push(TIMESTAMP_POLICY.into());
     for (system, count) in skipped.into_iter().enumerate() {
         if count != 0 {
             warnings.push(format!(
@@ -230,6 +258,12 @@ fn decode_records(
                 system + 1
             ));
         }
+    }
+    for system in undecodable_partial {
+        warnings.push(format!(
+            "Logging system {} had only leading numeric packets without setup and high-timestamp markers and was omitted.",
+            system + 1
+        ));
     }
     append_catalog_warnings(&catalog, &telemetry, &mut warnings);
     if telemetry.used_default_clock {
@@ -260,12 +294,19 @@ fn append_catalog_warnings(
         .flat_map(|segment| &segment.channels)
         .map(|channel| (channel.base, channel.address))
         .collect();
-    warnings.extend(
-        selected
-            .iter()
-            .filter_map(|address| catalog.unit_conversion_warnings.get(address))
-            .cloned(),
-    );
+    let matched: Vec<_> = selected
+        .iter()
+        .filter_map(|address| catalog.unit_conversion_warnings.get(address))
+        .collect();
+    for warning in matched.iter().take(MAX_INDIVIDUAL_UNIT_WARNINGS) {
+        warnings.push((*warning).clone());
+    }
+    if matched.len() > MAX_INDIVIDUAL_UNIT_WARNINGS {
+        warnings.push(format!(
+            "And {} additional channel(s) retained physical units due to unsupported display conversions.",
+            matched.len() - MAX_INDIVIDUAL_UNIT_WARNINGS
+        ));
+    }
 }
 
 fn validate_limits(limits: &ImageDecodeLimits) -> Result<(), String> {
@@ -378,9 +419,6 @@ fn metadata_entries<'a>(
                     }
                 }
                 CONFIG_XML => {
-                    if field.header.encoding != XZ_RECORD_ENCODING || field.header.flags != 0 {
-                        return Err("logging metadata XML requires the supported encoding-31/index-0 layout".into());
-                    }
                     unique(&mut xml, field, "logging metadata XML")?;
                 }
                 _ => return Err("unexpected record in logging metadata entry".into()),
@@ -395,13 +433,32 @@ fn metadata_entries<'a>(
     Ok(result)
 }
 
-fn session_metadata(image: &RawLogImage<'_>, max_records: usize) -> Result<Session, String> {
+fn truncate_session_field(text: &str, field: &str, warnings: &mut Vec<String>) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() <= MAX_LD_SESSION_FIELD_BYTES {
+        return trimmed.to_owned();
+    }
+    let mut end = MAX_LD_SESSION_FIELD_BYTES;
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    warnings.push(format!(
+        "Image session field {field} exceeded {MAX_LD_SESSION_FIELD_BYTES} bytes and was truncated for LD header compatibility."
+    ));
+    trimmed[..end].trim_end().to_owned()
+}
+
+fn session_metadata(
+    image: &RawLogImage<'_>,
+    max_records: usize,
+) -> Result<(Session, Vec<String>), String> {
     let metadata = image
         .inspect_metadata_with_limit(max_records.min(DEFAULT_METADATA_RECORD_LIMIT))
         .map_err(|error| error.to_string())?;
     let mut version = None;
     let mut serial = None;
     let mut strings = BTreeMap::new();
+    let mut warnings = Vec::new();
     for group in &metadata.groups {
         if !matches!(group.record.header.flags, 0 | 1) {
             continue;
@@ -441,9 +498,10 @@ fn session_metadata(image: &RawLogImage<'_>, max_records: usize) -> Result<Sessi
                     );
                 }
                 let text = std::str::from_utf8(value.payload)
-                    .map_err(|_| "image session text is not UTF-8")?
-                    .to_owned();
-                if strings.insert(name, text).is_some() {
+                    .map_err(|_| "image session text is not UTF-8")?;
+                let field_name = std::str::from_utf8(name).unwrap_or("Session");
+                let cleaned = truncate_session_field(text, field_name, &mut warnings);
+                if strings.insert(name, cleaned).is_some() {
                     return Err("duplicate image session text property".into());
                 }
             }
@@ -454,20 +512,23 @@ fn session_metadata(image: &RawLogImage<'_>, max_records: usize) -> Result<Sessi
             "unsupported M1 image version {version:?}; expected version 3"
         ));
     }
-    Ok(Session {
-        date: String::new(),
-        time: String::new(),
-        driver: strings.remove(b"Driver".as_slice()).unwrap_or_default(),
-        vehicle_id: strings.remove(b"Vehicle Id".as_slice()).unwrap_or_default(),
-        venue: strings.remove(b"Venue".as_slice()).unwrap_or_default(),
-        short_comment: strings
-            .remove(b"Short Comment".as_slice())
-            .unwrap_or_default(),
-        device_serial: serial.unwrap_or_default(),
-        device_type: "M1".into(),
-        device_version: 0,      // Image format version is not ECU firmware version.
-        num_channels_header: 0, // Each exported segment determines its own count.
-    })
+    Ok((
+        Session {
+            date: String::new(),
+            time: String::new(),
+            driver: strings.remove(b"Driver".as_slice()).unwrap_or_default(),
+            vehicle_id: strings.remove(b"Vehicle Id".as_slice()).unwrap_or_default(),
+            venue: strings.remove(b"Venue".as_slice()).unwrap_or_default(),
+            short_comment: strings
+                .remove(b"Short Comment".as_slice())
+                .unwrap_or_default(),
+            device_serial: serial.unwrap_or_default(),
+            device_type: "M1".into(),
+            device_version: 0, // Image format version is not ECU firmware version.
+            num_channels_header: 0, // Each exported segment determines its own count.
+        },
+        warnings,
+    ))
 }
 
 fn property_value<'a>(property: &MetadataProperty<'a>) -> Result<MoRecord<'a>, String> {
@@ -731,7 +792,7 @@ mod tests {
         let metadata = borrowed(roots[1].as_slice());
         let stream = borrowed(roots[2].as_slice());
         let bytes = image(vec![]);
-        let session = session_metadata(&RawLogImage::parse(&bytes).unwrap(), 100).unwrap();
+        let (session, _) = session_metadata(&RawLogImage::parse(&bytes).unwrap(), 100).unwrap();
         let limits = ImageDecodeLimits::default();
         let decoded = decode_parts(setups, metadata, stream, session.clone(), &limits).unwrap();
         assert_eq!(
@@ -870,7 +931,7 @@ mod tests {
         let roots = properties();
         let bytes = record(LOG_IMAGE_RECORD_TYPE, 0, 0, &joined(&roots));
         let parsed = RawLogImage::parse(&bytes).unwrap();
-        assert_eq!(session_metadata(&parsed, 100).unwrap().device_serial, 42);
+        assert_eq!(session_metadata(&parsed, 100).unwrap().0.device_serial, 42);
         for payload in [vec![2, 4, 0, 0, 0], vec![1, 3, 0, 0, 0]] {
             let group = record(
                 PROPERTIES_RECORD_TYPE,
@@ -926,6 +987,46 @@ mod tests {
                 .iter()
                 .any(|warning| warning == TIMESTAMP_POLICY)
         );
+
+        // Many unsupported display unit warnings are summarized so conversion
+        // manifests stay within their warning-count bound.
+        let mut many_warnings = BTreeMap::new();
+        let mut many_channels = Vec::new();
+        for index in 0..150u32 {
+            many_warnings.insert((1, index), format!("Channel {index}: retained"));
+            many_channels.push(super::super::telemetry::TelemetryChannel {
+                data_type: super::super::catalog::ValueType::F32,
+                base: 1,
+                address: index,
+                name: format!("Ch {index}"),
+                unit: String::new(),
+                enum_labels: Default::default(),
+                display_decimals: 1,
+                frequency_hz: 1.,
+                samples: Vec::new(),
+            });
+        }
+        let catalog = Catalog {
+            unit_conversion_warnings: many_warnings,
+            ..Catalog::default()
+        };
+        let telemetry = DecodedTelemetry {
+            systems: vec![super::super::telemetry::DecodedSystem {
+                system_id: 0,
+                segments: vec![super::super::telemetry::DecodedSegment {
+                    index: 0,
+                    start_ticks: 0,
+                    end_ticks: 0,
+                    channels: many_channels,
+                }],
+            }],
+            clock_hz: 125_000_000.,
+            used_default_clock: true,
+        };
+        let mut summarized = Vec::new();
+        append_catalog_warnings(&catalog, &telemetry, &mut summarized);
+        assert_eq!(summarized.len(), MAX_INDIVIDUAL_UNIT_WARNINGS + 1);
+        assert!(summarized.last().unwrap().contains("118 additional"));
     }
 
     #[test]

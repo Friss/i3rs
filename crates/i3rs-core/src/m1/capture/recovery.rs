@@ -2,6 +2,7 @@
 
 use sha2::{Digest, Sha256};
 
+use super::super::xcp::ByteOrder;
 use super::*;
 
 pub(super) struct RecoverySettings {
@@ -28,6 +29,7 @@ pub(super) struct RecoveringReader<'a> {
     committed: Vec<CommittedRecord>,
     attempts: u8,
     fast_upload: Option<bool>,
+    fast_upload_params: Option<(ByteOrder, u16)>,
     // Retain all old local ports, including failed handshakes, for this capture.
     // retire() prevents their Drop from disconnecting the replacement session.
     retired: Vec<XcpClient>,
@@ -54,6 +56,7 @@ impl<'a> RecoveringReader<'a> {
             } else {
                 Some(false)
             },
+            fast_upload_params: None,
             retired: Vec::new(),
         }
     }
@@ -81,10 +84,16 @@ impl<'a> RecoveringReader<'a> {
         progress: &mut impl FnMut(CaptureProgress),
     ) -> Result<(), CaptureErrorKind> {
         let payload = standard.len() - MO_HEADER_SIZE;
+        // Never spend the final reconnect slot or exhaust budget needed for
+        // remaining metadata on an optional Fast Upload probe.
+        let required_budget = (standard.len() as u64)
+            .saturating_mul(2)
+            .saturating_add(self.initial.info_bytes.len() as u64);
         if self.fast_upload.is_some()
+            || self.attempts >= self.limits.max_reconnects
             || !self.client.can_fast_upload(payload)
             || payload <= usize::from(self.client.parameters().max_dto) - 4
-            || self.budget.limit - self.budget.used < standard.len() as u64
+            || self.budget.limit.saturating_sub(self.budget.used) < required_budget
         {
             return Ok(());
         }
@@ -97,11 +106,23 @@ impl<'a> RecoveringReader<'a> {
         ) {
             Ok(bytes) if bytes == standard => {
                 self.fast_upload = Some(true);
+                let params = self.client.parameters();
+                self.fast_upload_params = Some((params.byte_order, params.max_dto));
                 diagnostics.push("Verified M1 Fast Upload byte for byte against standard XCP. Using indexed blocks for eligible records.".into());
                 return Ok(());
             }
             Ok(_) => "bytes differed from the standard read".into(),
-            Err(error) if transient(&error) || incompatible_fast_upload(&error) => {
+            Err(error)
+                if transient(&error)
+                    || incompatible_fast_upload(&error)
+                    || matches!(
+                        error,
+                        CaptureErrorKind::Transport(XcpError::CommandRejected {
+                            command: "Fast Upload",
+                            ..
+                        })
+                    ) =>
+            {
                 error.to_string()
             }
             Err(error) => return Err(error),
@@ -179,7 +200,7 @@ impl<'a> RecoveringReader<'a> {
                 }
                 std::thread::sleep(remaining.min(Duration::from_millis(25)));
             }
-            let result = self.reconnect_and_validate(&report, progress);
+            let result = self.reconnect_and_validate(&report, diagnostics, progress);
             match result {
                 Ok(()) => {
                     diagnostics.push(format!("Recovery attempt {} verified unchanged source; restarting interrupted record", self.attempts));
@@ -187,6 +208,14 @@ impl<'a> RecoveringReader<'a> {
                     resumed.bytes = self.budget.used;
                     progress(resumed);
                     return Ok(());
+                }
+                Err(error)
+                    if self.fast_upload == Some(true) && incompatible_fast_upload(&error) =>
+                {
+                    self.fast_upload = Some(false);
+                    diagnostics.push(format!(
+                        "M1 Fast Upload failed during recovery ({error}); falling back to standard XCP reads."
+                    ));
                 }
                 Err(error) if transient(&error) => {
                     diagnostics.push(format!(
@@ -202,6 +231,7 @@ impl<'a> RecoveringReader<'a> {
     fn reconnect_and_validate(
         &mut self,
         report: &CaptureProgress,
+        diagnostics: &mut Vec<String>,
         progress: &mut impl FnMut(CaptureProgress),
     ) -> Result<(), CaptureErrorKind> {
         // Open while the retired socket is still bound: even a repeated
@@ -213,6 +243,19 @@ impl<'a> RecoveringReader<'a> {
         )?;
         self.retired.push(std::mem::replace(&mut self.client, next));
         self.client.negotiate()?;
+        if self.fast_upload == Some(true)
+            && let Some(prev_fast_params) = self.fast_upload_params
+            && (
+                self.client.parameters().byte_order,
+                self.client.parameters().max_dto,
+            ) != prev_fast_params
+        {
+            self.fast_upload = Some(false);
+            diagnostics.push(
+                "Negotiated XCP byte order or max DTO changed on reconnect; disabling Fast Upload for standard XCP reads."
+                    .into(),
+            );
+        }
         let prepared = read_inspection(
             &mut self.client,
             self.settings.endpoint,
@@ -236,13 +279,32 @@ impl<'a> RecoveringReader<'a> {
         }
         for record in &self.committed {
             check_cancelled(&self.settings.cancellation)?;
-            let bytes = self.budget.read_record_with_upload(
+            let remaining_budget = self.budget.limit.saturating_sub(self.budget.used);
+            let fast = record.extension != 0x26 && self.fast_upload == Some(true);
+            let bytes = match self.budget.read_record_with_upload(
                 &mut self.client,
                 record.extension,
                 record.address,
                 record.length,
-                self.fast_upload == Some(true),
-            )?;
+                fast,
+            ) {
+                Ok(bytes) => bytes,
+                // If budget could cover the committed length, exceeding
+                // record.length (or an invalid Mo header) means the source changed.
+                Err(CaptureErrorKind::Transport(XcpError::ReadLimitExceeded {
+                    requested,
+                    limit,
+                })) if remaining_budget >= record.length as u64
+                    && limit == record.length
+                    && requested > record.length =>
+                {
+                    return Err(CaptureErrorKind::SourceChanged(record.name.clone()));
+                }
+                Err(CaptureErrorKind::Transport(XcpError::InvalidRecord(_))) => {
+                    return Err(CaptureErrorKind::SourceChanged(record.name.clone()));
+                }
+                Err(error) => return Err(error),
+            };
             if bytes.len() != record.length
                 || <[u8; 32]>::from(Sha256::digest(&bytes)) != record.digest
             {

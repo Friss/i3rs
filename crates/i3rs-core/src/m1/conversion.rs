@@ -355,13 +355,18 @@ pub fn persist_decoded(
                 u16::from(*system) + 1,
                 segment.index + 1
             );
+            // Stage into a .partial filename until sync_all completes so an
+            // interrupted write never masquerades as a readable .ld recording.
+            let staged_name = format!("{name}.partial");
+            let staged_path = child.join(&staged_name);
+            let final_path = child.join(&name);
             let mut file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(child.join(&name))
+                .open(&staged_path)
                 .map_err(io_error)?;
             current.files.push(ConvertedFile {
-                file_name: name,
+                file_name: staged_name,
                 system: *system,
                 segment: segment.index,
                 start_ticks: segment.start_ticks,
@@ -380,14 +385,17 @@ pub fn persist_decoded(
                 file.sync_all().map_err(io_error)
             })();
             let actual = file.metadata().map_err(io_error)?.len();
+            drop(file);
             let entry = current.files.last_mut().unwrap();
             entry.bytes = actual;
-            entry.complete = result.is_ok() && actual == entry.expected_bytes;
             current.total_bytes += actual;
             result?;
-            if !entry.complete {
+            if actual != entry.expected_bytes {
                 return Err("LD output file length differs from encoded bytes".into());
             }
+            fs::rename(&staged_path, &final_path).map_err(io_error)?;
+            entry.file_name = name;
+            entry.complete = true;
             completed += 1;
             replace_manifest(&child, current)?;
             progress(ConversionProgress {
@@ -471,7 +479,11 @@ fn read_bounded(
         check_cancelled(cancellation)?;
         let available = limit - bytes.len();
         let want = chunk.len().min(available.saturating_add(1));
-        let count = file.read(&mut chunk[..want]).map_err(io_error)?;
+        let count = match file.read(&mut chunk[..want]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(io_error(error)),
+        };
         if count == 0 {
             return Ok(bytes);
         }
@@ -565,7 +577,13 @@ fn write_manifest(path: &Path, manifest: &ConversionManifest) -> Result<(), Stri
 fn replace_manifest(directory: &Path, manifest: &ConversionManifest) -> Result<(), String> {
     let next = directory.join("manifest.next.json");
     write_manifest(&next, manifest)?;
-    fs::rename(next, directory.join("manifest.json")).map_err(io_error)
+    if let Err(error) = fs::rename(&next, directory.join("manifest.json")) {
+        // write_manifest succeeded with create_new, so this staged file is ours;
+        // remove it so subsequent failure-state saves do not hit AlreadyExists.
+        let _ = fs::remove_file(&next);
+        return Err(io_error(error));
+    }
+    Ok(())
 }
 
 fn io_error(error: io::Error) -> String {

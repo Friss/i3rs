@@ -556,9 +556,22 @@ fn conversion_errors_are_bounded_and_do_not_create_outputs() {
         vec![
             "m1",
             "convert-image",
-            "/missing-i3rs-test-image",
+            directory
+                .0
+                .join("missing-i3rs-test-image")
+                .to_str()
+                .unwrap(),
             "--destination",
             directory.0.to_str().unwrap(),
+        ],
+        vec![
+            "m1",
+            "convert-image",
+            path.to_str().unwrap(),
+            "--destination",
+            directory.0.to_str().unwrap(),
+            "--max-records",
+            "0",
         ],
     ] {
         let output = cli(&args);
@@ -672,8 +685,8 @@ fn loopback_download_captures_and_converts_with_read_only_commands() {
         "--timeout-ms",
         "1000",
     ]);
-    server.join().unwrap();
     let json = success_json(output);
+    server.join().unwrap();
     assert_eq!(json["schema_version"], "i3rs-cli.m1.download.v1");
     assert_eq!(json["raw_manifest"]["state"], "complete");
     assert!(
@@ -690,6 +703,46 @@ fn loopback_download_captures_and_converts_with_read_only_commands() {
         directory.0.to_str().unwrap(),
     ]));
     assert_converted_json(&json);
+
+    // Also verify --recover-partial on an interrupted bundle.
+    let partial_dir = TestDirectory::new();
+    let raw_dir = PathBuf::from(json["manifest"]["source"]["path"].as_str().unwrap());
+    let mut partial_manifest: Value =
+        serde_json::from_slice(&fs::read(raw_dir.join("manifest.json")).unwrap()).unwrap();
+    let after = partial_manifest["files"]
+        .as_array_mut()
+        .unwrap()
+        .pop()
+        .unwrap();
+    let after_bytes = after["bytes"].as_u64().unwrap();
+    partial_manifest["total_bytes"] =
+        Value::from(partial_manifest["total_bytes"].as_u64().unwrap() - after_bytes);
+    partial_manifest["state"] = Value::from("incomplete");
+    partial_manifest["boundaries_unchanged"] = Value::Null;
+    for entry in partial_manifest["files"].as_array().unwrap() {
+        let name = entry["file_name"].as_str().unwrap();
+        fs::copy(raw_dir.join(name), partial_dir.0.join(name)).unwrap();
+    }
+    fs::write(
+        partial_dir.0.join("manifest.json"),
+        serde_json::to_vec_pretty(&partial_manifest).unwrap(),
+    )
+    .unwrap();
+    let recovered = success_json(cli(&[
+        "m1",
+        "convert-capture",
+        partial_dir.0.to_str().unwrap(),
+        "--recover-partial",
+        "--destination",
+        directory.0.to_str().unwrap(),
+    ]));
+    assert_converted_json(&recovered);
+    assert!(
+        recovered["manifest"]["files"][0]["file_name"]
+            .as_str()
+            .unwrap()
+            .starts_with("partial-")
+    );
 }
 
 #[test]
@@ -709,8 +762,8 @@ fn download_conversion_failure_reports_and_preserves_complete_raw_bundle() {
         "--max-samples",
         "1",
     ]);
-    server.join().unwrap();
     assert!(!output.status.success());
+    server.join().unwrap();
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("raw capture retained at"), "{error}");
     assert!(error.contains("sample limit"), "{error}");

@@ -1,6 +1,6 @@
 //! Experimental native M1 acquisition and conversion commands.
 
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -94,9 +94,9 @@ struct CaptureArgs {
     max_total_bytes: u64,
     #[arg(long, default_value_t = 16_777_216, value_parser = parse_record_limit)]
     max_sector_bytes: usize,
-    #[arg(long, default_value_t = 10_000)]
+    #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u64).range(1..))]
     max_sectors: u64,
-    /// Total automatic reconnect attempts after a transient download failure (0 disables).
+    /// Total automatic reconnect attempts after a transient download failure (0 disables recovery and Fast Upload).
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=8))]
     reconnect_attempts: u8,
     /// Disable verified MoTeC Fast Upload and use standard XCP reads only.
@@ -109,7 +109,7 @@ struct CaptureArgs {
 #[derive(Args)]
 struct ConversionLimitArgs {
     /// Maximum source image or combined captured setup, metadata and sector bytes.
-    #[arg(long, default_value_t=268_435_456, value_parser=parse_record_limit)]
+    #[arg(long, default_value_t=536_870_912, value_parser=parse_record_limit)]
     max_input_bytes: usize,
     #[arg(long, default_value_t=67_108_864, value_parser=parse_record_limit)]
     max_decoded_bytes: usize,
@@ -120,12 +120,12 @@ struct ConversionLimitArgs {
     #[arg(long, default_value_t=1024, value_parser=clap::value_parser!(u32).range(1..=10_000))]
     max_output_files: u32,
     /// Maximum number of source records, including telemetry packets.
-    #[arg(long, default_value_t = TelemetryLimits::default().max_records)]
+    #[arg(long, default_value_t = TelemetryLimits::default().max_records, value_parser = parse_positive_usize)]
     max_records: usize,
-    #[arg(long, default_value_t = TelemetryLimits::default().max_samples)]
+    #[arg(long, default_value_t = TelemetryLimits::default().max_samples, value_parser = parse_positive_usize)]
     max_samples: usize,
     /// Maximum number of channel series across all recording segments.
-    #[arg(long, default_value_t = TelemetryLimits::default().max_channels)]
+    #[arg(long, default_value_t = TelemetryLimits::default().max_channels, value_parser = parse_positive_usize)]
     max_channels: usize,
 }
 impl ConversionLimitArgs {
@@ -149,6 +149,13 @@ fn parse_system(value: &str) -> Result<u8, String> {
         .ok()
         .filter(|number| (1..=8).contains(number))
         .ok_or_else(|| "logging systems are numbered 1 through 8".into())
+}
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|count| *count >= 1)
+        .ok_or_else(|| "limit must be at least 1 and fit this platform".into())
 }
 fn parse_record_limit(value: &str) -> Result<usize, String> {
     value
@@ -194,21 +201,20 @@ fn parse_endpoint(value: &str) -> Result<SocketAddr, String> {
 pub(super) fn run(args: M1Args) -> Result<(), String> {
     match args.command {
         M1Command::Devices { window_ms } => {
-            let report = discovery::discover(
-                Duration::from_millis(window_ms),
-                &CancellationToken::default(),
-            )
-            .map_err(|error| error.to_string())?;
+            let sigint = SigintCancellation::install();
+            let report = discovery::discover(Duration::from_millis(window_ms), sigint.token())
+                .map_err(|error| error.to_string())?;
             super::print_json(&discovery_json(report))
         }
         M1Command::Inspect {
             endpoint,
             timeout_ms,
         } => {
+            let sigint = SigintCancellation::install();
             let inspection = capture::inspect_device(
                 endpoint,
                 Duration::from_millis(timeout_ms),
-                CancellationToken::default(),
+                sigint.token().clone(),
                 &CaptureLimits::default(),
             )
             .map_err(|error| error.to_string())?;
@@ -227,7 +233,8 @@ pub(super) fn run(args: M1Args) -> Result<(), String> {
             super::print_json(&value)
         }
         M1Command::DownloadRaw(args) => {
-            let result = acquire(args)?;
+            let sigint = SigintCancellation::install();
+            let result = acquire(args, sigint.token().clone())?;
             super::print_json(&json!({
                 "schema_version": "i3rs-cli.m1.raw-capture.v1",
                 "directory": result.directory,
@@ -239,14 +246,16 @@ pub(super) fn run(args: M1Args) -> Result<(), String> {
             capture,
             conversion,
         } => {
+            let sigint = SigintCancellation::install();
             let destination = capture.destination.clone();
-            let raw = acquire(capture)?;
+            let conversion_limits = conversion.into_limits();
+            let raw = acquire(capture, sigint.token().clone())?;
             let mut progress = ConversionPrinter::default();
             let converted = conversion::convert_capture_directory(
                 &raw.directory,
                 &destination,
-                &conversion.into_limits(),
-                CancellationToken::default(),
+                &conversion_limits,
+                sigint.token().clone(),
                 |update| progress.print(update),
             )
             .map_err(|error| {
@@ -269,12 +278,13 @@ pub(super) fn run(args: M1Args) -> Result<(), String> {
             destination,
             limits,
         } => {
+            let sigint = SigintCancellation::install();
             let mut progress = ConversionPrinter::default();
             let result = conversion::convert_image_file(
                 &source,
                 &destination,
                 &limits.into_limits(),
-                CancellationToken::default(),
+                sigint.token().clone(),
                 |update| progress.print(update),
             )
             .map_err(|e| e.to_string())?;
@@ -286,6 +296,7 @@ pub(super) fn run(args: M1Args) -> Result<(), String> {
             limits,
             recover_partial,
         } => {
+            let sigint = SigintCancellation::install();
             let mut progress = ConversionPrinter::default();
             let convert = if recover_partial {
                 conversion::recover_capture_directory
@@ -296,7 +307,7 @@ pub(super) fn run(args: M1Args) -> Result<(), String> {
                 &source,
                 &destination,
                 &limits.into_limits(),
-                CancellationToken::default(),
+                sigint.token().clone(),
                 |update| progress.print(update),
             )
             .map_err(|e| e.to_string())?;
@@ -308,7 +319,10 @@ pub(super) fn run(args: M1Args) -> Result<(), String> {
     }
 }
 
-fn acquire(mut args: CaptureArgs) -> Result<capture::CaptureResult, String> {
+fn acquire(
+    mut args: CaptureArgs,
+    cancellation: CancellationToken,
+) -> Result<capture::CaptureResult, String> {
     args.systems.sort_unstable();
     if args.systems.windows(2).any(|ids| ids[0] == ids[1]) {
         return Err("logging systems must be distinct".into());
@@ -329,7 +343,7 @@ fn acquire(mut args: CaptureArgs) -> Result<capture::CaptureResult, String> {
         &args.destination,
         &limits,
         Duration::from_millis(args.timeout_ms),
-        CancellationToken::default(),
+        cancellation,
         |progress| {
             let now = Instant::now();
             if last_progress.is_none_or(|(stage, time)| {
@@ -462,8 +476,17 @@ fn record_json(record: &MoRecord<'_>) -> Value {
     json!({ "offset": record.offset, "header": header_json(record.header), "opaque": record.header.encoding != 0 })
 }
 fn image_info(path: PathBuf, max_bytes: usize) -> Result<Value, String> {
-    let mut file =
-        File::open(&path).map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Reject FIFOs as non-regular files without blocking inside open().
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.is_file() {
         return Err("image-info requires a regular local file".into());
@@ -573,6 +596,100 @@ fn image_info(path: PathBuf, max_bytes: usize) -> Result<Value, String> {
         "other_root_records_omitted": inspection.other_root_records.len().saturating_sub(PROPERTY_LIMIT),
     }))
 }
+
+#[cfg(unix)]
+mod sigint {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    use i3rs_core::m1::transport::CancellationToken;
+
+    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_sigint(_: libc::c_int) {
+        if INTERRUPTED.swap(true, Ordering::SeqCst) {
+            // Second Ctrl-C restores default disposition and terminates promptly.
+            unsafe {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::raise(libc::SIGINT);
+            }
+        }
+    }
+
+    pub(super) struct SigintCancellation {
+        token: CancellationToken,
+        done: Arc<AtomicBool>,
+        watcher: Option<thread::JoinHandle<()>>,
+        previous: libc::sighandler_t,
+    }
+
+    impl SigintCancellation {
+        pub(super) fn install() -> Self {
+            INTERRUPTED.store(false, Ordering::SeqCst);
+            let previous =
+                unsafe { libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t) };
+            let token = CancellationToken::default();
+            let done = Arc::new(AtomicBool::new(false));
+            let watch_token = token.clone();
+            let watch_done = done.clone();
+            let watcher = thread::Builder::new()
+                .name("i3rs-sigint".into())
+                .spawn(move || {
+                    while !watch_done.load(Ordering::Acquire) {
+                        if INTERRUPTED.load(Ordering::Acquire) {
+                            watch_token.cancel();
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                })
+                .ok();
+            Self {
+                token,
+                done,
+                watcher,
+                previous,
+            }
+        }
+
+        pub(super) fn token(&self) -> &CancellationToken {
+            &self.token
+        }
+    }
+
+    impl Drop for SigintCancellation {
+        fn drop(&mut self) {
+            self.done.store(true, Ordering::Release);
+            unsafe {
+                libc::signal(libc::SIGINT, self.previous);
+            }
+            if let Some(watcher) = self.watcher.take() {
+                let _ = watcher.join();
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod sigint {
+    use i3rs_core::m1::transport::CancellationToken;
+
+    pub(super) struct SigintCancellation(CancellationToken);
+
+    impl SigintCancellation {
+        pub(super) fn install() -> Self {
+            Self(CancellationToken::default())
+        }
+
+        pub(super) fn token(&self) -> &CancellationToken {
+            &self.0
+        }
+    }
+}
+
+use sigint::SigintCancellation;
 
 #[cfg(test)]
 mod tests {

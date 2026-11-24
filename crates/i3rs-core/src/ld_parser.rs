@@ -539,7 +539,7 @@ fn parse_event(data: &[u8], event_ptr: u32) -> Event {
     let mut e = Event::default();
     let off = event_ptr as usize;
 
-    if event_ptr == 0 || off + 1154 > data.len() {
+    if event_ptr == 0 || off.checked_add(1156).is_none_or(|end| end > data.len()) {
         return e;
     }
 
@@ -548,13 +548,21 @@ fn parse_event(data: &[u8], event_ptr: u32) -> Event {
     e.comment = read_string(data, off + 128, 1024);
 
     let venue_ptr = read_u32(data, off + 1152) as usize;
-    if venue_ptr == 0 || venue_ptr + 1100 > data.len() {
+    if venue_ptr == 0
+        || venue_ptr
+            .checked_add(1102)
+            .is_none_or(|end| end > data.len())
+    {
         return e;
     }
     e.venue_detail = read_string(data, venue_ptr, 64);
 
     let vehicle_ptr = read_u32(data, venue_ptr + 1098) as usize;
-    if vehicle_ptr == 0 || vehicle_ptr + 260 > data.len() {
+    if vehicle_ptr == 0
+        || vehicle_ptr
+            .checked_add(260)
+            .is_none_or(|end| end > data.len())
+    {
         return e;
     }
     e.vehicle_id = read_string(data, vehicle_ptr, 64);
@@ -581,7 +589,7 @@ fn signed_enum_attribute(payload: &[u8]) -> Option<HashMap<i64, String>> {
         return None;
     }
     let count = usize::from(read_u16(payload, 2));
-    if count > 500 {
+    if count == 0 || count > 500 {
         return None;
     }
     let mut labels = HashMap::new();
@@ -934,6 +942,11 @@ fn scan_enum_entries(
                     continue;
                 }
             }
+        }
+        // A genuine enum table header is immediately followed by its first
+        // valid 03-entry; never scan past arbitrary metadata on a false header.
+        if entries.is_empty() {
+            return None;
         }
         pos += 1;
     }

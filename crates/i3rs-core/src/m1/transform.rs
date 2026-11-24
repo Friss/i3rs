@@ -58,23 +58,35 @@ pub fn decode_xz_record(
         ));
     }
     let compressed = &record.payload[4..];
+    if compressed.len() < 12 || &compressed[..6] != b"\xfd7zXZ\0" {
+        return Err("XZ record decoding failed: invalid or truncated XZ stream header".into());
+    }
+    if compressed[6] == 0
+        && (compressed[7] & 0xf0) == 0
+        && !matches!(compressed[7] & 0x0f, 0x01 | 0x04 | 0x0a)
+    {
+        return Err("XZ stream has no supported content integrity check".into());
+    }
     let mut output = Vec::new();
-    output
-        .try_reserve_exact(declared)
+    let chunk_size = declared.min(64 * 1024);
+    let mut chunk = Vec::new();
+    chunk
+        .try_reserve_exact(chunk_size)
         .map_err(|_| "could not allocate the bounded XZ output buffer")?;
-    output.resize(declared, 0);
+    chunk.resize(chunk_size, 0);
     let mut decoder = XzStream::new_mem_limit(false, max_memory_kib);
     let mut input_position = 0;
-    let mut output_position = 0;
     let mut overflow_probe = [0; 1];
     loop {
         // Once the declared output is full, a one-byte stack probe lets the
         // decoder finish checks/index/footer without allocating extra output.
-        let output_full = output_position == declared;
+        let remaining = declared - output.len();
+        let output_full = remaining == 0;
         let destination = if output_full {
             overflow_probe.as_mut_slice()
         } else {
-            &mut output[output_position..]
+            let want = remaining.min(chunk.len());
+            &mut chunk[..want]
         };
         let step = decoder
             .process(&compressed[input_position..], destination, Action::Finish)
@@ -85,7 +97,12 @@ pub fn decode_xz_record(
                 "XZ output exceeds its declared {declared}-byte length"
             ));
         }
-        output_position += step.bytes_produced;
+        if step.bytes_produced != 0 {
+            output
+                .try_reserve(step.bytes_produced)
+                .map_err(|_| "could not allocate the bounded XZ output buffer")?;
+            output.extend_from_slice(&chunk[..step.bytes_produced]);
+        }
         if step.status == Status::StreamEnd {
             break;
         }
@@ -99,9 +116,10 @@ pub fn decode_xz_record(
             compressed.len() - input_position
         ));
     }
-    if output_position != declared {
+    if output.len() != declared {
         return Err(format!(
-            "XZ output length {output_position} does not match its declared {declared} bytes"
+            "XZ output length {} does not match its declared {declared} bytes",
+            output.len()
         ));
     }
     if !matches!(

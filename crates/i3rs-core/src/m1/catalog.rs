@@ -6,11 +6,12 @@
 //! A2L calibration tables are not needed for this catalog.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
-const MAX_XML_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_XML_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NODES: usize = 1_000_000;
 const MAX_DEPTH: usize = 128;
 const MAX_ATTRIBUTE_BYTES: usize = 16 * 1024;
@@ -32,7 +33,7 @@ pub struct ChannelDefinition {
     pub name: String,
     pub unit: String,
     pub data_type: ValueType,
-    pub enum_labels: BTreeMap<i32, String>,
+    pub enum_labels: Arc<BTreeMap<i32, String>>,
     pub display_decimals: u8,
     pub display_scale: f64,
     pub display_offset: f64,
@@ -210,6 +211,7 @@ struct Item {
     properties_depth: Option<usize>,
     value: Option<Value>,
     address: Option<(u32, u32)>,
+    default_locale_seen: bool,
     decimals: Option<u8>,
     display_unit: Option<String>,
 }
@@ -229,7 +231,7 @@ struct Parser {
     tags: Vec<String>,
     items: Vec<Item>,
     current_enum: Option<EnumTable>,
-    enums: BTreeMap<u32, BTreeMap<i32, String>>,
+    enums: BTreeMap<u32, Arc<BTreeMap<i32, String>>>,
     channels: BTreeMap<(u32, u32), PendingChannel>,
     events: BTreeMap<u32, f64>,
     unit_conversion_warnings: BTreeMap<(u32, u32), String>,
@@ -313,6 +315,7 @@ impl Parser {
                 properties_depth: None,
                 value: None,
                 address: None,
+                default_locale_seen: false,
                 decimals: None,
                 display_unit: None,
             });
@@ -338,7 +341,10 @@ impl Parser {
             && name == "EnumItem"
         {
             self.consume_item()?;
-            let label = required(attributes, "Name")?.to_owned();
+            let label = required(attributes, "Name")?.trim().to_owned();
+            if label.is_empty() {
+                return Err("TuneConfig enum item name cannot be blank".into());
+            }
             self.text_budget(label.len())?;
             let value = required(attributes, "Value")?
                 .parse::<i32>()
@@ -359,10 +365,20 @@ impl Parser {
             let period: f64 = required(attributes, "Period")?
                 .parse()
                 .map_err(|_| "Invalid TuneConfig event period")?;
-            let rate = period.recip();
-            if !period.is_finite() || period <= 0. || !rate.is_finite() || rate <= 0. {
+            let raw_rate = period.recip();
+            if !period.is_finite() || period <= 0. || !raw_rate.is_finite() || raw_rate <= 0. {
                 return Err("TuneConfig event period/rate must be finite and positive".into());
             }
+            // Snap decimal-rounded reciprocals (e.g. 0.014705882 -> 68 Hz,
+            // 1/49 -> 49 Hz) to their exact integer rate when within 1 ppm.
+            let rounded = raw_rate.round();
+            let rate = if (1. ..=65_535.).contains(&rounded)
+                && (raw_rate - rounded).abs() <= rounded * 1e-6
+            {
+                rounded
+            } else {
+                raw_rate
+            };
             if self.events.insert(index, rate).is_some() {
                 return Err("Duplicate TuneConfig event index".into());
             }
@@ -404,7 +420,13 @@ impl Parser {
                 "DefaultLocale"
                     if parent_is_properties && item.properties_depth == Some(depth - 1) =>
                 {
-                    item.display_unit = attributes.get("DisplayUnit").cloned();
+                    if item.default_locale_seen {
+                        return Err("Duplicate direct TuneConfig DefaultLocale".into());
+                    }
+                    item.default_locale_seen = true;
+                    item.display_unit = attributes
+                        .get("DisplayUnit")
+                        .map(|unit| unit.trim().to_owned());
                     if let Some(decimals) = attributes.get("DisplayDPS") {
                         let decimals: u8 = decimals
                             .parse()
@@ -444,7 +466,11 @@ impl Parser {
             .is_some_and(|table| table.depth == depth)
         {
             let table = self.current_enum.take().unwrap();
-            if self.enums.insert(table.id, table.labels).is_some() {
+            if self
+                .enums
+                .insert(table.id, Arc::new(table.labels))
+                .is_some()
+            {
                 return Err("Duplicate TuneConfig enum ID".into());
             }
         }
@@ -495,21 +521,29 @@ impl Parser {
         }) {
             path = &ancestor.path;
         }
-        let name = path.replace('.', " ");
-        let (unit, display_scale, display_offset) = match item.display_unit.as_deref() {
-            Some(display) => match locale_conversion(&value.unit, display) {
-                Some((scale, offset)) => (display.to_owned(), scale, offset),
-                None => {
-                    let warning = format!(
-                        "Channel {name}: unsupported display conversion {:?} to {:?}; physical units retained",
-                        value.unit, display
-                    );
-                    self.text_budget(warning.len())?;
-                    self.unit_conversion_warnings.insert(address, warning);
-                    (value.unit, 1., 0.)
-                }
-            },
-            None => (value.unit, 1., 0.),
+        let name = path.replace('.', " ").trim().to_owned();
+        if name.is_empty() {
+            return Err("TuneConfig channel name cannot be blank".into());
+        }
+        let physical_unit = value.unit.trim().to_owned();
+        let (unit, display_scale, display_offset) = if data_type == ValueType::Enum {
+            (physical_unit, 1., 0.)
+        } else {
+            match item.display_unit.as_deref() {
+                Some(display) => match locale_conversion(&physical_unit, display) {
+                    Some((scale, offset)) => (display.to_owned(), scale, offset),
+                    None => {
+                        let warning = format!(
+                            "Channel {name}: unsupported display conversion {:?} to {:?}; physical units retained",
+                            physical_unit, display
+                        );
+                        self.text_budget(warning.len())?;
+                        self.unit_conversion_warnings.insert(address, warning);
+                        (physical_unit, 1., 0.)
+                    }
+                },
+                None => (physical_unit, 1., 0.),
+            }
         };
         self.text_budget(name.len() + unit.len())?;
         let display_decimals = item.decimals.unwrap_or(match data_type {
@@ -521,7 +555,7 @@ impl Parser {
             name,
             unit,
             data_type,
-            enum_labels: BTreeMap::new(),
+            enum_labels: Arc::new(BTreeMap::new()),
             display_decimals,
             display_scale,
             display_offset,
@@ -569,7 +603,7 @@ impl Parser {
                         .filter(|count| *count <= MAX_OWNED_TEXT_BYTES)
                         .ok_or("TuneConfig owned text budget exceeded")?;
                 }
-                channel.definition.enum_labels = labels.clone();
+                channel.definition.enum_labels = Arc::clone(labels);
             }
             channels.insert(address, channel.definition);
         }
@@ -582,9 +616,9 @@ impl Parser {
     }
 }
 
-/// Source/display pairs present in the matched TuneConfig and Tune LD fixture.
-/// Metric/time factors use their exact definitions. Sign changes and %Trim's
-/// affine offset were also checked against nonconstant vendor sample values.
+/// Source/display pairs present in the matched TuneConfig and Tune LD fixture,
+/// plus exact SI/Imperial unit definitions. Sign changes and %Trim's affine
+/// offset were also checked against nonconstant vendor sample values.
 fn locale_conversion(source: &str, display: &str) -> Option<(f64, f64)> {
     if source == display {
         return Some((1., 0.));
@@ -596,13 +630,24 @@ fn locale_conversion(source: &str, display: &str) -> Option<(f64, f64)> {
         ("deg", "dBTDC" | "dADV") => (-1., 0.),
         ("deg", "dRTD") => (1., 0.),
         ("Pa", "kPa" | "kPa a") | ("dPa", "dkPa" | "kPa g") => (0.001, 0.),
-        ("kg/s", "g/s") | ("m3", "l") | ("m", "mm") => (1000., 0.),
-        ("kg", "mg") => (1_000_000., 0.),
-        ("m", "km") => (0.001, 0.),
+        ("Pa", "bar" | "bar a") | ("dPa", "bar" | "bar g") => (1e-5, 0.),
+        ("Pa", "psi" | "psi a") | ("dPa", "psi" | "psi g") => (1. / 6894.757293168, 0.),
+        ("K", "C" | "degC" | "°C") => (1., -273.15),
+        ("K", "F" | "degF" | "°F") => (1.8, -459.67),
+        ("C" | "degC" | "°C", "F" | "degF" | "°F") => (1.8, 32.),
+        ("kg/s", "g/s") | ("m3", "l") | ("m", "mm") | ("s", "ms") | ("V", "mV") | ("A", "mA") => {
+            (1000., 0.)
+        }
+        ("kg", "mg") | ("s", "us" | "µs") => (1_000_000., 0.),
+        ("m", "km") | ("Hz", "kHz") => (0.001, 0.),
+        ("m", "ft") => (1. / 0.3048, 0.),
+        ("m", "in") => (1. / 0.0254, 0.),
+        ("mm", "in") => (1. / 25.4, 0.),
         ("m/s", "km/h") => (3.6, 0.),
         ("m/s", "mph") => (1. / 0.44704, 0.),
         ("m/s/s", "G") => (1. / 9.80665, 0.),
         ("s", "hour") => (1. / 3600., 0.),
+        ("Nm", "lb-ft" | "ft-lb") => (1. / 1.3558179483314004, 0.),
         _ => return None,
     })
 }
@@ -730,6 +775,25 @@ mod tests {
         assert_eq!((channel.display_scale, channel.display_offset), (1., 0.));
         assert!(catalog.unit_conversion_warnings[&(1, 4)].contains("physical units retained"));
         assert!(catalog.unit_conversion_warnings[&(1, 4)].contains("Sensor"));
+    }
+
+    #[test]
+    fn snaps_decimal_reciprocal_event_rates_and_rejects_duplicate_default_locale() {
+        let xml = br#"<TuneConfig><System><TargetModel><Events><Event Index="1" Period="0.014705882"/><Event Index="2" Period="0.02040816326530612"/><Event Index="3" Period="0.016666667"/></Events></TargetModel></System></TuneConfig>"#;
+        let catalog = parse_catalog(xml, 20).unwrap();
+        assert_eq!(catalog.events[&1], 68.0);
+        assert_eq!(catalog.events[&2], 49.0);
+        assert_eq!(catalog.events[&3], 60.0);
+
+        let dup_locale = br#"<TuneConfig><Device><Items><BuiltIn.Channel Name="Temp"><Properties><Value Type="f32" Unit="K"><Address Base="1" Offset="0"/></Value><DefaultLocale DisplayUnit="C"/><DefaultLocale DisplayDPS="1"/></Properties></BuiltIn.Channel></Items></Device></TuneConfig>"#;
+        assert!(
+            parse_catalog(dup_locale, 20)
+                .unwrap_err()
+                .contains("Duplicate direct TuneConfig DefaultLocale")
+        );
+        assert_eq!(locale_conversion("K", "degC"), Some((1., -273.15)));
+        assert_eq!(locale_conversion("Pa", "bar"), Some((1e-5, 0.)));
+        assert_eq!(locale_conversion("s", "ms"), Some((1000., 0.)));
     }
 
     #[test]

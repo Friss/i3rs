@@ -7,7 +7,9 @@
 //! to the physical memory sector after ring-buffer wrapping is not established.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(unix))]
+use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::Path;
 #[cfg(not(unix))]
@@ -34,7 +36,8 @@ impl Default for CaptureDecodeLimits {
     fn default() -> Self {
         Self {
             image: ImageDecodeLimits::default(),
-            max_manifest_bytes: 1024 * 1024,
+            // Sized to accommodate 10,000+ pretty-printed CapturedFile entries plus diagnostics.
+            max_manifest_bytes: 8 * 1024 * 1024,
             max_info_bytes: 4 * 1024 * 1024,
             max_config_bytes: 64 * 1024 * 1024,
             max_sector_bytes: 16 * 1024 * 1024,
@@ -260,6 +263,7 @@ fn decode_bundle(
         }
         if config_bytes
             .checked_add(stream_bytes)
+            .and_then(|n| n.checked_add(MO_HEADER_SIZE))
             .ok_or("raw capture decode size overflow")?
             > limits.image.max_image_bytes
         {
@@ -363,6 +367,9 @@ fn decode_bundle(
     let setup_bytes = read_record(setups_index)?;
     let metadata_bytes = read_record(metadata_index)?;
     let mut joined = Vec::new();
+    joined
+        .try_reserve_exact(stream_bytes)
+        .map_err(|_| "could not allocate bounded capture stream")?;
     let mut logical_ids = BTreeSet::new();
     for (index, role) in roles.iter().enumerate() {
         match role {
@@ -381,9 +388,11 @@ fn decode_bundle(
                 if new_len > limits.image.max_image_bytes || new_len > u32::MAX as usize {
                     return Err("raw capture stream exceeds byte limit".into());
                 }
-                joined
-                    .try_reserve(padding + bytes.len())
-                    .map_err(|_| "could not allocate bounded capture stream")?;
+                if new_len > joined.capacity() {
+                    joined
+                        .try_reserve_exact(new_len - joined.len())
+                        .map_err(|_| "could not allocate bounded capture stream")?;
+                }
                 joined.resize(joined.len() + padding, 0);
                 joined.extend_from_slice(&bytes);
             }
@@ -425,6 +434,7 @@ fn decode_bundle(
         stream,
         session,
         &limits.image,
+        true,
         true,
     )?;
     check_cancelled(cancellation)?;
@@ -515,25 +525,27 @@ struct BundleDirectory {
 }
 impl BundleDirectory {
     fn open(path: &Path) -> Result<Self, String> {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|e| format!("could not inspect capture directory: {e}"))?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err("capture source must be a directory, not a symlink".into());
-        }
-        let root = fs::canonicalize(path)
-            .map_err(|e| format!("could not resolve capture directory: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
+            // Open directly with O_NOFOLLOW | O_DIRECTORY to avoid a TOCTOU
+            // symlink-swap window before the directory fd is pinned.
             let handle = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
-                .open(&root)
+                .open(path)
                 .map_err(|e| format!("could not open capture directory: {e}"))?;
             Ok(Self { handle })
         }
         #[cfg(not(unix))]
         {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|e| format!("could not inspect capture directory: {e}"))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("capture source must be a directory, not a symlink".into());
+            }
+            let root = fs::canonicalize(path)
+                .map_err(|e| format!("could not resolve capture directory: {e}"))?;
             Ok(Self { root })
         }
     }
@@ -633,6 +645,7 @@ impl BundleDirectory {
 mod tests {
     use super::*;
     use crate::m1::capture::{CapturedFile, DeviceInspection, SystemSummary};
+    use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     struct Fixture(std::path::PathBuf);

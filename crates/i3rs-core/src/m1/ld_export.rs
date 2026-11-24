@@ -18,7 +18,7 @@ const HEADER_SIZE: usize = 0x6e2;
 const CHANNEL_BASE_SIZE: usize = 124;
 const MAX_SAMPLES: usize = 20_000_000;
 pub const SIGNED_ENUM_ATTRIBUTE_KIND: u32 = u32::from_le_bytes(*b"i3rs");
-pub const RESAMPLING_POLICY: &str = "Common segment t0, per-channel k/frequency grids through the last segment sample. Floating engineering values use linear interpolation only inside source brackets no wider than 1.5 periods. Synchronized GPS coordinate pairs hold the previous pair at transitions to or from (0, 0). Integer/state values use previous-value hold for at most 1.5 periods. Missing coverage is NaN. Exact matches use 16 machine-epsilon relative time tolerance. Source timestamps must be strictly increasing; channels are never shifted to their own first sample.";
+pub const RESAMPLING_POLICY: &str = "Common segment t0, per-channel k/frequency grids through the last segment sample. Floating engineering values use linear interpolation only inside source brackets no wider than 1.5 periods. Synchronized GPS coordinate pairs hold the previous pair at transitions to or from (0, 0), Lap Time Running holds the previous sample across lap resets, and GPS True Course interpolates along the shortest 0-360 deg arc. Integer/state values use previous-value hold for at most 1.5 periods. Missing coverage is NaN. Exact matches use 16 machine-epsilon relative time tolerance. Source timestamps must be strictly increasing; channels are never shifted to their own first sample.";
 
 #[derive(Debug, Clone)]
 pub struct OutputChannel {
@@ -73,7 +73,22 @@ pub fn encode_segment(
         return Err("LD segment has no timestamped samples".into());
     }
     // Preflight the complete serialized size before allocating output grids.
+    // Legacy enum tables precede channel metadata so enum scanning never walks
+    // through channel base structs.
     let mut size = HEADER_SIZE;
+    let mut enum_encodings = Vec::new();
+    enum_encodings
+        .try_reserve_exact(segment.channels.len())
+        .map_err(|_| "Could not allocate LD enum layout")?;
+    for channel in &segment.channels {
+        let encoding = enum_encoding(&channel.enum_labels)?;
+        if let EnumEncoding::Legacy(length) = encoding {
+            grow(&mut size, length, max_output_bytes)?;
+        }
+        enum_encodings.push(encoding);
+    }
+    let meta_padding = (4 - size % 4) % 4;
+    grow(&mut size, meta_padding, max_output_bytes)?;
     grow(
         &mut size,
         segment
@@ -88,7 +103,7 @@ pub fn encode_segment(
         .try_reserve_exact(segment.channels.len())
         .map_err(|_| "Could not allocate LD grid layout")?;
     let mut sample_count = 0usize;
-    for channel in &segment.channels {
+    for (channel, encoding) in segment.channels.iter().zip(enum_encodings) {
         let scaled = duration * channel.frequency_hz;
         if !scaled.is_finite() || scaled >= MAX_SAMPLES as f64 {
             return Err("LD output grid exceeds 20 million samples".into());
@@ -99,12 +114,9 @@ pub fn encode_segment(
             .filter(|count| *count <= MAX_SAMPLES)
             .ok_or("LD output exceeds 20 million samples")?;
         counts.push(count);
-        let extra = match enum_encoding(&channel.enum_labels)? {
+        let extra = match encoding {
             EnumEncoding::None => 0,
-            EnumEncoding::Legacy(length) => {
-                grow(&mut size, length, max_output_bytes)?;
-                10
-            }
+            EnumEncoding::Legacy(_) => 10,
             EnumEncoding::Private(length) => 8 + length,
         };
         grow(
@@ -151,7 +163,7 @@ pub fn encode_segment(
             unit: channel.unit.clone(),
             frequency_hz: channel.frequency_hz,
             values,
-            enum_labels: channel.enum_labels.clone(),
+            enum_labels: (*channel.enum_labels).clone(),
             display_decimals: channel.display_decimals,
         });
     }
@@ -160,9 +172,9 @@ pub fn encode_segment(
 
 fn gps_coordinate_pair(channels: &[TelemetryChannel]) -> Option<(usize, usize)> {
     let find = |name: &str| {
-        channels
-            .iter()
-            .position(|channel| channel.data_type == ValueType::I32E7 && channel.name == name)
+        channels.iter().position(|channel| {
+            matches!(channel.data_type, ValueType::I32E7 | ValueType::F32) && channel.name == name
+        })
     };
     let lat = find("GPS Latitude")?;
     let lon = find("GPS Longitude")?;
@@ -177,6 +189,10 @@ fn gps_coordinate_pair(channels: &[TelemetryChannel]) -> Option<(usize, usize)> 
             .zip(&longitude.samples)
             .all(|(a, b)| a.time_seconds == b.time_seconds))
     .then_some((lat, lon))
+}
+
+fn sanitize_finite(value: f64) -> f64 {
+    if value.is_finite() { value } else { f64::NAN }
 }
 
 fn time_tolerance(a: f64, b: f64) -> f64 {
@@ -199,7 +215,7 @@ fn resampled_value(
     if let Some(sample) = samples.get(*cursor)
         && (sample.time_seconds - time).abs() <= time_tolerance(time, sample.time_seconds)
     {
-        return sample.value;
+        return sanitize_finite(sample.value);
     }
     let Some(left) = cursor.checked_sub(1).and_then(|index| samples.get(index)) else {
         return f64::NAN;
@@ -214,7 +230,7 @@ fn resampled_value(
     if state {
         let age = time - left.time_seconds;
         return if age >= 0. && age <= max_gap + time_tolerance(age, max_gap) {
-            left.value
+            sanitize_finite(left.value)
         } else {
             f64::NAN
         };
@@ -236,7 +252,17 @@ fn resampled_value(
             return left.value;
         }
     }
+    // Hold previous sample across Lap Time Running sawtooth resets so lap
+    // detection never sees a fabricated mid-lap drop.
+    if channel.name == "Lap Time Running" && right.value + 1.0 < left.value {
+        return left.value;
+    }
     let weight = (time - left.time_seconds) / gap;
+    // Interpolate circular headings across the 360/0 degree wrap.
+    if channel.name == "GPS True Course" && (right.value - left.value).abs() > 180.0 {
+        let delta = (right.value - left.value + 540.0).rem_euclid(360.0) - 180.0;
+        return (left.value + delta * weight).rem_euclid(360.0);
+    }
     left.value * (1. - weight) + right.value * weight
 }
 
@@ -254,14 +280,6 @@ pub fn encode_channels(
         return Err("LD output requires one to 65535 channels".into());
     }
     let mut size = HEADER_SIZE;
-    grow(
-        &mut size,
-        channels
-            .len()
-            .checked_mul(CHANNEL_BASE_SIZE)
-            .ok_or("LD metadata size overflow")?,
-        max_output_bytes,
-    )?;
     let mut layouts = Vec::new();
     layouts
         .try_reserve_exact(channels.len())
@@ -273,11 +291,40 @@ pub fn encode_channels(
             .checked_add(channel.values.len())
             .filter(|count| *count <= MAX_SAMPLES)
             .ok_or("LD output exceeds 20 million samples")?;
-        let extension = size;
-        grow(&mut size, 6, max_output_bytes)?;
-        let attributes = size;
         let enum_encoding = enum_encoding(&channel.enum_labels)?;
-        let enum_attribute_bytes = match enum_encoding {
+        let enumeration = if let EnumEncoding::Legacy(table_len) = enum_encoding {
+            let table_offset = size;
+            grow(&mut size, table_len, max_output_bytes)?;
+            Some((table_offset, (index + 1) as u16))
+        } else {
+            None
+        };
+        layouts.push(ChannelLayout {
+            base: 0,
+            extension: 0,
+            attributes: 0,
+            enumeration,
+            enum_encoding,
+            data: 0,
+        });
+    }
+    let meta_padding = (4 - size % 4) % 4;
+    grow(&mut size, meta_padding, max_output_bytes)?;
+    let first_meta = size;
+    grow(
+        &mut size,
+        channels
+            .len()
+            .checked_mul(CHANNEL_BASE_SIZE)
+            .ok_or("LD metadata size overflow")?,
+        max_output_bytes,
+    )?;
+    for (index, (channel, layout)) in channels.iter().zip(&mut layouts).enumerate() {
+        layout.base = first_meta + index * CHANNEL_BASE_SIZE;
+        layout.extension = size;
+        grow(&mut size, 6, max_output_bytes)?;
+        layout.attributes = size;
+        let enum_attribute_bytes = match layout.enum_encoding {
             EnumEncoding::None => 0,
             EnumEncoding::Legacy(_) => 10,
             EnumEncoding::Private(length) => 8 + length,
@@ -288,23 +335,9 @@ pub fn encode_channels(
             .and_then(|n| n.checked_add(enum_attribute_bytes))
             .ok_or("LD attribute size overflow")?;
         grow(&mut size, attribute_len, max_output_bytes)?;
-        layouts.push(ChannelLayout {
-            base: HEADER_SIZE + index * CHANNEL_BASE_SIZE,
-            extension,
-            attributes,
-            enumeration: None,
-            enum_encoding,
-            data: 0,
-        });
     }
-    for (index, layout) in layouts.iter_mut().enumerate() {
-        if let EnumEncoding::Legacy(table_len) = layout.enum_encoding {
-            layout.enumeration = Some((size, (index + 1) as u16));
-            grow(&mut size, table_len, max_output_bytes)?;
-        }
-    }
-    // Keep sample arrays naturally aligned. Enum tables remain before this
-    // header pointer, matching the reader's bounded enum-scan region.
+    // Keep sample arrays naturally aligned. Enum tables remain before channel
+    // metadata and before this header pointer, matching the reader's scan region.
     let padding = (8 - size % 8) % 8;
     grow(&mut size, padding, max_output_bytes)?;
     let first_data = size;
@@ -326,7 +359,7 @@ pub fn encode_channels(
         .map_err(|_| "Could not allocate bounded LD output")?;
     bytes.resize(size, 0);
     bytes[0] = 0x40;
-    put_u32(&mut bytes, 8, HEADER_SIZE as u32);
+    put_u32(&mut bytes, 8, first_meta as u32);
     put_u32(&mut bytes, 12, first_data as u32);
     put_u32(&mut bytes, 0x42, 1_000_000);
     put_u32(&mut bytes, 0x46, session.device_serial);
@@ -403,7 +436,7 @@ pub fn encode_channels(
         }
         for (sample_index, value) in channel.values.iter().enumerate() {
             let at = layout.data + sample_index * 8;
-            bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            bytes[at..at + 8].copy_from_slice(&sanitize_finite(*value).to_le_bytes());
         }
     }
     Ok(bytes)
@@ -517,8 +550,9 @@ fn enum_encoding(labels: &BTreeMap<i32, String>) -> Result<EnumEncoding, String>
     if labels
         .keys()
         .all(|value| (-2..=i32::from(i16::MAX)).contains(value))
+        && let Ok(length) = enum_size(labels)
     {
-        return enum_size(labels).map(EnumEncoding::Legacy);
+        return Ok(EnumEncoding::Legacy(length));
     }
     let mut size = 4usize;
     for label in labels.values() {
@@ -733,7 +767,7 @@ mod tests {
             base: 1,
             address: 0,
             data_type,
-            enum_labels: BTreeMap::new(),
+            enum_labels: std::sync::Arc::new(BTreeMap::new()),
             display_decimals: 3,
             frequency_hz,
             samples: values
@@ -845,5 +879,94 @@ mod tests {
         assert!(resampled_value(&state, 0., &mut cursor, None).is_nan());
         assert_eq!(resampled_value(&state, 1., &mut cursor, None), -4.);
         assert!(resampled_value(&state, 2., &mut cursor, None).is_nan());
+    }
+
+    #[test]
+    fn legacy_enum_tables_survive_channel_metadata_scanner_collision() {
+        // Channel index 2 has counter = 3 (03 00) at base+16; with data_ptr >> 16 >= 1
+        // and n_data == 2, bytes at base+10..18 form [>=1][02 00][00 00][03 00].
+        let mut ch0 = channel("Mode", 1., vec![0.; 10_000]);
+        ch0.display_decimals = 0;
+        ch0.enum_labels = [(0, "Off".into()), (1, "On".into()), (2, "Fault".into())].into();
+        let ch1 = channel("Speed", 1., vec![10.; 100]);
+        let ch2 = channel("Short", 1., vec![1., 2.]);
+        let mut ch3 = channel("Gear", 1., vec![0., 1.]);
+        ch3.display_decimals = 0;
+        ch3.enum_labels = [(0, "Neutral".into()), (1, "First".into())].into();
+        let bytes = encode_channels(&[ch0, ch1, ch2, ch3], &session(), 1_000_000).unwrap();
+        let ld = LdFile::from_bytes(bytes).unwrap();
+        assert_eq!(
+            ld.channels[0].enum_labels.get(&0).map(String::as_str),
+            Some("Off")
+        );
+        assert_eq!(
+            ld.channels[0].enum_labels.get(&1).map(String::as_str),
+            Some("On")
+        );
+        assert_eq!(
+            ld.channels[0].enum_labels.get(&2).map(String::as_str),
+            Some("Fault")
+        );
+        assert_eq!(
+            ld.channels[3].enum_labels.get(&0).map(String::as_str),
+            Some("Neutral")
+        );
+        assert_eq!(
+            ld.channels[3].enum_labels.get(&1).map(String::as_str),
+            Some("First")
+        );
+    }
+
+    #[test]
+    fn lap_time_running_resets_and_gps_true_course_wrap_do_not_fabricate_midpoints() {
+        // 5 Hz Lap Time Running with a lap reset between 0.3 s and 0.5 s.
+        let lap_time = timestamped(
+            "Lap Time Running",
+            ValueType::F32,
+            5.,
+            &[(0.1, 99.8), (0.3, 100.0), (0.5, 0.1), (0.7, 0.3)],
+        );
+        // 5 Hz GPS True Course wrapping across 360/0 degrees between 0.1 s and 0.3 s.
+        let heading = timestamped(
+            "GPS True Course",
+            ValueType::F32,
+            5.,
+            &[(0.1, 350.0), (0.3, 10.0), (0.5, 14.0), (0.7, 18.0)],
+        );
+        // Non-finite Inf values are sanitized to NaN.
+        let inf = timestamped(
+            "Voltage",
+            ValueType::F32,
+            5.,
+            &[(0.0, f64::INFINITY), (0.2, 12.5), (0.4, f64::NEG_INFINITY)],
+        );
+        let segment = DecodedSegment {
+            index: 0,
+            start_ticks: 0,
+            end_ticks: 1,
+            channels: vec![lap_time, heading, inf],
+        };
+        let bytes = encode_segment(&segment, &session(), 100_000).unwrap();
+        let ld = LdFile::from_bytes(bytes).unwrap();
+        let lap_values = ld.read_channel_data(&ld.channels[0]).unwrap();
+        // Grid times: 0.0 (NaN), 0.2 (99.9), 0.4 (held 100.0, NOT ~50.05!), 0.6 (0.2)
+        assert!((lap_values[1] - 99.9).abs() < 1e-9);
+        assert!((lap_values[2] - 100.0).abs() < 1e-9);
+        assert!((lap_values[3] - 0.2).abs() < 1e-9);
+        // Exactly one lap drop > 1.0 (at index 2 -> 3), never a double drop.
+        let drops = lap_values
+            .windows(2)
+            .filter(|w| w[0].is_finite() && w[1].is_finite() && w[0] - w[1] > 1.0)
+            .count();
+        assert_eq!(drops, 1);
+
+        let heading_values = ld.read_channel_data(&ld.channels[1]).unwrap();
+        // At t=0.2 (midpoint between 350 and 10), shortest arc yields 0 deg (not 180 deg).
+        assert!(heading_values[1].abs() < 1e-9 || (heading_values[1] - 360.0).abs() < 1e-9);
+
+        let volt_values = ld.read_channel_data(&ld.channels[2]).unwrap();
+        assert!(volt_values[0].is_nan());
+        assert_eq!(volt_values[1], 12.5);
+        assert!(volt_values[2].is_nan());
     }
 }

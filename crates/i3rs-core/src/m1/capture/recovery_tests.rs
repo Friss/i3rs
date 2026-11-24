@@ -25,6 +25,9 @@ enum Fault {
     FastUnsupported,
     FastBadChunk,
     FastLoss,
+    FastGenericReject,
+    FastBadChunkDuringRecovery,
+    SavedSectorGrew,
 }
 #[derive(Debug, Clone)]
 struct Event {
@@ -43,7 +46,12 @@ impl Device {
     fn new(fault: Fault) -> Self {
         let fast = matches!(
             fault,
-            Fault::Fast | Fault::FastUnsupported | Fault::FastBadChunk | Fault::FastLoss
+            Fault::Fast
+                | Fault::FastUnsupported
+                | Fault::FastBadChunk
+                | Fault::FastLoss
+                | Fault::FastGenericReject
+                | Fault::FastBadChunkDuringRecovery
         );
         let big_endian = fault == Fault::Fast;
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -167,7 +175,14 @@ impl Device {
                                     } else {
                                         sector as u8
                                     };
-                                    if fast { 4000 } else { 256 }
+                                    if session > 1 && fault == Fault::SavedSectorGrew && sector == 1
+                                    {
+                                        320
+                                    } else if fast {
+                                        4000
+                                    } else {
+                                        256
+                                    }
                                 ],
                             ),
                             selector => panic!("unexpected selector {selector:?}"),
@@ -230,9 +245,14 @@ impl Device {
                     0xf1 if fast => {
                         assert_eq!(&command[..4], &[0xf1, 0xff, 0, 0]);
                         assert!(!poisoned_peers.contains(&peer));
-                        if fault == Fault::FastUnsupported {
+                        if matches!(fault, Fault::FastUnsupported | Fault::FastGenericReject) {
                             assert_eq!(session, 1, "unsupported mode must be disabled");
-                            let response = encode_frame(frame.counter, &[0xfe, 0x20]).unwrap();
+                            let code = if fault == Fault::FastGenericReject {
+                                0x29
+                            } else {
+                                0x20
+                            };
+                            let response = encode_frame(frame.counter, &[0xfe, code]).unwrap();
                             socket.send_to(&response, peer).unwrap();
                             continue;
                         }
@@ -258,7 +278,11 @@ impl Device {
                             reply.extend_from_slice(chunk);
                             let encoded = encode_frame(frame.counter, &reply).unwrap();
                             if *key == (0x25, 0) && session == 1 {
-                                if fault == Fault::FastLoss && index == 0 {
+                                if matches!(
+                                    fault,
+                                    Fault::FastLoss | Fault::FastBadChunkDuringRecovery
+                                ) && index == 0
+                                {
                                     poisoned_peers.insert(peer);
                                     pending_late = Some((peer, encoded));
                                     continue;
@@ -271,6 +295,18 @@ impl Device {
                                     );
                                     continue;
                                 }
+                            }
+                            if fault == Fault::FastBadChunkDuringRecovery
+                                && session == 2
+                                && *key == (0x27, 0)
+                                && index == 1
+                            {
+                                frames.extend_from_slice(&encoded);
+                                reply[4] ^= 1;
+                                frames.extend_from_slice(
+                                    &encode_frame(frame.counter, &reply).unwrap(),
+                                );
+                                continue;
                             }
                             frames.extend_from_slice(&encoded);
                             if index == 2 {
@@ -415,6 +451,7 @@ fn source_changes_or_revoked_rights_stop_recovery_without_restarting_failed_reco
         Fault::Setups,
         Fault::Metadata,
         Fault::SavedSector,
+        Fault::SavedSectorGrew,
     ] {
         let device = Device::new(fault);
         let base = TestDirectory::new();
@@ -434,7 +471,11 @@ fn source_changes_or_revoked_rights_stop_recovery_without_restarting_failed_reco
             "{fault:?}: {error}"
         );
         let saved = manifest(&error.bundle_directory.unwrap());
-        assert_ne!(saved.state, CaptureState::Complete);
+        if fault == Fault::Denied {
+            assert_eq!(saved.state, CaptureState::Incomplete);
+        } else {
+            assert_eq!(saved.state, CaptureState::Inconsistent, "{fault:?}");
+        }
         assert_eq!(saved.files.iter().filter(|f| f.sector.is_some()).count(), 1);
         let events = device.finish();
         assert_eq!(connections(&events), 2);
@@ -606,7 +647,13 @@ fn fast_upload_verifies_bytes_and_handles_out_of_order_and_duplicate_chunks() {
 
 #[test]
 fn fast_upload_falls_back_or_restarts_whole_records_after_failure() {
-    for fault in [Fault::FastUnsupported, Fault::FastBadChunk, Fault::FastLoss] {
+    for fault in [
+        Fault::FastUnsupported,
+        Fault::FastGenericReject,
+        Fault::FastBadChunk,
+        Fault::FastLoss,
+        Fault::FastBadChunkDuringRecovery,
+    ] {
         let device = Device::new(fault);
         let base = TestDirectory::new();
         let result = capture(
@@ -618,7 +665,12 @@ fn fast_upload_falls_back_or_restarts_whole_records_after_failure() {
         )
         .unwrap();
         let events = device.finish();
-        assert_eq!(connections(&events), 2, "{fault:?}");
+        let expected_connections = if fault == Fault::FastBadChunkDuringRecovery {
+            3
+        } else {
+            2
+        };
+        assert_eq!(connections(&events), expected_connections, "{fault:?}");
         let replacement = events
             .iter()
             .rev()

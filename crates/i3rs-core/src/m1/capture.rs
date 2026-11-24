@@ -260,6 +260,12 @@ pub fn download_raw(
             parameters.max_cto, parameters.max_dto, parameters.address_granularity.bytes(),
             parameters.communication_mode
         ));
+        if limits.fast_upload && limits.max_reconnects == 0 {
+            current.diagnostics.push(
+                "M1 Fast Upload is disabled when max_reconnects is 0 (no fallback reconnect budget); using standard XCP reads."
+                    .into(),
+            );
+        }
         create_manifest(&child, current)?;
         save_record(
             &child,
@@ -401,6 +407,22 @@ pub fn download_raw(
         )?;
         let final_info = LogInfo::parse_with_limit(&final_bytes, limits.max_records)?;
         let initial_info = LogInfo::parse_with_limit(reader.initial_info(), limits.max_records)?;
+        let device_mapping = |info: &LogInfo<'_>| {
+            info.device.as_ref().map(|device| {
+                (
+                    device.last_sector(),
+                    device.address_numerator(),
+                    device.address_denominator(),
+                )
+            })
+        };
+        if device_mapping(&initial_info) != device_mapping(&final_info) {
+            current.boundaries_unchanged = Some(false);
+            current.state = CaptureState::Inconsistent;
+            return Err(CaptureErrorKind::SourceChanged(
+                "device sector mapping".into(),
+            ));
+        }
         let changed = systems
             .iter()
             .copied()
@@ -686,7 +708,10 @@ fn update_manifest(directory: &Path, manifest: &CaptureManifest) -> Result<(), C
         return Err(error);
     }
     let current = directory.join("manifest.json");
-    fs::rename(&next, current)?;
+    if let Err(error) = fs::rename(&next, current) {
+        let _ = fs::remove_file(&next);
+        return Err(error.into());
+    }
     Ok(())
 }
 fn save_record(
@@ -715,6 +740,13 @@ fn save_record(
     entry.complete = result.is_ok() && entry.bytes == entry.expected_bytes;
     manifest.total_bytes += entry.bytes;
     result?;
+    if !entry.complete {
+        return Err(io::Error::other(format!(
+            "persisted record {name} length {} differs from expected {}",
+            entry.bytes, entry.expected_bytes
+        ))
+        .into());
+    }
     update_manifest(directory, manifest)
 }
 
@@ -766,9 +798,14 @@ impl fmt::Display for CaptureErrorKind {
             Self::InvalidInput(message) => f.write_str(message),
             Self::PermissionDenied(id) => write!(
                 f,
-                "active user does not grant logging download for system {id}"
+                "active user does not grant logging download for system {} (wire ID {id})",
+                u16::from(*id) + 1
             ),
-            Self::MissingSystem(id) => write!(f, "logging system {id} is absent from device info"),
+            Self::MissingSystem(id) => write!(
+                f,
+                "logging system {} (wire ID {id}) is absent from device info",
+                u16::from(*id) + 1
+            ),
             Self::ByteLimit { remaining } => write!(
                 f,
                 "raw capture byte budget has {remaining} bytes left; a Mo header needs 12"

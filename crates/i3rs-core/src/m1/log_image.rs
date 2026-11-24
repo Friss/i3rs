@@ -112,8 +112,8 @@ impl<'a> RawLogImage<'a> {
         if inspection.opaque_root {
             return Ok(inspection);
         }
-        for item in MoRecordIter::at(self.payload, MO_HEADER_SIZE, max_records) {
-            let record = item?;
+        for item in MoRecordIter::at(self.payload, MO_HEADER_SIZE, budget.remaining) {
+            let record = map_limit_error(item, budget.limit)?;
             budget.consume(record.offset)?;
             if record.header.record_type == PROPERTIES_RECORD_TYPE {
                 inspection.groups.push(inspect_group(record, &mut budget)?);
@@ -318,18 +318,24 @@ fn inspect_group<'a>(
     }
     let mut properties = Vec::new();
     let mut other_records = Vec::new();
-    for item in MoRecordIter::at(record.payload, record.offset + MO_HEADER_SIZE, budget.limit) {
-        let child = item?;
+    for item in MoRecordIter::at(
+        record.payload,
+        record.offset + MO_HEADER_SIZE,
+        budget.remaining,
+    ) {
+        let child = map_limit_error(item, budget.limit)?;
         budget.consume(child.offset)?;
         if child.header.record_type == PROPERTY_RECORD_TYPE {
             let fields = if child.header.encoding != 0 {
                 PropertyFields::Opaque
             } else {
                 let mut fields = Vec::new();
-                for field in
-                    MoRecordIter::at(child.payload, child.offset + MO_HEADER_SIZE, budget.limit)
-                {
-                    let field = field?;
+                for field in MoRecordIter::at(
+                    child.payload,
+                    child.offset + MO_HEADER_SIZE,
+                    budget.remaining,
+                ) {
+                    let field = map_limit_error(field, budget.limit)?;
                     budget.consume(field.offset)?;
                     fields.push(field);
                 }
@@ -349,6 +355,18 @@ fn inspect_group<'a>(
             properties,
             other_records,
         },
+    })
+}
+
+fn map_limit_error<'a>(
+    item: Result<MoRecord<'a>, RecordError>,
+    limit: usize,
+) -> Result<MoRecord<'a>, RecordError> {
+    item.map_err(|mut error| {
+        if matches!(error.kind, LogImageError::RecordLimitExceeded { .. }) {
+            error.kind = LogImageError::RecordLimitExceeded { limit };
+        }
+        error
     })
 }
 

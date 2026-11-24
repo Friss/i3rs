@@ -8,11 +8,11 @@ use std::time::Duration;
 use egui::Context;
 use i3rs_core::m1::{
     capture::{
-        CaptureError, CaptureLimits, CaptureProgress, CaptureResult, CaptureStage,
-        DeviceInspection, SystemSummary, download_raw, inspect_device,
+        CaptureError, CaptureLimits, CaptureProgress, CaptureStage, DeviceInspection,
+        SystemSummary, download_raw, inspect_device,
     },
     conversion::{
-        ConversionError, ConversionLimits, ConversionProgress, ConversionResult,
+        ConversionError, ConversionLimits, ConversionProgress, ConversionResult, ConversionStage,
         convert_capture_directory, convert_image_file,
     },
     discovery::{DiscoveryReport, discover},
@@ -20,12 +20,17 @@ use i3rs_core::m1::{
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 enum Finished {
     Scan(Result<DiscoveryReport, String>),
     Inspect(SocketAddr, Result<DeviceInspection, CaptureError>),
-    Download(Result<CaptureResult, CaptureError>),
-    Converted(Option<PathBuf>, Result<ConversionResult, ConversionError>),
+    DownloadFailed(CaptureError),
+    Converted {
+        raw: Option<PathBuf>,
+        raw_diagnostics: Vec<String>,
+        result: Result<ConversionResult, ConversionError>,
+    },
     WorkerFailed,
 }
 
@@ -78,6 +83,30 @@ pub struct M1DownloadUi {
 }
 
 impl M1DownloadUi {
+    /// Cancel any active M1 worker on application exit and wait briefly for it
+    /// to flush its incomplete manifest before the process terminates.
+    pub fn shutdown_gracefully(&mut self) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        job.cancellation.cancel();
+        let deadline = std::time::Instant::now() + EXIT_FLUSH_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match job.events.recv_timeout(remaining) {
+                Ok(JobEvent::Finished(finished)) => {
+                    self.finish(*finished);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+    }
+
     /// Poll workers even while the window is closed, so completion and retained
     /// partial-bundle paths remain available when it is reopened.
     pub fn show(&mut self, ctx: &Context) -> Option<PathBuf> {
@@ -101,7 +130,8 @@ impl M1DownloadUi {
 
     fn contents(&mut self, ui: &mut egui::Ui) {
         ui.label("Download M1 logs or convert a saved M1 image into recordings.");
-        ui.weak("Experimental: hardware compatibility is unverified. Original raw records are retained. Conversion resamples onto a shared clock; gaps remain missing.");
+        ui.weak("Read-only acquisition: i3rs never erases or writes to ECU memory. Scanning passively browses advertisements without connecting.");
+        ui.weak("Experimental: validated on one M150 ECU; other hardware/firmware remains unverified. Original raw records are retained. Conversion resamples onto a shared clock; gaps remain missing.");
         ui.separator();
         let busy = self.job.is_some();
         ui.horizontal(|ui| {
@@ -194,7 +224,7 @@ impl M1DownloadUi {
                     ui.label(folder.display().to_string());
                 }
                 None => {
-                    ui.weak("Choose a folder before downloading.");
+                    ui.weak("Choose a folder before downloading or converting.");
                 }
             }
         });
@@ -210,7 +240,10 @@ impl M1DownloadUi {
         {
             self.start_download(snapshot, ui.ctx());
         }
-        if !busy && let Some(reason) = reason {
+        if !busy
+            && !self.endpoint.trim().is_empty()
+            && let Some(reason) = reason
+        {
             ui.weak(reason);
         }
         ui.separator();
@@ -237,10 +270,18 @@ impl M1DownloadUi {
             }
         });
         if let Some(job) = &self.job {
+            let cancelling = job.cancellation.is_cancelled();
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(job.label);
-                if ui.button("Cancel").clicked() {
+                ui.label(if cancelling {
+                    "Cancelling…"
+                } else {
+                    job.label
+                });
+                if ui
+                    .add_enabled(!cancelling, egui::Button::new("Cancel"))
+                    .clicked()
+                {
                     job.cancellation.cancel();
                 }
             });
@@ -270,8 +311,8 @@ impl M1DownloadUi {
         }
         if let Some(progress) = &self.conversion_progress {
             ui.label(format!(
-                "{:?} · {} / {} recordings · {} bytes",
-                progress.stage,
+                "{} · {} / {} recordings · {} bytes",
+                conversion_stage_label(progress.stage),
                 progress.files_complete,
                 progress.files_total,
                 progress.bytes_written
@@ -459,7 +500,7 @@ impl M1DownloadUi {
                     },
                 );
                 match result {
-                    Err(error) => Finished::Download(Err(error)),
+                    Err(error) => Finished::DownloadFailed(error),
                     Ok(raw) => {
                         let converted = convert_capture_directory(
                             &raw.directory,
@@ -472,7 +513,11 @@ impl M1DownloadUi {
                                 }
                             },
                         );
-                        Finished::Converted(Some(raw.directory), converted)
+                        Finished::Converted {
+                            raw: Some(raw.directory),
+                            raw_diagnostics: raw.manifest.diagnostics,
+                            result: converted,
+                        }
                     }
                 }
             },
@@ -483,8 +528,6 @@ impl M1DownloadUi {
         let Some(destination) = self.destination.clone() else {
             return;
         };
-        self.result_directory = None;
-        self.recordings.clear();
         self.start_job(
             "Converting M1 logs…",
             ctx,
@@ -511,7 +554,11 @@ impl M1DownloadUi {
                         progress,
                     )
                 };
-                Finished::Converted(bundle.then_some(source), result)
+                Finished::Converted {
+                    raw: bundle.then_some(source),
+                    raw_diagnostics: Vec::new(),
+                    result,
+                }
             },
         );
     }
@@ -534,6 +581,7 @@ impl M1DownloadUi {
         self.status.clear();
         self.progress = None;
         self.conversion_progress = None;
+        self.result_directory = None;
         self.recordings.clear();
         match std::thread::Builder::new()
             .name("i3rs-m1-download".into())
@@ -574,6 +622,9 @@ impl M1DownloadUi {
                 Ok(JobEvent::Converting(progress)) => {
                     self.progress = None;
                     self.conversion_progress = Some(progress);
+                    if let Some(job) = self.job.as_mut() {
+                        job.label = "Converting M1 logs…";
+                    }
                 }
                 Ok(JobEvent::Finished(finished)) => {
                     self.job = None;
@@ -583,6 +634,8 @@ impl M1DownloadUi {
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.job = None;
+                    self.progress = None;
+                    self.conversion_progress = None;
                     self.status =
                         "The acquisition worker stopped before returning a result.".into();
                     break;
@@ -595,6 +648,8 @@ impl M1DownloadUi {
     }
 
     fn finish(&mut self, finished: Finished) {
+        self.progress = None;
+        self.conversion_progress = None;
         match finished {
             Finished::Scan(Ok(report)) => {
                 self.status = format!(
@@ -621,28 +676,22 @@ impl M1DownloadUi {
                 self.status =
                     "Inspection finished. Choose systems and a destination folder.".into();
             }
-            Finished::Inspect(_, Err(error)) | Finished::Download(Err(error)) => {
+            Finished::Inspect(_, Err(error)) | Finished::DownloadFailed(error) => {
                 self.result_directory = error.bundle_directory.clone();
                 self.status = error.to_string();
             }
-            Finished::Download(Ok(result)) => {
-                self.status = format!(
-                    "Raw bundle saved: {} records, {} bytes. This bundle cannot be opened as an .ld recording.",
-                    result.manifest.files.len(),
-                    result.manifest.total_bytes
-                );
-                if !result.manifest.diagnostics.is_empty() {
-                    self.status
-                        .push_str(&format!("\n{}", result.manifest.diagnostics.join("\n")));
-                }
-                self.result_directory = Some(result.directory);
-            }
-            Finished::Converted(raw, result) => {
-                self.progress = None;
+            Finished::Converted {
+                raw,
+                raw_diagnostics,
+                result,
+            } => {
                 match result {
                     Ok(result) => {
                         self.status =
                             format!("Converted {} recording(s).", result.manifest.files.len());
+                        for diagnostic in &raw_diagnostics {
+                            self.status.push_str(&format!("\n{diagnostic}"));
+                        }
                         for warning in &result.manifest.warnings {
                             self.status.push_str(&format!("\n{warning}"));
                         }
@@ -657,7 +706,14 @@ impl M1DownloadUi {
                     }
                     Err(error) => {
                         self.result_directory = error.directory.clone().or_else(|| raw.clone());
-                        self.status = format!("Conversion failed: {error}");
+                        if error.message.contains("cancelled") {
+                            self.status = format!("Conversion cancelled: {error}");
+                        } else {
+                            self.status = format!("Conversion failed: {error}");
+                        }
+                        for diagnostic in &raw_diagnostics {
+                            self.status.push_str(&format!("\n{diagnostic}"));
+                        }
                     }
                 }
                 if let Some(raw) = raw {
@@ -670,6 +726,16 @@ impl M1DownloadUi {
                 self.status = "The acquisition worker failed unexpectedly. Inspect the device again before retrying.".into();
             }
         }
+    }
+}
+
+fn conversion_stage_label(stage: ConversionStage) -> &'static str {
+    match stage {
+        ConversionStage::ReadingInput => "Reading conversion source",
+        ConversionStage::Decoding => "Decoding M1 data",
+        ConversionStage::PreparingOutput => "Preparing LD recordings",
+        ConversionStage::WritingOutput => "Writing LD recordings",
+        ConversionStage::Finished => "Conversion finished",
     }
 }
 
@@ -743,16 +809,18 @@ mod tests {
         let partial = PathBuf::from("/partial-conversion");
         let mut ui = M1DownloadUi::default();
         for output in [None, Some(partial.clone())] {
-            ui.finish(Finished::Converted(
-                Some(raw.clone()),
-                Err(ConversionError {
+            ui.finish(Finished::Converted {
+                raw: Some(raw.clone()),
+                raw_diagnostics: vec!["Verified M1 Fast Upload".into()],
+                result: Err(ConversionError {
                     message: "unsupported recording".into(),
                     directory: output.clone(),
                     manifest_diagnostic: None,
                 }),
-            ));
+            });
             assert_eq!(ui.result_directory, output.or_else(|| Some(raw.clone())));
             assert!(ui.status.contains("/raw-capture"));
+            assert!(ui.status.contains("Verified M1 Fast Upload"));
             assert!(ui.recordings.is_empty());
         }
         let recording = PathBuf::from("/converted/system-1.ld");
@@ -832,5 +900,56 @@ mod tests {
         ui.set_endpoint("127.0.0.2:12345".into());
         assert!(ui.inspected.is_none());
         assert_eq!(ui.selected, [false; 8]);
+    }
+
+    #[test]
+    fn sequential_jobs_clear_stale_result_directory_and_progress_and_update_label() {
+        let mut ui = M1DownloadUi {
+            result_directory: Some(PathBuf::from("/previous-output")),
+            progress: Some(CaptureProgress {
+                stage: CaptureStage::ReadingSector,
+                system: Some(0),
+                sector: Some(1),
+                sectors_complete: 1,
+                sectors_total: 2,
+                bytes: 100,
+            }),
+            ..Default::default()
+        };
+        let (tx, events) = mpsc::sync_channel(8);
+        let cancellation = CancellationToken::default();
+        ui.job = Some(Job {
+            events,
+            cancellation,
+            label: "Downloading raw ECU records…",
+        });
+        tx.send(JobEvent::Converting(ConversionProgress {
+            stage: ConversionStage::Decoding,
+            system: None,
+            segment: None,
+            files_complete: 0,
+            files_total: 2,
+            bytes_written: 0,
+        }))
+        .unwrap();
+        let ctx = Context::default();
+        ui.poll(&ctx);
+        assert!(ui.progress.is_none());
+        assert!(ui.conversion_progress.is_some());
+        assert_eq!(ui.job.as_ref().unwrap().label, "Converting M1 logs…");
+
+        tx.send(JobEvent::Finished(Box::new(Finished::WorkerFailed)))
+            .unwrap();
+        ui.poll(&ctx);
+        assert!(ui.job.is_none());
+        assert!(ui.progress.is_none());
+        assert!(ui.conversion_progress.is_none());
+
+        // Starting a new scan clears any stale result_directory from a prior job.
+        ui.result_directory = Some(PathBuf::from("/stale"));
+        ui.start_job("Test job", &ctx, |_, _, _| Finished::WorkerFailed);
+        assert!(ui.result_directory.is_none());
+        ui.shutdown_gracefully();
+        assert!(ui.job.is_none());
     }
 }

@@ -34,10 +34,16 @@ impl XcpClient {
         let mut missing = seen.len();
         // One stateful request advances the device's read position for the
         // block. Charge it even if a response is lost.
-        self.requested_upload_bytes += length as u64;
-        let (counter, deadline) = self.send_command(&request)?;
+        self.requested_upload_bytes = self.requested_upload_bytes.saturating_add(length as u64);
+        let (counter, mut deadline) = self.send_command(&request)?;
+        // Refresh the idle deadline when new valid chunks arrive so large
+        // bursts do not fail on a short per-command timeout, while still
+        // capping total burst duration.
+        let overall_cap = self.timeout.saturating_mul(10).max(Duration::from_secs(30));
+        let overall_deadline = Instant::now().checked_add(overall_cap).unwrap_or(deadline);
         while missing != 0 {
             let size = self.receive_datagram(deadline)?;
+            let mut progressed = false;
             for frame in decode_datagram(&self.datagram[..size])? {
                 if frame.counter != counter {
                     continue;
@@ -84,6 +90,10 @@ impl XcpClient {
                 slot.copy_from_slice(data);
                 *received = true;
                 missing -= 1;
+                progressed = true;
+            }
+            if progressed && let Some(next) = Instant::now().checked_add(self.timeout) {
+                deadline = next.min(overall_deadline);
             }
         }
         Ok(())

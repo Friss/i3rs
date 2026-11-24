@@ -100,11 +100,13 @@ impl XcpClient {
         if cancellation.is_cancelled() {
             return Err(XcpError::Cancelled);
         }
+        validate_endpoint(endpoint)?;
         let bind_address = match endpoint {
             SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         };
         let socket = UdpSocket::bind(bind_address)?;
+        set_receive_buffer_size(&socket, 2 * 1024 * 1024);
         socket.connect(endpoint)?;
         let poll_timeout = timeout.min(CANCELLATION_POLL);
         socket.set_write_timeout(Some(poll_timeout))?;
@@ -322,6 +324,11 @@ impl XcpClient {
             // higher level must not reset the capture's transfer budget.
             self.requested_upload_bytes = self.requested_upload_bytes.saturating_add(chunk as u64);
             let reply = self.exchange(&upload_request(units as u8))?;
+            if reply.first() != Some(&0xff) {
+                return self.poison(XcpError::Reply(ReplyError::UnexpectedPacket {
+                    marker: reply.first().copied().unwrap_or(0),
+                }));
+            }
             let expected = granularity + chunk;
             if reply.len() != expected {
                 return self.poison(XcpError::UnexpectedReplyLength {
@@ -423,10 +430,29 @@ impl XcpClient {
             .ok_or(XcpError::InvalidTimeout)?;
         let counter = self.counter.advance();
         let request = encode_frame(counter, payload)?;
-        if self.socket.send(&request).map_err(classify_io)? != request.len() {
-            return Err(XcpError::PartialDatagramSend);
+        loop {
+            if self.cancellation.is_cancelled() {
+                return Err(XcpError::Cancelled);
+            }
+            match self.socket.send(&request) {
+                Ok(sent) if sent == request.len() => return Ok((counter, deadline)),
+                Ok(_) => return Err(XcpError::PartialDatagramSend),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if Instant::now() >= deadline {
+                        return Err(XcpError::Timeout);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(classify_io(error)),
+            }
         }
-        Ok((counter, deadline))
     }
 
     fn receive_datagram(&mut self, deadline: Instant) -> Result<usize, XcpError> {
@@ -459,9 +485,6 @@ impl XcpClient {
             };
             if self.cancellation.is_cancelled() {
                 return Err(XcpError::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                return Err(XcpError::Timeout);
             }
             return Ok(length);
         }
@@ -598,6 +621,86 @@ impl From<ReplyError> for XcpError {
     fn from(error: ReplyError) -> Self {
         Self::Reply(error)
     }
+}
+
+fn validate_endpoint(endpoint: SocketAddr) -> Result<(), XcpError> {
+    if endpoint.port() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "XCP endpoint port must be greater than zero",
+        )
+        .into());
+    }
+    let valid = match endpoint {
+        SocketAddr::V4(addr) => {
+            !addr.ip().is_unspecified() && !addr.ip().is_multicast() && !addr.ip().is_broadcast()
+        }
+        SocketAddr::V6(addr) => {
+            !addr.ip().is_unspecified()
+                && !addr.ip().is_multicast()
+                && (!addr.ip().is_unicast_link_local() || addr.scope_id() != 0)
+                && !addr
+                    .ip()
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast())
+        }
+    };
+    if !valid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "XCP endpoint must be a unicast address with a link-local IPv6 scope when required",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Best-effort SO_RCVBUF increase so multi-packet Fast Upload bursts do not
+/// overflow small default OS UDP receive buffers (e.g. 64 KiB on Windows).
+fn set_receive_buffer_size(socket: &UdpSocket, bytes: usize) {
+    let size = i32::try_from(bytes).unwrap_or(i32::MAX);
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `socket` is a live UDP descriptor and `size` is a valid c_int.
+        let _ = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&raw const size).cast(),
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        const SOL_SOCKET: i32 = 0xffff;
+        const SO_RCVBUF: i32 = 0x1002;
+        #[link(name = "ws2_32")]
+        unsafe extern "system" {
+            fn setsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *const u8,
+                optlen: i32,
+            ) -> i32;
+        }
+        // SAFETY: `socket` is a live Winsock UDP socket and `size` is a valid 4-byte int.
+        let _ = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as usize,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                (&raw const size).cast(),
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (socket, size);
 }
 
 fn classify_io(error: io::Error) -> XcpError {
@@ -1038,17 +1141,22 @@ mod tests {
             respond(&socket, peer, counter, &[0xfe, 0]);
             let (counter, command, _) = receive(&socket, Some(peer));
             assert_eq!(command, upload_request(1));
-            // The shared classifier treats FE 00 as success; the observed
-            // UPLOAD handler then copies the single byte after the prefix.
+            // UPLOAD payload replies must use 0xFF; [0xFE, 0x00] (ERR_CMD_SYNCH)
+            // must never be silently written as data byte 0x00.
             respond(&socket, peer, counter, &[0xfe, 0]);
-            let (counter, command, _) = receive(&socket, Some(peer));
-            assert_eq!(command, [0xfe]);
-            respond(&socket, peer, counter, &[0xfe, 0]);
+            let (_, next, _) = receive(&socket, Some(peer));
+            assert_eq!(next, [0xfe]);
         });
         let mut client = client(endpoint);
         assert_eq!(client.parameters().resources, 0);
-        assert_eq!(client.read_memory(0x26, u32::MAX, 1, 1).unwrap(), [0]);
-        client.disconnect().unwrap();
+        assert!(matches!(
+            client.read_memory(0x26, u32::MAX, 1, 1),
+            Err(XcpError::Reply(ReplyError::UnexpectedPacket {
+                marker: 0xfe
+            }))
+        ));
+        assert!(client.is_poisoned());
+        drop(client);
         server.join().unwrap();
     }
 
