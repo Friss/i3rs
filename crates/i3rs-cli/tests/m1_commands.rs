@@ -472,7 +472,12 @@ fn native_parts() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (setups, metadata, sector)
 }
 fn synthetic_native_image() -> Vec<u8> {
+    synthetic_native_image_with_sectors(Vec::new())
+}
+
+fn synthetic_native_image_with_sectors(mut extra_sectors: Vec<Vec<u8>>) -> Vec<u8> {
     let (s, m, d) = native_parts();
+    extra_sectors.insert(0, d);
     let version = record(
         PROPERTY_RECORD_TYPE,
         0,
@@ -490,12 +495,12 @@ fn synthetic_native_image() -> Vec<u8> {
             record(PROPERTIES_RECORD_TYPE, 0, 0, &version),
             s,
             m,
-            record(0x0101_0002, 0, 0, &d),
+            record(0x0101_0002, 0, 0, &joined(&extra_sectors)),
         ]),
     )
 }
-fn assert_converted_json(json: &Value) {
-    assert_eq!(json["manifest"]["state"], "complete");
+fn assert_converted_json(json: &Value, state: &str) {
+    assert_eq!(json["manifest"]["state"], state);
     assert_eq!(json["manifest"]["vendor_compatibility_validated"], false);
     assert!(!json["manifest"]["warnings"].as_array().unwrap().is_empty());
     let directory = PathBuf::from(json["directory"].as_str().unwrap());
@@ -522,9 +527,49 @@ fn convert_image_cli_writes_native_ld_and_returns_manifest_warnings() {
         directory.0.to_str().unwrap(),
     ]));
     assert_eq!(json["schema_version"], "i3rs-cli.m1.conversion.v1");
-    assert_converted_json(&json);
+    assert_converted_json(&json, "complete");
     assert_eq!(fs::read(path).unwrap(), synthetic_native_image());
 }
+
+#[test]
+fn convert_image_cli_reports_partial_success_when_a_system_cannot_be_decoded() {
+    let directory = TestDirectory::new();
+    let mut packet = 0u32.to_be_bytes().to_vec();
+    packet.extend(1000f32.to_bits().to_be_bytes());
+    packet.extend(crc32(&packet).to_be_bytes());
+    let unsynchronized_sector = record(
+        0x0200_004c,
+        1,
+        0,
+        &joined(&[
+            record(0x0201_004d, 0, 0, &0u32.to_be_bytes()),
+            record(0x0201_002b, 0, 0, &packet),
+        ]),
+    );
+    let path = directory.file(&synthetic_native_image_with_sectors(vec![
+        unsynchronized_sector,
+    ]));
+    let output = cli(&[
+        "m1",
+        "convert-image",
+        path.to_str().unwrap(),
+        "--destination",
+        directory.0.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("omitted 1 logging system"));
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_converted_json(&json, "partial");
+    assert_eq!(json["manifest"]["omitted_systems"], serde_json::json!([1]));
+    assert_eq!(json["manifest"]["files"][0]["system"], 0);
+    let saved: Value = serde_json::from_slice(
+        &fs::read(PathBuf::from(json["directory"].as_str().unwrap()).join("manifest.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved, json["manifest"]);
+}
+
 #[test]
 fn conversion_errors_are_bounded_and_do_not_create_outputs() {
     let directory = TestDirectory::new();
@@ -694,7 +739,7 @@ fn loopback_download_captures_and_converts_with_read_only_commands() {
             .join("manifest.json")
             .is_file()
     );
-    assert_converted_json(&json);
+    assert_converted_json(&json, "complete");
     let json = success_json(cli(&[
         "m1",
         "convert-capture",
@@ -702,7 +747,7 @@ fn loopback_download_captures_and_converts_with_read_only_commands() {
         "--destination",
         directory.0.to_str().unwrap(),
     ]));
-    assert_converted_json(&json);
+    assert_converted_json(&json, "complete");
 
     // Also verify --recover-partial on an interrupted bundle.
     let partial_dir = TestDirectory::new();
@@ -736,7 +781,7 @@ fn loopback_download_captures_and_converts_with_read_only_commands() {
         "--destination",
         directory.0.to_str().unwrap(),
     ]));
-    assert_converted_json(&recovered);
+    assert_converted_json(&recovered, "partial");
     assert!(
         recovered["manifest"]["files"][0]["file_name"]
             .as_str()

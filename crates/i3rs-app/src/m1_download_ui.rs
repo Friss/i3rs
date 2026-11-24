@@ -13,7 +13,7 @@ use i3rs_core::m1::{
     },
     conversion::{
         ConversionError, ConversionLimits, ConversionProgress, ConversionResult, ConversionStage,
-        convert_capture_directory, convert_image_file,
+        ConversionState, convert_capture_directory, convert_image_file,
     },
     discovery::{DiscoveryReport, discover},
     transport::CancellationToken,
@@ -687,8 +687,12 @@ impl M1DownloadUi {
             } => {
                 match result {
                     Ok(result) => {
-                        self.status =
-                            format!("Converted {} recording(s).", result.manifest.files.len());
+                        let file_count = result.manifest.files.len();
+                        self.status = if result.manifest.state == ConversionState::Partial {
+                            format!("Partial conversion. Recovered {file_count} recording(s).")
+                        } else {
+                            format!("Converted {file_count} recording(s).")
+                        };
                         for diagnostic in &raw_diagnostics {
                             self.status.push_str(&format!("\n{diagnostic}"));
                         }

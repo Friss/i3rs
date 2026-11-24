@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
 use i3rs_core::m1::capture::{self, CaptureLimits, CaptureProgress, CaptureStage};
-use i3rs_core::m1::conversion::{self, ConversionLimits, ConversionProgress, ConversionStage};
+use i3rs_core::m1::conversion::{
+    self, ConversionLimits, ConversionProgress, ConversionResult, ConversionStage, ConversionState,
+};
 use i3rs_core::m1::discovery::{self, DiscoveryReport};
 use i3rs_core::m1::log_image::{
     MetadataGroupContents, MoRecord, MoRecordHeader, PropertyFields, RawLogImage,
@@ -264,14 +266,18 @@ pub(super) fn run(args: M1Args) -> Result<(), String> {
                     raw.directory.display()
                 )
             })?;
-            super::print_json(&json!({
-                "schema_version":"i3rs-cli.m1.download.v1",
-                "raw_directory":raw.directory,
-                "raw_manifest":raw.manifest,
-                "directory":converted.directory,
-                "manifest":converted.manifest,
-                "system_numbering":"CLI --systems uses 1..8; manifest system IDs use 0..7",
-            }))
+            print_conversion_result(
+                json!({
+                    "schema_version":"i3rs-cli.m1.download.v1",
+                    "raw_directory":raw.directory,
+                    "raw_manifest":raw.manifest,
+                    "directory":converted.directory,
+                    "manifest":converted.manifest,
+                    "system_numbering":"CLI --systems uses 1..8; manifest system IDs use 0..7",
+                }),
+                &converted,
+                false,
+            )
         }
         M1Command::ConvertImage {
             source,
@@ -288,7 +294,7 @@ pub(super) fn run(args: M1Args) -> Result<(), String> {
                 |update| progress.print(update),
             )
             .map_err(|e| e.to_string())?;
-            super::print_json(&conversion_json(result))
+            print_conversion_result(conversion_json(&result), &result, false)
         }
         M1Command::ConvertCapture {
             source,
@@ -311,7 +317,7 @@ pub(super) fn run(args: M1Args) -> Result<(), String> {
                 |update| progress.print(update),
             )
             .map_err(|e| e.to_string())?;
-            super::print_json(&conversion_json(result))
+            print_conversion_result(conversion_json(&result), &result, recover_partial)
         }
         M1Command::ImageInfo { path, max_bytes } => {
             super::print_json(&image_info(path, max_bytes)?)
@@ -356,9 +362,26 @@ fn acquire(
     )
     .map_err(|e| e.to_string())
 }
-fn conversion_json(result: conversion::ConversionResult) -> Value {
+fn conversion_json(result: &ConversionResult) -> Value {
     json!({"schema_version":"i3rs-cli.m1.conversion.v1","directory":result.directory,"manifest":result.manifest,"system_numbering":"manifest system IDs use 0..7"})
 }
+
+fn print_conversion_result(
+    value: Value,
+    result: &ConversionResult,
+    allow_partial: bool,
+) -> Result<(), String> {
+    super::print_json(&value)?;
+    if !allow_partial && result.manifest.state == ConversionState::Partial {
+        return Err(format!(
+            "M1 conversion omitted {} logging system(s). Recovered recordings and manifest saved at {}",
+            result.manifest.omitted_systems.len(),
+            result.directory.display()
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct ConversionPrinter {
     last: Option<(ConversionStage, Instant)>,
@@ -377,7 +400,7 @@ impl ConversionPrinter {
             ConversionStage::Decoding => "Decoding M1 data",
             ConversionStage::PreparingOutput => "Preparing LD recordings",
             ConversionStage::WritingOutput => "Writing LD recording",
-            ConversionStage::Finished => "Conversion complete",
+            ConversionStage::Finished => "Conversion finished",
         };
         let system = progress
             .system

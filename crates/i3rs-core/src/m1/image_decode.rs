@@ -57,6 +57,8 @@ impl Default for ImageDecodeLimits {
 pub struct DecodedImage {
     pub telemetry: DecodedTelemetry,
     pub session: Session,
+    /// Zero-based logging systems with numeric packets but no decodable context.
+    pub omitted_systems: Vec<u8>,
     /// Explicit limitations, including unvalidated permissions and clock fallback.
     pub warnings: Vec<String>,
 }
@@ -237,7 +239,7 @@ fn decode_records(
         .min(super::catalog::MAX_XML_BYTES + MO_HEADER_SIZE);
     let decoded_config = decode_xz_record(config, max_xml_record_bytes, limits.max_xz_memory_kib)?;
     let catalog = parse_catalog(&decoded_config[MO_HEADER_SIZE..], limits.max_catalog_items)?;
-    let (telemetry, skipped, undecodable_partial) = decode_stream_with_capture_start(
+    let (telemetry, skipped, omitted_systems) = decode_stream_with_capture_start(
         stream_record,
         &setups,
         &catalog,
@@ -259,7 +261,7 @@ fn decode_records(
             ));
         }
     }
-    for system in undecodable_partial {
+    for &system in &omitted_systems {
         warnings.push(format!(
             "Logging system {} had only leading numeric packets without setup and high-timestamp markers and was omitted.",
             system + 1
@@ -278,6 +280,7 @@ fn decode_records(
     Ok(DecodedImage {
         telemetry,
         session,
+        omitted_systems,
         warnings,
     })
 }

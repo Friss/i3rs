@@ -76,7 +76,10 @@ pub struct ConversionSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversionState {
+    /// Output writing stopped or failed.
     Incomplete,
+    /// Available recordings were written, but part of the source was unavailable.
+    Partial,
     Complete,
 }
 
@@ -105,6 +108,9 @@ pub struct ConversionManifest {
     pub used_default_clock: bool,
     /// Internal checks do not establish compatibility with MoTeC i2/Tune.
     pub vendor_compatibility_validated: bool,
+    /// Zero-based logging systems whose numeric packets could not be decoded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omitted_systems: Vec<u8>,
     pub warnings: Vec<String>,
     pub files: Vec<ConvertedFile>,
     pub total_bytes: u64,
@@ -314,6 +320,7 @@ pub fn persist_decoded(
             clock_hz: decoded.telemetry.clock_hz,
             used_default_clock: decoded.telemetry.used_default_clock,
             vendor_compatibility_validated: false,
+            omitted_systems: decoded.omitted_systems.clone(),
             warnings: decoded.warnings.clone(),
             files: Vec::new(),
             total_bytes: 0,
@@ -393,7 +400,16 @@ pub fn persist_decoded(
             if actual != entry.expected_bytes {
                 return Err("LD output file length differs from encoded bytes".into());
             }
-            fs::rename(&staged_path, &final_path).map_err(io_error)?;
+            let mut staged = tempfile::TempPath::try_from_path(staged_path).map_err(io_error)?;
+            // The incomplete manifest points at this file if publishing fails.
+            staged.disable_cleanup(true);
+            staged.persist_noclobber(&final_path).map_err(|error| {
+                format!(
+                    "could not publish {}: {}",
+                    final_path.display(),
+                    error.error
+                )
+            })?;
             entry.file_name = name;
             entry.complete = true;
             completed += 1;
@@ -405,7 +421,13 @@ pub fn persist_decoded(
             });
         }
         check_cancelled(&cancellation)?;
-        current.state = ConversionState::Complete;
+        current.state = if current.source.kind == SourceKind::PartialRawCapture
+            || !current.omitted_systems.is_empty()
+        {
+            ConversionState::Partial
+        } else {
+            ConversionState::Complete
+        };
         replace_manifest(&child, current)?;
         progress(ConversionProgress {
             stage: ConversionStage::Finished,
@@ -700,6 +722,7 @@ mod tests {
                 device_version: 0,
                 num_channels_header: 0,
             },
+            omitted_systems: Vec::new(),
             warnings: vec!["Synthetic source; vendor compatibility unvalidated.".into()],
         }
     }
@@ -801,6 +824,47 @@ mod tests {
         assert!(manifest.files[0].complete);
         assert!(manifest.error.unwrap().contains("cancelled"));
         assert!(path.join(&manifest.files[0].file_name).is_file());
+    }
+
+    #[test]
+    fn publishing_never_replaces_an_existing_final_recording() {
+        let base = TempDirectory::new();
+        let final_name = "system-01-segment-0002.ld";
+        let error = persist_decoded(
+            &decoded(),
+            source(),
+            &base.0,
+            &ConversionLimits::default(),
+            CancellationToken::default(),
+            |progress| {
+                if progress.segment == Some(1) && progress.files_complete == 1 {
+                    let child = fs::read_dir(&base.0).unwrap().next().unwrap().unwrap();
+                    fs::write(child.path().join(final_name), b"existing recording").unwrap();
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("could not publish"));
+        let directory = error.directory.unwrap();
+        assert_eq!(
+            fs::read(directory.join(final_name)).unwrap(),
+            b"existing recording"
+        );
+        let manifest = saved_manifest(&directory);
+        assert_eq!(manifest.state, ConversionState::Incomplete);
+        assert_eq!(manifest.files.len(), 2);
+        assert!(manifest.files[0].complete);
+        assert!(directory.join(&manifest.files[0].file_name).is_file());
+        let staged = &manifest.files[1];
+        assert!(!staged.complete);
+        assert_eq!(staged.file_name, format!("{final_name}.partial"));
+        assert_eq!(staged.bytes, staged.expected_bytes);
+        assert_eq!(
+            fs::metadata(directory.join(&staged.file_name))
+                .unwrap()
+                .len(),
+            staged.bytes
+        );
     }
 
     #[test]
